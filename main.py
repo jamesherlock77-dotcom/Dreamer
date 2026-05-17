@@ -7,6 +7,7 @@ from discord.ext import commands, tasks
 
 # Configuration
 ALLOWED_USER_ID = 1429110753683832985
+MANAGEMENT_CHANNEL_ID = 1505664564522651830
 DB_URL = os.environ.get("DATABASE_URL")
 
 # Role Map Configuration for Streak System (Streak Count: Role ID)
@@ -54,6 +55,31 @@ def init_db():
                     last_msg_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Table for Global Bot Master Switch (ON/OFF Status)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS bot_status (
+                    id INT PRIMARY KEY,
+                    is_active BOOLEAN DEFAULT TRUE
+                );
+            """)
+            cursor.execute("SELECT id FROM bot_status WHERE id = 1;")
+            if not cursor.fetchone():
+                cursor.execute("INSERT INTO bot_status (id, is_active) VALUES (1, TRUE);")
+
+            conn.commit()
+
+def get_bot_active_status():
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT is_active FROM bot_status WHERE id = 1;")
+            row = cursor.fetchone()
+            return row[0] if row else True
+
+def set_bot_active_status(status: bool):
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE bot_status SET is_active = %s WHERE id = 1;", (status,))
             conn.commit()
 
 def get_deadtrap_settings():
@@ -77,7 +103,6 @@ def increment_kick_count():
             return new_count
 
 def build_deadtrap_embed(kick_count):
-    """Builds the exact visual layout provided in the reference image using your custom emoji."""
     embed = discord.Embed(
         title="DO NOT SEND MESSAGES IN THIS CHANNEL",
         description="This channel is used to catch spam bots. Any messages sent here will result in **a softban.**",
@@ -87,9 +112,13 @@ def build_deadtrap_embed(kick_count):
     return embed
 
 
-# 2. Background Task Loop (Defined early so the Bot Class can register it safely)
+# 2. Background Task Loop
 @tasks.loop(seconds=30)
 async def streak_expiry_check(bot_instance):
+    # If the master switch is off, suspend expiry processing entirely
+    if not get_bot_active_status():
+        return
+
     now = datetime.now(timezone.utc)
     expiry_limit = timedelta(hours=20)
 
@@ -134,7 +163,6 @@ class UnifiedBot(commands.Bot):
         
     async def setup_hook(self):
         await self.tree.sync()
-        # Pass self so the background task has access to the bot instances' guilds
         self.streak_task = streak_expiry_check.start(self)
 
 bot = UnifiedBot()
@@ -168,12 +196,28 @@ async def on_ready():
         return
     init_db()
     print(f"Logged in as {bot.user.name}")
-    print("PostgreSQL Database initialized. Deadtrap and Streak systems fixed and ready!")
+    print("PostgreSQL Database initialized. Master switch operational.")
 
 
 # ==============================================================================
 # SLASH COMMANDS
 # ==============================================================================
+
+@bot.tree.command(name="togglebot", description="Turn the entire bot functionality ON or OFF.")
+@app_commands.describe(status="Choose True to turn ON, False to turn OFF")
+async def togglebot(interaction: discord.Interaction, status: bool):
+    # Enforcement checks: Only your ID, and only inside the specified channel
+    if interaction.user.id != ALLOWED_USER_ID:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+        
+    if interaction.channel_id != MANAGEMENT_CHANNEL_ID:
+        await interaction.response.send_message(f"This command can only be executed in <#{MANAGEMENT_CHANNEL_ID}>.", ephemeral=True)
+        return
+
+    set_bot_active_status(status)
+    state_str = "🟢 **ENABLED/ONLINE**" if status else "🔴 **DISABLED/OFFLINE**"
+    await interaction.response.send_message(f"The bot is now {state_str}. All deadtrap and streak activity updates are halted.")
 
 @bot.tree.command(name="deadtrap", description="Sets the channel to act as a deadtrap.")
 @app_commands.describe(channel="The channel to turn into a deadtrap")
@@ -215,6 +259,10 @@ async def channel_config(interaction: discord.Interaction, channel: discord.Text
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
+        return
+
+    # CRITICAL MASTER SWITCH CHECK: Ignore EVERYTHING if bot is set to offline
+    if not get_bot_active_status():
         return
 
     deadtrap_channel_id, current_kicks = get_deadtrap_settings()
