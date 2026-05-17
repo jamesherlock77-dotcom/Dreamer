@@ -1,2 +1,4 @@
 discord.py
 psycopg[binary]
+pillow
+requests
