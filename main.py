@@ -21,7 +21,7 @@ STREAK_ROLES = {
     14: 1495573637800136844,
     30: 1495573640132034670,
     60: 1495573754921877687,
-    100: 1495573763004039380
+    100: 149557363004039380
 }
 
 # 1. Database Functions
@@ -195,7 +195,7 @@ bot = UnifiedBot()
 async def update_streak_roles(member: discord.Member, streak_count: int):
     try:
         if streak_count in STREAK_ROLES:
-            target_role_id = STREAK_ROLES[checkpoint]
+            target_role_id = STREAK_ROLES[streak_count]
             role = member.guild.get_role(target_role_id)
             if role and role not in member.roles:
                 await member.add_roles(role, reason="Reached a chat streak milestone!")
@@ -235,19 +235,19 @@ async def messagestreak(interaction: discord.Interaction):
     
     streak_count, msg_progress, rank_num = get_user_streak_and_rank(interaction.user.id)
 
-    # 1. Base Dimensions (1000x230 landscape aspect ratio matches example image)
+    # 1. Base Dimensions (1000x230 matches the panoramic profile block size exactly)
     width, height = 1000, 230
     card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
 
-    # 2. Main Background Box (Sleek dark container with rounded edges)
-    card_bg_color = (15, 18, 22, 240)
-    card_border_color = (40, 44, 52, 255)
-    draw.rounded_rectangle([10, 10, width-10, height-10], radius=18, fill=card_bg_color, outline=card_border_color, width=2)
+    # 2. Precise Background Styling (Matches the translucent rounded slate look)
+    card_bg_color = (17, 18, 20, 245)
+    card_border_color = (38, 41, 45, 255)
+    draw.rounded_rectangle([10, 10, width-10, height-10], radius=28, fill=card_bg_color, outline=card_border_color, width=2)
     
-    # 3. Avatar Processing (With thick circular gold boundary frame)
-    avatar_size = 150
-    avatar_x, avatar_y = 35, 40
+    # 3. Render Profile Picture + Gold Stroke Alignment
+    avatar_size = 154
+    avatar_x, avatar_y = 40, 38
     
     avatar_url = interaction.user.display_avatar.with_size(256).url
     try:
@@ -261,38 +261,38 @@ async def messagestreak(interaction: discord.Interaction):
         
         card.paste(avatar_img, (avatar_x, avatar_y), mask=mask)
         
-        # Gold/Bronze outer ring matching image reference precisely
-        draw.ellipse((avatar_x-4, avatar_y-4, avatar_x+avatar_size+4, avatar_y+avatar_size+4), outline=(197, 160, 89, 255), width=4)
+        # The sharp metallic gold frame ring
+        draw.ellipse((avatar_x-1, avatar_y-1, avatar_x+avatar_size+1, avatar_y+avatar_size+1), outline=(197, 160, 89, 255), width=5)
     except Exception as e:
         print(f"Failed handling avatar asset: {e}")
-        draw.ellipse((avatar_x-4, avatar_y-4, avatar_x+avatar_size+4, avatar_y+avatar_size+4), outline=(197, 160, 89, 255), width=4)
+        draw.ellipse((avatar_x-1, avatar_y-1, avatar_x+avatar_size+1, avatar_y+avatar_size+1), outline=(197, 160, 89, 255), width=5)
 
-    # 4. Text Fonts Initializer Configuration
+    # 4. Text Fonts Settings
     try:
-        font_user = ImageFont.load_default(size=52)
-        font_sub_label = ImageFont.load_default(size=22)
-        font_stat_val = ImageFont.load_default(size=48)
+        font_user = ImageFont.load_default(size=56)
+        font_sub_label = ImageFont.load_default(size=24)
+        font_stat_val = ImageFont.load_default(size=54)
     except TypeError:
         font_user = font_sub_label = font_stat_val = ImageFont.load_default()
 
-    # Colors derived directly from image example
+    # Colors mapped exactly from the image example
     text_white = (255, 255, 255, 255)
-    text_cyan = (90, 198, 216, 255) # Light blue accent color
+    text_cyan = (95, 180, 195, 255) # Hex #5EB4C3 exact light cyan
 
-    # 5. Draw User Name (Clean alignment right next to avatar)
-    username_text = interaction.user.display_name
-    draw.text((220, 32), username_text, font=font_user, fill=text_white)
+    # 5. Draw Username (Positioned next to the avatar frame)
+    username_text = interaction.user.display_name.lower() # Forced lower-case like 'imkirbs'
+    draw.text((235, 36), username_text, font=font_user, fill=text_white)
     
-    # 6. Metrics Row Alignment Setup (X-coordinates staggered to separate values)
-    # Block 1: Current Streak Label + Value
-    draw.text((220, 110), "Current Streak", font=font_sub_label, fill=text_white)
-    draw.text((220, 142), f"{streak_count} Days", font=font_stat_val, fill=text_cyan)
+    # 6. Aligned Metrics Grid Layout 
+    # Current Streak Placement Block
+    draw.text((235, 115), "Current Streak", font=font_sub_label, fill=text_white)
+    draw.text((235, 148), f"{streak_count} Days", font=font_stat_val, fill=text_cyan)
 
-    # Block 2: Rank Label + Value
-    draw.text((580, 110), "Rank", font=font_sub_label, fill=text_white)
-    draw.text((580, 142), f"#{rank_num}" if rank_num > 0 else "#--", font=font_stat_val, fill=text_cyan)
+    # Server Rank Placement Block (Pushed perfectly rightwards to decouple text fields)
+    draw.text((615, 115), "Rank", font=font_sub_label, fill=text_white)
+    draw.text((615, 148), f"#{rank_num}" if rank_num > 0 else "#--", font=font_stat_val, fill=text_cyan)
 
-    # Export output mapping stream
+    # Save and stream output image configuration data
     final_buffer = io.BytesIO()
     card.save(final_buffer, format="PNG")
     final_buffer.seek(0)
@@ -419,7 +419,7 @@ async def on_message(message):
 
             cursor.execute("UPDATE user_streaks SET last_msg_time = %s WHERE user_id = %s;", (now, user_id))
 
-            # 12-Hour Cooldown
+            # 12-Hour Cooldown Check
             if last_streak_time:
                 if now - last_streak_time < timedelta(hours=12):
                     conn.commit()
