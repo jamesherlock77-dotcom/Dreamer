@@ -5,21 +5,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-# 1. Set up Intents
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True  # Required to kick members and manage streak roles
-
-class UnifiedBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
-        
-    async def setup_hook(self):
-        await self.tree.sync()
-        self.streak_expiry_check.start()  # Start the background background loop to check for lost streaks
-
-bot = UnifiedBot()
-
 # Configuration
 ALLOWED_USER_ID = 1429110753683832985
 DB_URL = os.environ.get("DATABASE_URL")
@@ -35,7 +20,7 @@ STREAK_ROLES = {
     100: 1495573763004039380
 }
 
-# 2. Database Initialization
+# 1. Database Functions
 def init_db():
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
@@ -71,20 +56,6 @@ def init_db():
             """)
             conn.commit()
 
-@bot.event
-async def on_ready():
-    if not DB_URL:
-        print("CRITICAL: DATABASE_URL is missing!")
-        return
-    init_db()
-    print(f"Logged in as {bot.user.name}")
-    print("PostgreSQL Database initialized. Both Deadtrap and Streak systems are online!")
-
-
-# ==============================================================================
-# PHASE 1: DEADTRAP SYSTEM
-# ==============================================================================
-
 def get_deadtrap_settings():
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
@@ -110,50 +81,66 @@ def build_deadtrap_embed(kick_count):
     embed = discord.Embed(
         title="DO NOT SEND MESSAGES IN THIS CHANNEL",
         description="This channel is used to catch spam bots. Any messages sent here will result in **a softban.**",
-        color=discord.Color.from_rgb(43, 45, 49)  # Matches standard dark Discord background
+        color=discord.Color.from_rgb(43, 45, 49)
     )
-    # Replaces the honey jar with your custom emoji in the button/text footprint
     embed.add_field(name="\u200b", value=f"<:Dreamer:1495243686378868787> Kicks: {kick_count}", inline=False)
     return embed
 
-@bot.tree.command(name="deadtrap", description="Sets the channel to act as a deadtrap.")
-@app_commands.describe(channel="The channel to turn into a deadtrap")
-async def deadtrap(interaction: discord.Interaction, channel: discord.TextChannel):
-    if interaction.user.id != ALLOWED_USER_ID:
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-        return
 
-    save_deadtrap_channel(channel.id)
-    await interaction.response.send_message(f"Deadtrap channel active in {channel.mention}.", ephemeral=True)
-    
-    # Send the warning text followed by the fancy embed layout
-    await channel.send(content="<:Sneeze:1495243609035899023> DONT TYPE IN HERE <:Sneeze:1495243609035899023>\nYou will be kicked")
-    embed = build_deadtrap_embed(0)
-    await channel.send(embed=embed)
-
-
-# ==============================================================================
-# PHASE 2: CHAT STREAK SYSTEM
-# ==============================================================================
-
-@bot.tree.command(name="channel", description="Sets the channel where streak milestone alerts are sent.")
-@app_commands.describe(channel="The channel for chat streak alerts")
-async def channel_config(interaction: discord.Interaction, channel: discord.TextChannel):
-    if interaction.user.id != ALLOWED_USER_ID:
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-        return
+# 2. Background Task Loop (Defined early so the Bot Class can register it safely)
+@tasks.loop(seconds=30)
+async def streak_expiry_check(bot_instance):
+    now = datetime.now(timezone.utc)
+    expiry_limit = timedelta(hours=20)
 
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO streak_config (guild_id, announcement_channel_id)
-                VALUES (%s, %s)
-                ON CONFLICT (guild_id) DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id;
-            """, (interaction.guild_id, channel.id))
+                SELECT user_id, current_streak FROM user_streaks 
+                WHERE current_streak > 0 AND (last_msg_time < %s OR (last_streak_time IS NOT NULL AND last_streak_time < %s));
+            """, (now - expiry_limit, now - expiry_limit))
+            
+            expired_users = cursor.fetchall()
+
+            for user_id, old_streak in expired_users:
+                cursor.execute("""
+                    UPDATE user_streaks 
+                    SET current_streak = 0, msg_count = 0, last_streak_time = NULL 
+                    WHERE user_id = %s;
+                """, (user_id,))
+                
+                for guild in bot_instance.guilds:
+                    member = guild.get_member(user_id)
+                    if member:
+                        await remove_all_streak_roles(member)
+                        
+                        cursor.execute("SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;", (guild.id,))
+                        config = cursor.fetchone()
+                        if config and config[0]:
+                            channel = guild.get_channel(config[0])
+                            if channel:
+                                await channel.send(f"💔 {member.mention}, you have lost your streak!")
             conn.commit()
 
-    await interaction.response.send_message(f"Streak announcements will now be sent to {channel.mention}.", ephemeral=True)
 
+# 3. Set up Intents & Bot Class
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True 
+
+class UnifiedBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        
+    async def setup_hook(self):
+        await self.tree.sync()
+        # Pass self so the background task has access to the bot instances' guilds
+        self.streak_task = streak_expiry_check.start(self)
+
+bot = UnifiedBot()
+
+
+# 4. Helper Role Adjusters
 async def update_streak_roles(member: discord.Member, streak_count: int):
     try:
         if streak_count in STREAK_ROLES:
@@ -174,8 +161,55 @@ async def remove_all_streak_roles(member: discord.Member):
         print(f"Lacking permissions to strip roles from {member.name}.")
 
 
+@bot.event
+async def on_ready():
+    if not DB_URL:
+        print("CRITICAL: DATABASE_URL is missing!")
+        return
+    init_db()
+    print(f"Logged in as {bot.user.name}")
+    print("PostgreSQL Database initialized. Deadtrap and Streak systems fixed and ready!")
+
+
 # ==============================================================================
-# CORE MESSAGING CONTROLLER (Handles both systems simultaneously)
+# SLASH COMMANDS
+# ==============================================================================
+
+@bot.tree.command(name="deadtrap", description="Sets the channel to act as a deadtrap.")
+@app_commands.describe(channel="The channel to turn into a deadtrap")
+async def deadtrap(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.user.id != ALLOWED_USER_ID:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    save_deadtrap_channel(channel.id)
+    await interaction.response.send_message(f"Deadtrap channel active in {channel.mention}.", ephemeral=True)
+    
+    await channel.send(content="<:Sneeze:1495243609035899023> DONT TYPE IN HERE <:Sneeze:1495243609035899023>\nYou will be kicked")
+    embed = build_deadtrap_embed(0)
+    await channel.send(embed=embed)
+
+@bot.tree.command(name="channel", description="Sets the channel where streak milestone alerts are sent.")
+@app_commands.describe(channel="The channel for chat streak alerts")
+async def channel_config(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.user.id != ALLOWED_USER_ID:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO streak_config (guild_id, announcement_channel_id)
+                VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id;
+            """, (interaction.guild_id, channel.id))
+            conn.commit()
+
+    await interaction.response.send_message(f"Streak announcements will now be sent to {channel.mention}.", ephemeral=True)
+
+
+# ==============================================================================
+# CORE MESSAGING CONTROLLER (Deadtrap + Streaks)
 # ==============================================================================
 
 @bot.event
@@ -183,12 +217,10 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    # Check Deadtrap Channel settings
     deadtrap_channel_id, current_kicks = get_deadtrap_settings()
 
-    # --- EXECUTE DEADTRAP ACTION ---
+    # --- DEADTRAP TARGET BLOCK ---
     if deadtrap_channel_id and message.channel.id == deadtrap_channel_id:
-        # 1. Delete message instantly
         try:
             await message.delete()
         except discord.Forbidden:
@@ -198,18 +230,15 @@ async def on_message(message):
 
         member = message.author
         
-        # 2. Try sending the custom DM
         try:
             await member.send("You have been kicked from Dreamer Vr Server. For supposed hacked account.")
         except discord.Forbidden:
             print(f"Could not DM {member.name}.")
 
-        # 3. Kick user
         try:
             await member.kick(reason="Typed in the designated deadtrap channel.")
             updated_kicks = increment_kick_count()
             
-            # 4. Search and modify the Embed layout
             async for msg in message.channel.history(limit=20):
                 if msg.author == bot.user and len(msg.embeds) > 0:
                     if "DO NOT SEND MESSAGES IN THIS CHANNEL" in msg.embeds[0].title:
@@ -223,9 +252,9 @@ async def on_message(message):
         except discord.Forbidden:
             print(f"Failed to kick {member.name}. Check role hierarchy rules.")
         
-        return  # Stop processing further logic if they hit the deadtrap
+        return
 
-    # --- EXECUTE STREAK SYSTEM LOGIC ---
+    # --- STREAK MANAGEMENT BLOCK ---
     user_id = message.author.id
     now = datetime.now(timezone.utc)
 
@@ -244,10 +273,9 @@ async def on_message(message):
             
             msg_count, current_streak, last_streak_time = user_data
 
-            # Keep activity tracker warm
             cursor.execute("UPDATE user_streaks SET last_msg_time = %s WHERE user_id = %s;", (now, user_id))
 
-            # 12-Hour Check Cooldown
+            # 12-Hour Cooldown
             if last_streak_time:
                 if now - last_streak_time < timedelta(hours=12):
                     conn.commit()
@@ -255,7 +283,7 @@ async def on_message(message):
 
             new_msg_count = msg_count + 1
 
-            # Hit the milestone! (3 messages sent after 12h cooldown window passed)
+            # Check Milestone (3 messages)
             if new_msg_count >= 3:
                 new_streak = current_streak + 1
                 cursor.execute("""
@@ -265,7 +293,6 @@ async def on_message(message):
                 """, (new_streak, now, user_id))
                 conn.commit()
 
-                # Trigger Announcement
                 cursor.execute("SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;", (message.guild.id,))
                 config = cursor.fetchone()
                 if config and config[0]:
@@ -280,49 +307,6 @@ async def on_message(message):
             else:
                 cursor.execute("UPDATE user_streaks SET msg_count = %s WHERE user_id = %s;", (new_msg_count, user_id))
                 conn.commit()
-
-
-# ==============================================================================
-# BACKGROUND LOOP: STREAK EXPIRATION (Runs every 30 seconds to catch 20h idle)
-# ==============================================================================
-
-@tasks.loop(seconds=30)
-async def streak_expiry_check():
-    now = datetime.now(timezone.utc)
-    expiry_limit = timedelta(hours=20)
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT user_id, current_streak FROM user_streaks 
-                WHERE current_streak > 0 AND (last_msg_time < %s OR (last_streak_time IS NOT NULL AND last_streak_time < %s));
-            """, (now - expiry_limit, now - expiry_limit))
-            
-            expired_users = cursor.fetchall()
-
-            for user_id, old_streak in expired_users:
-                cursor.execute("""
-                    UPDATE user_streaks 
-                    SET current_streak = 0, msg_count = 0, last_streak_time = NULL 
-                    WHERE user_id = %s;
-                """, (user_id,))
-                
-                for guild in bot.guilds:
-                    member = guild.get_member(user_id)
-                    if member:
-                        await remove_all_streak_roles(member)
-                        
-                        cursor.execute("SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;", (guild.id,))
-                        config = cursor.fetchone()
-                        if config and config[0]:
-                            channel = guild.get_channel(config[0])
-                            if channel:
-                                await channel.send(f"💔 {member.mention}, you have lost your streak!")
-            conn.commit()
-
-@streak_expiry_check.before_loop
-async def before_streak_check():
-    await bot.wait_until_ready()
 
 # Run Bot
 token = os.environ.get("DISCORD_TOKEN")
