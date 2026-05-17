@@ -1,62 +1,103 @@
 import os
 import psycopg
+from datetime import datetime, timedelta, timezone
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-# 1. Set up intents (permissions) the bot needs
+# 1. Set up Intents
 intents = discord.Intents.default()
-intents.message_content = True 
-intents.members = True  # Required to kick members
+intents.message_content = True
+intents.members = True  # Required to kick members and manage streak roles
 
-class MyBot(commands.Bot):
+class UnifiedBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         
     async def setup_hook(self):
-        # Synchronizes slash commands globally with Discord
         await self.tree.sync()
+        self.streak_expiry_check.start()  # Start the background background loop to check for lost streaks
 
-bot = MyBot()
+bot = UnifiedBot()
 
-# Configuration Variables
+# Configuration
 ALLOWED_USER_ID = 1429110753683832985
 DB_URL = os.environ.get("DATABASE_URL")
 
-# 2. Database Functions
+# Role Map Configuration for Streak System (Streak Count: Role ID)
+STREAK_ROLES = {
+    1: 1495573627217641604,
+    3: 1495573632984813639,
+    7: 1495573635459448842,
+    14: 1495573637800136844,
+    30: 1495573640132034670,
+    60: 1495573754921877687,
+    100: 1495573763004039380
+}
+
+# 2. Database Initialization
 def init_db():
-    """Creates the table and config row in Postgres if they do not exist."""
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
+            # Table for Deadtrap Settings
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS deadtrap_settings (
-                    id SERIAL PRIMARY KEY,
+                    id INT PRIMARY KEY,
                     channel_id BIGINT,
                     kick_count INT DEFAULT 0
                 );
             """)
-            # Ensure a single tracking row with ID=1 exists
             cursor.execute("SELECT id FROM deadtrap_settings WHERE id = 1;")
             if not cursor.fetchone():
                 cursor.execute("INSERT INTO deadtrap_settings (id, channel_id, kick_count) VALUES (1, NULL, 0);")
+
+            # Table for Streak Config (Announcement Channel)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS streak_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    announcement_channel_id BIGINT
+                );
+            """)
+
+            # Table for User Streak tracking
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_streaks (
+                    user_id BIGINT PRIMARY KEY,
+                    msg_count INT DEFAULT 0,
+                    current_streak INT DEFAULT 0,
+                    last_streak_time TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+                    last_msg_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
             conn.commit()
 
-def get_settings():
-    """Retrieves the current trap channel ID and kick count."""
+@bot.event
+async def on_ready():
+    if not DB_URL:
+        print("CRITICAL: DATABASE_URL is missing!")
+        return
+    init_db()
+    print(f"Logged in as {bot.user.name}")
+    print("PostgreSQL Database initialized. Both Deadtrap and Streak systems are online!")
+
+
+# ==============================================================================
+# PHASE 1: DEADTRAP SYSTEM
+# ==============================================================================
+
+def get_deadtrap_settings():
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT channel_id, kick_count FROM deadtrap_settings WHERE id = 1;")
             return cursor.fetchone()
 
-def save_channel(channel_id):
-    """Saves the channel ID and resets the kick count for a new setup."""
+def save_deadtrap_channel(channel_id):
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE deadtrap_settings SET channel_id = %s, kick_count = 0 WHERE id = 1;", (channel_id,))
             conn.commit()
 
 def increment_kick_count():
-    """Increments the kick count and returns the updated total."""
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
             cursor.execute("UPDATE deadtrap_settings SET kick_count = kick_count + 1 WHERE id = 1 RETURNING kick_count;")
@@ -64,98 +105,228 @@ def increment_kick_count():
             conn.commit()
             return new_count
 
+def build_deadtrap_embed(kick_count):
+    """Builds the exact visual layout provided in the reference image using your custom emoji."""
+    embed = discord.Embed(
+        title="DO NOT SEND MESSAGES IN THIS CHANNEL",
+        description="This channel is used to catch spam bots. Any messages sent here will result in **a softban.**",
+        color=discord.Color.from_rgb(43, 45, 49)  # Matches standard dark Discord background
+    )
+    # Replaces the honey jar with your custom emoji in the button/text footprint
+    embed.add_field(name="\u200b", value=f"<:Dreamer:1495243686378868787> Kicks: {kick_count}", inline=False)
+    return embed
 
-@bot.event
-async def on_ready():
-    if not DB_URL:
-        print("CRITICAL ERROR: DATABASE_URL environment variable is missing!")
-        return
-    init_db()  # Setup tables on startup
-    print(f"Logged in as {bot.user.name}")
-    print("PostgreSQL Database linked and bot is running on Railway!")
-
-
-# 3. Slash Command to set the deadtrap channel
 @bot.tree.command(name="deadtrap", description="Sets the channel to act as a deadtrap.")
 @app_commands.describe(channel="The channel to turn into a deadtrap")
 async def deadtrap(interaction: discord.Interaction, channel: discord.TextChannel):
-    # Enforce permission restriction
     if interaction.user.id != ALLOWED_USER_ID:
         await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
         return
 
-    # Update state in PostgreSQL
-    save_channel(channel.id)
+    save_deadtrap_channel(channel.id)
+    await interaction.response.send_message(f"Deadtrap channel active in {channel.mention}.", ephemeral=True)
     
-    await interaction.response.send_message(f"Deadtrap active in {channel.mention}.", ephemeral=True)
-    
-    # Send the initial warning text to the targeted channel
-    warning_text = (
-        f"<:Sneeze:1495243609035899023> DONT TYPE IN HERE <:Sneeze:1495243609035899023>\n"
-        f"You will be kicked\n"
-        f"`Kick Count: 0`"
-    )
-    await channel.send(warning_text)
+    # Send the warning text followed by the fancy embed layout
+    await channel.send(content="<:Sneeze:1495243609035899023> DONT TYPE IN HERE <:Sneeze:1495243609035899023>\nYou will be kicked")
+    embed = build_deadtrap_embed(0)
+    await channel.send(embed=embed)
 
 
-# 4. Message Monitor
+# ==============================================================================
+# PHASE 2: CHAT STREAK SYSTEM
+# ==============================================================================
+
+@bot.tree.command(name="channel", description="Sets the channel where streak milestone alerts are sent.")
+@app_commands.describe(channel="The channel for chat streak alerts")
+async def channel_config(interaction: discord.Interaction, channel: discord.TextChannel):
+    if interaction.user.id != ALLOWED_USER_ID:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO streak_config (guild_id, announcement_channel_id)
+                VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id;
+            """, (interaction.guild_id, channel.id))
+            conn.commit()
+
+    await interaction.response.send_message(f"Streak announcements will now be sent to {channel.mention}.", ephemeral=True)
+
+async def update_streak_roles(member: discord.Member, streak_count: int):
+    try:
+        if streak_count in STREAK_ROLES:
+            target_role_id = STREAK_ROLES[streak_count]
+            role = member.guild.get_role(target_role_id)
+            if role and role not in member.roles:
+                await member.add_roles(role, reason="Reached a chat streak milestone!")
+    except discord.Forbidden:
+        print(f"Lacking permissions to adjust roles for {member.name}.")
+
+async def remove_all_streak_roles(member: discord.Member):
+    try:
+        roles_to_remove = [member.guild.get_role(r_id) for r_id in STREAK_ROLES.values()]
+        roles_to_remove = [r for r in roles_to_remove if r and r in member.roles]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Lost chat streak due to inactivity.")
+    except discord.Forbidden:
+        print(f"Lacking permissions to strip roles from {member.name}.")
+
+
+# ==============================================================================
+# CORE MESSAGING CONTROLLER (Handles both systems simultaneously)
+# ==============================================================================
+
 @bot.event
 async def on_message(message):
-    # Ignore messages sent by bots
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    # Safely pull settings dynamically from the database
-    trap_channel_id, current_count = get_settings()
-    
-    # Only act if the message was sent in the designated channel
-    if trap_channel_id is None or message.channel.id != trap_channel_id:
-        return
+    # Check Deadtrap Channel settings
+    deadtrap_channel_id, current_kicks = get_deadtrap_settings()
 
-    # Delete their message instantly
-    try:
-        await message.delete()
-    except discord.Forbidden:
-        print("Bot lacks 'Manage Messages' permission.")
-    except discord.NotFound:
-        pass
+    # --- EXECUTE DEADTRAP ACTION ---
+    if deadtrap_channel_id and message.channel.id == deadtrap_channel_id:
+        # 1. Delete message instantly
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            print("Bot lacks 'Manage Messages' permission.")
+        except discord.NotFound:
+            pass
 
-    member = message.author
-    
-    # Direct Message warning attempt
-    try:
-        await member.send("You have been kicked from Dreamer Vr Server. For supposed hacked account.")
-    except discord.Forbidden:
-        print(f"Could not DM {member.name} (User has private settings enabled).")
+        member = message.author
+        
+        # 2. Try sending the custom DM
+        try:
+            await member.send("You have been kicked from Dreamer Vr Server. For supposed hacked account.")
+        except discord.Forbidden:
+            print(f"Could not DM {member.name}.")
 
-    # Perform kick and update counter
-    try:
-        await member.kick(reason="Typed in the designated deadtrap channel.")
-        
-        # Safely increment inside Postgres
-        updated_count = increment_kick_count()
-        
-        warning_text = (
-            f"<:Sneeze:1495243609035899023> DONT TYPE IN HERE <:Sneeze:1495243609035899023>\n"
-            f"You will be kicked\n"
-            f"`Kick Count: {updated_count}`"
-        )
-        
-        # Search back to find the warning message and edit it dynamically
-        async for msg in message.channel.history(limit=20):
-            if msg.author == bot.user and "DONT TYPE IN HERE" in msg.content:
-                await msg.edit(content=warning_text)
-                break
-        else:
-            # Fallback if the previous message can't be found
-            await message.channel.send(warning_text)
+        # 3. Kick user
+        try:
+            await member.kick(reason="Typed in the designated deadtrap channel.")
+            updated_kicks = increment_kick_count()
             
-    except discord.Forbidden:
-        print(f"Failed to kick {member.name}. Check role hierarchy or 'Kick Members' permission.")
+            # 4. Search and modify the Embed layout
+            async for msg in message.channel.history(limit=20):
+                if msg.author == bot.user and len(msg.embeds) > 0:
+                    if "DO NOT SEND MESSAGES IN THIS CHANNEL" in msg.embeds[0].title:
+                        new_embed = build_deadtrap_embed(updated_kicks)
+                        await msg.edit(embed=new_embed)
+                        break
+            else:
+                new_embed = build_deadtrap_embed(updated_kicks)
+                await message.channel.send(embed=new_embed)
+                
+        except discord.Forbidden:
+            print(f"Failed to kick {member.name}. Check role hierarchy rules.")
+        
+        return  # Stop processing further logic if they hit the deadtrap
 
-# Run the bot execution loop
+    # --- EXECUTE STREAK SYSTEM LOGIC ---
+    user_id = message.author.id
+    now = datetime.now(timezone.utc)
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT msg_count, current_streak, last_streak_time FROM user_streaks WHERE user_id = %s;", (user_id,))
+            user_data = cursor.fetchone()
+
+            if not user_data:
+                cursor.execute("""
+                    INSERT INTO user_streaks (user_id, msg_count, current_streak, last_msg_time)
+                    VALUES (%s, 1, 0, %s);
+                """, (user_id, now))
+                conn.commit()
+                return
+            
+            msg_count, current_streak, last_streak_time = user_data
+
+            # Keep activity tracker warm
+            cursor.execute("UPDATE user_streaks SET last_msg_time = %s WHERE user_id = %s;", (now, user_id))
+
+            # 12-Hour Check Cooldown
+            if last_streak_time:
+                if now - last_streak_time < timedelta(hours=12):
+                    conn.commit()
+                    return
+
+            new_msg_count = msg_count + 1
+
+            # Hit the milestone! (3 messages sent after 12h cooldown window passed)
+            if new_msg_count >= 3:
+                new_streak = current_streak + 1
+                cursor.execute("""
+                    UPDATE user_streaks 
+                    SET msg_count = 0, current_streak = %s, last_streak_time = %s 
+                    WHERE user_id = %s;
+                """, (new_streak, now, user_id))
+                conn.commit()
+
+                # Trigger Announcement
+                cursor.execute("SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;", (message.guild.id,))
+                config = cursor.fetchone()
+                if config and config[0]:
+                    announcement_channel = message.guild.get_channel(config[0])
+                    if announcement_channel:
+                        await announcement_channel.send(
+                            f"<:Sneeze:1495243609035899023> {message.author.mention}, you've acquired a chat streak! <:Sneeze:1495243609035899023>\n"
+                            f"**Streak:** `{new_streak}`"
+                        )
+                
+                await update_streak_roles(message.author, new_streak)
+            else:
+                cursor.execute("UPDATE user_streaks SET msg_count = %s WHERE user_id = %s;", (new_msg_count, user_id))
+                conn.commit()
+
+
+# ==============================================================================
+# BACKGROUND LOOP: STREAK EXPIRATION (Runs every 30 seconds to catch 20h idle)
+# ==============================================================================
+
+@tasks.loop(seconds=30)
+async def streak_expiry_check():
+    now = datetime.now(timezone.utc)
+    expiry_limit = timedelta(hours=20)
+
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT user_id, current_streak FROM user_streaks 
+                WHERE current_streak > 0 AND (last_msg_time < %s OR (last_streak_time IS NOT NULL AND last_streak_time < %s));
+            """, (now - expiry_limit, now - expiry_limit))
+            
+            expired_users = cursor.fetchall()
+
+            for user_id, old_streak in expired_users:
+                cursor.execute("""
+                    UPDATE user_streaks 
+                    SET current_streak = 0, msg_count = 0, last_streak_time = NULL 
+                    WHERE user_id = %s;
+                """, (user_id,))
+                
+                for guild in bot.guilds:
+                    member = guild.get_member(user_id)
+                    if member:
+                        await remove_all_streak_roles(member)
+                        
+                        cursor.execute("SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;", (guild.id,))
+                        config = cursor.fetchone()
+                        if config and config[0]:
+                            channel = guild.get_channel(config[0])
+                            if channel:
+                                await channel.send(f"💔 {member.mention}, you have lost your streak!")
+            conn.commit()
+
+@streak_expiry_check.before_loop
+async def before_streak_check():
+    await bot.wait_until_ready()
+
+# Run Bot
 token = os.environ.get("DISCORD_TOKEN")
 if token:
     bot.run(token)
 else:
-    print("Error: DISCORD_TOKEN variable not found in the environment settings.")
+    print("Error: DISCORD_TOKEN is missing from variables configuration.")
