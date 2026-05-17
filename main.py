@@ -1,9 +1,12 @@
 import os
+import io
 import psycopg
+import requests
 from datetime import datetime, timedelta, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # Configuration
 ALLOWED_USER_ID = 1429110753683832985
@@ -111,11 +114,34 @@ def build_deadtrap_embed(kick_count):
     embed.add_field(name="\u200b", value=f"<:Dreamer:1495243686378868787> Kicks: {kick_count}", inline=False)
     return embed
 
+def get_user_streak_and_rank(user_id):
+    """Calculates user stats and orders everyone by current_streak to compute server leaderboard rank."""
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cursor:
+            # Fetch target user profile details
+            cursor.execute("SELECT current_streak, msg_count FROM user_streaks WHERE user_id = %s;", (user_id,))
+            user_row = cursor.fetchone()
+            if not user_row:
+                return 0, 0, 0
+            
+            streak_count, msg_progress = user_row
+
+            # Determine rank placement positioning order
+            cursor.execute("""
+                SELECT position FROM (
+                    SELECT user_id, RANK() OVER (ORDER BY current_streak DESC, last_msg_time ASC) as position 
+                    FROM user_streaks
+                ) as leaderboard WHERE user_id = %s;
+            """, (user_id,))
+            rank_row = cursor.fetchone()
+            rank = rank_row[0] if rank_row else 0
+            
+            return streak_count, msg_progress, rank
+
 
 # 2. Background Task Loop
 @tasks.loop(seconds=30)
 async def streak_expiry_check(bot_instance):
-    # If the master switch is off, suspend expiry processing entirely
     if not get_bot_active_status():
         return
 
@@ -196,17 +222,97 @@ async def on_ready():
         return
     init_db()
     print(f"Logged in as {bot.user.name}")
-    print("PostgreSQL Database initialized. Master switch operational.")
 
 
 # ==============================================================================
 # SLASH COMMANDS
 # ==============================================================================
 
+@bot.tree.command(name="messagestreak", description="Displays your rank and message streak status card.")
+async def messagestreak(interaction: discord.Interaction):
+    if not get_bot_active_status():
+        await interaction.response.send_message("The streak system is currently disabled by management.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    
+    # Extract live dynamic calculations from database entries
+    streak_count, msg_progress, rank_num = get_user_streak_and_rank(interaction.user.id)
+
+    # 1. Base Dimensions (Card Canvas Dimensions match the thumbnail structure)
+    width, height = 900, 300
+    card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+
+    # 2. Main Outer Container Panel Frame (Subtle Sleek Dark Theme)
+    draw.rounded_rectangle([10, 10, width-10, height-10], radius=24, fill=(15, 15, 18, 255), outline=(45, 47, 54, 255), width=2)
+    
+    # 3. Inner Banner Backdrop Gradient simulation
+    draw.rounded_rectangle([25, 25, width-25, height-25], radius=18, fill=(24, 25, 28, 255))
+
+    # 4. Process Circular User Avatar
+    avatar_size = 160
+    avatar_x, avatar_y = 50, 70
+    
+    # Fetch live fallback or high-res target member profile image link structure
+    avatar_url = interaction.user.display_avatar.with_size(256).url
+    try:
+        response = requests.get(avatar_url, timeout=5)
+        avatar_img = Image.open(io.BytesIO(response.content)).convert("RGBA")
+        avatar_img = avatar_img.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+        
+        # Round mask application overlay execution
+        mask = Image.new("L", (avatar_size, avatar_size), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.ellipse((0, 0, avatar_size, avatar_size), fill=255)
+        
+        # Mount profile asset cleanly down into template area mappings
+        card.paste(avatar_img, (avatar_x, avatar_y), mask=mask)
+        # Circular outer profile glow highlight stroke ring border line wrapper outline
+        draw.ellipse((avatar_x-3, avatar_y-3, avatar_x+avatar_size+3, avatar_y+avatar_size+3), outline=(52, 152, 219, 255), width=3)
+    except Exception as e:
+        print(f"Failed handling avatar asset processing mapping logic: {e}")
+        # Secondary fallback bounding structural placeholder indicator box if API timeout fails
+        draw.ellipse((avatar_x, avatar_y, avatar_x+avatar_size, avatar_y+avatar_size), fill=(43, 45, 49, 255), outline=(52, 152, 219, 255), width=3)
+
+    # 5. Fonts configuration loaders setups
+    try:
+        font_name = ImageFont.load_default(size=38)
+        font_metrics = ImageFont.load_default(size=52)
+        font_labels = ImageFont.load_default(size=22)
+    except TypeError:
+        font_name = font_metrics = font_labels = ImageFont.load_default()
+
+    # 6. Render Username Identity 
+    user_string = f"{interaction.user.name.upper()}"
+    draw.text((240, 75), user_string, font=font_name, fill=(255, 255, 255, 255))
+    
+    # Progress text metric label tracker line layout element footprint text
+    draw.text((240, 125), f"Daily Cap Increment: {msg_progress}/3 Messages", font=font_labels, fill=(142, 146, 151, 255))
+
+    # 7. Render Block Stat Matrix Blocks on the right side
+    # Metric Segment A: STREAK DAYS
+    draw.rounded_rectangle([480, 60, 670, 240], radius=15, fill=(32, 34, 37, 255), outline=(58, 61, 67, 255), width=2)
+    draw.text((500, 80), "STREAK", font=font_labels, fill=(52, 152, 219, 255))
+    draw.text((500, 120), f"{streak_count} Days", font=font_metrics, fill=(255, 255, 255, 255))
+
+    # Metric Segment B: SERVER RANK
+    draw.rounded_rectangle([690, 60, 875, 240], radius=15, fill=(32, 34, 37, 255), outline=(58, 61, 67, 255), width=2)
+    draw.text((710, 80), "RANK", font=font_labels, fill=(46, 204, 113, 255))
+    draw.text((710, 120), f"#{rank_num}" if rank_num > 0 else "N/A", font=font_metrics, fill=(255, 255, 255, 255))
+
+    # Compress layout structure directly into an asset stream mapping
+    final_buffer = io.BytesIO()
+    card.save(final_buffer, format="PNG")
+    final_buffer.seek(0)
+
+    discord_file = discord.File(fp=final_buffer, filename="message_streak_status.png")
+    await interaction.followup.send(file=discord_file)
+
+
 @bot.tree.command(name="togglebot", description="Turn the entire bot functionality ON or OFF.")
 @app_commands.describe(status="Choose True to turn ON, False to turn OFF")
 async def togglebot(interaction: discord.Interaction, status: bool):
-    # Enforcement checks: Only your ID, and only inside the specified channel
     if interaction.user.id != ALLOWED_USER_ID:
         await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
         return
@@ -217,7 +323,7 @@ async def togglebot(interaction: discord.Interaction, status: bool):
 
     set_bot_active_status(status)
     state_str = "🟢 **ENABLED/ONLINE**" if status else "🔴 **DISABLED/OFFLINE**"
-    await interaction.response.send_message(f"The bot is now {state_str}. All deadtrap and streak activity updates are halted.")
+    await interaction.response.send_message(f"The bot is now {state_str}. All activity metrics updates are completely paused.")
 
 @bot.tree.command(name="deadtrap", description="Sets the channel to act as a deadtrap.")
 @app_commands.describe(channel="The channel to turn into a deadtrap")
@@ -261,7 +367,6 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    # CRITICAL MASTER SWITCH CHECK: Ignore EVERYTHING if bot is set to offline
     if not get_bot_active_status():
         return
 
@@ -323,7 +428,7 @@ async def on_message(message):
 
             cursor.execute("UPDATE user_streaks SET last_msg_time = %s WHERE user_id = %s;", (now, user_id))
 
-            # 12-Hour Cooldown
+            # 12-Hour Cooldown Check
             if last_streak_time:
                 if now - last_streak_time < timedelta(hours=12):
                     conn.commit()
