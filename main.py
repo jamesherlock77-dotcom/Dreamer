@@ -1,7 +1,10 @@
 import os
+import asyncio
 import psycopg
 import aiohttp
 from datetime import datetime, timedelta, timezone
+import base64
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -77,13 +80,18 @@ async def generate_streak_image(display_name, streak, rank):
                     "steps": 20,
                     "width": 1024,
                     "height": 512,
-                    "model": "SDXL-Lightning"
+                    "model": "SDXL-Lightning-v2"
                 }
             },
             headers={"apikey": HORDE_API_KEY}
         ) as resp:
             data = await resp.json()
-            job_id = data["id"]
+
+        # If no ID returned → error
+        if "id" not in data:
+            raise RuntimeError(f"Horde error (no id): {data}")
+
+        job_id = data["id"]
 
         # Poll until ready
         while True:
@@ -105,9 +113,10 @@ async def generate_streak_image(display_name, streak, rank):
         ) as resp:
             result = await resp.json()
 
-        img_b64 = result["generations"][0]["img"]
+        if "generations" not in result or not result["generations"]:
+            raise RuntimeError(f"Horde returned no generations: {result}")
 
-        import base64
+        img_b64 = result["generations"][0]["img"]
         return base64.b64decode(img_b64)
 
 # ============================
@@ -268,7 +277,14 @@ async def streaks(interaction: discord.Interaction):
 
     await interaction.response.defer()
 
-    img_bytes = await generate_streak_image(display_name, streak, rank)
+    try:
+        img_bytes = await generate_streak_image(display_name, streak, rank)
+    except Exception as e:
+        await interaction.followup.send(
+            f"Failed to generate streak image: `{e}`",
+            ephemeral=True
+        )
+        return
 
     await interaction.followup.send(
         file=discord.File(fp=img_bytes, filename="streak.png")
@@ -301,6 +317,7 @@ async def on_message(message):
                     VALUES (%s, 1, 0, %s);
                 """, (user_id, now))
                 conn.commit()
+                await bot.process_commands(message)
                 return
 
             msg_count, current_streak, last_streak_time = user_data
