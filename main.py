@@ -67,7 +67,6 @@ async def generate_streak_image(display_name, streak, rank):
     )
 
     async with aiohttp.ClientSession() as session:
-        # Submit generation request
         async with session.post(
             "https://aihorde.net/api/v2/generate/async",
             json={
@@ -76,18 +75,17 @@ async def generate_streak_image(display_name, streak, rank):
                     "sampler_name": "k_euler",
                     "cfg_scale": 7,
                     "denoising_strength": 1,
-                    "seed": 0,
+                    "seed": "0",  # FIXED: must be a string
                     "steps": 20,
                     "width": 1024,
                     "height": 512,
-                    "model": "SDXL-Lightning-v2"
+                    "model": "SDXL-Lightning-v2"  # FIXED MODEL NAME
                 }
             },
             headers={"apikey": HORDE_API_KEY}
         ) as resp:
             data = await resp.json()
 
-        # If no ID returned → error
         if "id" not in data:
             raise RuntimeError(f"Horde error (no id): {data}")
 
