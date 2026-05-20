@@ -52,7 +52,7 @@ def init_db():
             conn.commit()
 
 # ============================
-# HORDE IMAGE GENERATION
+# HORDE IMAGE GENERATION (FREE-TIER FRIENDLY)
 # ============================
 
 async def generate_streak_image(display_name, streak, rank):
@@ -72,14 +72,14 @@ async def generate_streak_image(display_name, streak, rank):
             json={
                 "prompt": prompt,
                 "params": {
-                    "sampler_name": "k_euler",
-                    "cfg_scale": 7,
+                    "sampler_name": "lcm",          # free-tier friendly for Lightning
+                    "cfg_scale": 1,                 # Lightning prefers low CFG
                     "denoising_strength": 1,
-                    "seed": "0",  # FIXED: must be a string
-                    "steps": 20,
-                    "width": 1024,
-                    "height": 512,
-                    "model": "SDXL-Lightning-v2"  # FIXED MODEL NAME
+                    "seed": "0",                    # must be string
+                    "steps": 8,                     # low steps → low kudos
+                    "width": 768,                   # smaller resolution → low kudos
+                    "height": 384,
+                    "model": "SDXL-Lightning-v2"
                 }
             },
             headers={"apikey": HORDE_API_KEY}
