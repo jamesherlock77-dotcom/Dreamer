@@ -287,7 +287,88 @@ async def streaks(interaction: discord.Interaction):
     await interaction.followup.send(
         file=discord.File(fp=img_bytes, filename="streak.png")
     )
+# ============================
+# DREAM TEAM COMMANDS
+# ============================
 
+DREAM_TEAM_ROLE_ID = 1497337678960791632
+DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
+
+
+@bot.tree.command(name="adddreamteam", description="Add a user to Dream Team.")
+async def add_dreamteam(interaction: discord.Interaction, user: discord.Member):
+
+    if not any(role.id == DREAM_TEAM_MANAGER_ROLE_ID for role in interaction.user.roles):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
+
+    if not role:
+        await interaction.response.send_message(
+            "Dream Team role not found.",
+            ephemeral=True
+        )
+        return
+
+    if role in user.roles:
+        await interaction.response.send_message(
+            f"{user.mention} already has the Dream Team role.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await user.add_roles(role)
+        await interaction.response.send_message(
+            f"Added Dream Team role to {user.mention}."
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to add that role.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="removedreamteam", description="Remove a user from Dream Team.")
+async def remove_dreamteam(interaction: discord.Interaction, user: discord.Member):
+
+    if not any(role.id == DREAM_TEAM_MANAGER_ROLE_ID for role in interaction.user.roles):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.",
+            ephemeral=True
+        )
+        return
+
+    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
+
+    if not role:
+        await interaction.response.send_message(
+            "Dream Team role not found.",
+            ephemeral=True
+        )
+        return
+
+    if role not in user.roles:
+        await interaction.response.send_message(
+            f"{user.mention} does not have the Dream Team role.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await user.remove_roles(role)
+        await interaction.response.send_message(
+            f"Removed Dream Team role from {user.mention}."
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to remove that role.",
+            ephemeral=True
+        )
 # ============================
 # MESSAGE HANDLER
 # ============================
