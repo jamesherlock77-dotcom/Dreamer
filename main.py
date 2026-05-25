@@ -1,12 +1,8 @@
 import os
-import asyncio
-import psycopg
-import aiohttp
 from datetime import datetime, timedelta, timezone
-import base64
 
+import psycopg
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
 
 # ============================
@@ -14,7 +10,6 @@ from discord.ext import commands, tasks
 # ============================
 
 DB_URL = os.environ.get("DATABASE_URL")
-HORDE_API_KEY = os.environ.get("HORDE_API_KEY")
 
 STREAK_ROLES = {
     1: 1495573627217641604,
@@ -25,6 +20,9 @@ STREAK_ROLES = {
     60: 1495573754921877687,
     100: 1495573763004039380
 }
+
+DREAM_TEAM_ROLE_ID = 1497337678960791632
+DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
 
 # ============================
 # DATABASE INIT
@@ -49,73 +47,8 @@ def init_db():
                     last_msg_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
             conn.commit()
-
-# ============================
-# HORDE IMAGE GENERATION (FREE-TIER FRIENDLY)
-# ============================
-
-async def generate_streak_image(display_name, streak, rank):
-    prompt = (
-        f"Create a clean, modern streak card with a blurred colorful background, "
-        f"a dark rounded rectangle panel, and bold high-contrast text. "
-        f"Top text: '{display_name}'. "
-        f"Middle text: 'Current Streak {streak} Days'. "
-        f"Bottom text: 'Rank #{rank}'. "
-        f"Match the exact style of the reference image: soft glow, vibrant blur, "
-        f"sharp panel edges, centered layout, no avatar."
-    )
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://aihorde.net/api/v2/generate/async",
-            json={
-                "prompt": prompt,
-                "params": {
-                    "sampler_name": "lcm",          # free-tier friendly for Lightning
-                    "cfg_scale": 1,                 # Lightning prefers low CFG
-                    "denoising_strength": 1,
-                    "seed": "0",                    # must be string
-                    "steps": 8,                     # low steps → low kudos
-                    "width": 768,                   # smaller resolution → low kudos
-                    "height": 384,
-                    "model": "SDXL-Lightning-v2"
-                }
-            },
-            headers={"apikey": HORDE_API_KEY}
-        ) as resp:
-            data = await resp.json()
-
-        if "id" not in data:
-            raise RuntimeError(f"Horde error (no id): {data}")
-
-        job_id = data["id"]
-
-        # Poll until ready
-        while True:
-            async with session.get(
-                f"https://aihorde.net/api/v2/generate/status/{job_id}",
-                headers={"apikey": HORDE_API_KEY}
-            ) as resp:
-                status = await resp.json()
-
-            if status.get("done"):
-                break
-
-            await asyncio.sleep(1)
-
-        # Retrieve final image
-        async with session.get(
-            f"https://aihorde.net/api/v2/generate/status/{job_id}",
-            headers={"apikey": HORDE_API_KEY}
-        ) as resp:
-            result = await resp.json()
-
-        if "generations" not in result or not result["generations"]:
-            raise RuntimeError(f"Horde returned no generations: {result}")
-
-        img_b64 = result["generations"][0]["img"]
-        return base64.b64decode(img_b64)
 
 # ============================
 # BOT SETUP
@@ -131,7 +64,7 @@ class UnifiedBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
-        self.streak_task = streak_expiry_check.start(self)
+        streak_expiry_check.start(self)
 
 bot = UnifiedBot()
 
@@ -169,9 +102,9 @@ async def streak_expiry_check(bot_instance):
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT user_id, current_streak 
-                FROM user_streaks 
-                WHERE current_streak > 0 
+                SELECT user_id, current_streak
+                FROM user_streaks
+                WHERE current_streak > 0
                 AND last_msg_time < %s;
             """, (now - expiry_limit,))
 
@@ -179,8 +112,10 @@ async def streak_expiry_check(bot_instance):
 
             for user_id, old_streak in expired_users:
                 cursor.execute("""
-                    UPDATE user_streaks 
-                    SET current_streak = 0, msg_count = 0, last_streak_time = NULL 
+                    UPDATE user_streaks
+                    SET current_streak = 0,
+                        msg_count = 0,
+                        last_streak_time = NULL
                     WHERE user_id = %s;
                 """, (user_id,))
 
@@ -189,10 +124,12 @@ async def streak_expiry_check(bot_instance):
                     if member:
                         await remove_all_streak_roles(member)
 
-                        cursor.execute(
-                            "SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;",
-                            (guild.id,)
-                        )
+                        cursor.execute("""
+                            SELECT announcement_channel_id
+                            FROM streak_config
+                            WHERE guild_id = %s;
+                        """, (guild.id,))
+
                         config = cursor.fetchone()
 
                         if config and config[0]:
@@ -220,7 +157,10 @@ async def on_ready():
 @bot.tree.command(name="channel", description="Sets the channel for streak alerts.")
 async def channel_config(interaction: discord.Interaction, channel: discord.TextChannel):
     if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("Missing permissions.", ephemeral=True)
+        await interaction.response.send_message(
+            "Missing permissions.",
+            ephemeral=True
+        )
         return
 
     with psycopg.connect(DB_URL) as conn:
@@ -231,6 +171,7 @@ async def channel_config(interaction: discord.Interaction, channel: discord.Text
                 ON CONFLICT (guild_id)
                 DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id;
             """, (interaction.guild_id, channel.id))
+
             conn.commit()
 
     await interaction.response.send_message(
@@ -239,61 +180,33 @@ async def channel_config(interaction: discord.Interaction, channel: discord.Text
     )
 
 # ============================
-# /streaks COMMAND
+# /messagestreak COMMAND
 # ============================
 
-@bot.tree.command(name="streaks", description="View your streak card.")
-async def streaks(interaction: discord.Interaction):
-
+@bot.tree.command(name="messagestreak", description="View your current message streak.")
+async def messagestreak(interaction: discord.Interaction):
     user_id = interaction.user.id
 
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT current_streak
+                FROM user_streaks
+                WHERE user_id = %s;
+            """, (user_id,))
 
-            cursor.execute("SELECT current_streak FROM user_streaks WHERE user_id = %s;", (user_id,))
             row = cursor.fetchone()
 
-            if not row:
-                await interaction.response.send_message(
-                    "You don't have a streak yet.",
-                    ephemeral=True
-                )
-                return
+            streak = row[0] if row else 0
 
-            streak = row[0]
-
-            cursor.execute("""
-                SELECT user_id, current_streak,
-                RANK() OVER (ORDER BY current_streak DESC) AS r
-                FROM user_streaks;
-            """)
-            ranks = cursor.fetchall()
-
-            rank = next((r for uid, s, r in ranks if uid == user_id), None)
-
-    display_name = interaction.user.display_name
-
-    await interaction.response.defer()
-
-    try:
-        img_bytes = await generate_streak_image(display_name, streak, rank)
-    except Exception as e:
-        await interaction.followup.send(
-            f"Failed to generate streak image: `{e}`",
-            ephemeral=True
-        )
-        return
-
-    await interaction.followup.send(
-        file=discord.File(fp=img_bytes, filename="streak.png")
+    await interaction.response.send_message(
+        f"You have a message streak of `{streak}`",
+        ephemeral=True
     )
+
 # ============================
 # DREAM TEAM COMMANDS
 # ============================
-
-DREAM_TEAM_ROLE_ID = 1497337678960791632
-DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
-
 
 @bot.tree.command(name="adddreamteam", description="Add a user to Dream Team.")
 async def add_dreamteam(interaction: discord.Interaction, user: discord.Member):
@@ -332,7 +245,6 @@ async def add_dreamteam(interaction: discord.Interaction, user: discord.Member):
             ephemeral=True
         )
 
-
 @bot.tree.command(name="removedreamteam", description="Remove a user from Dream Team.")
 async def remove_dreamteam(interaction: discord.Interaction, user: discord.Member):
 
@@ -369,6 +281,7 @@ async def remove_dreamteam(interaction: discord.Interaction, user: discord.Membe
             "I don't have permission to remove that role.",
             ephemeral=True
         )
+
 # ============================
 # MESSAGE HANDLER
 # ============================
@@ -384,27 +297,32 @@ async def on_message(message):
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
 
-            cursor.execute(
-                "SELECT msg_count, current_streak, last_streak_time FROM user_streaks WHERE user_id = %s;",
-                (user_id,)
-            )
+            cursor.execute("""
+                SELECT msg_count, current_streak, last_streak_time
+                FROM user_streaks
+                WHERE user_id = %s;
+            """, (user_id,))
+
             user_data = cursor.fetchone()
 
             if not user_data:
                 cursor.execute("""
-                    INSERT INTO user_streaks (user_id, msg_count, current_streak, last_msg_time)
+                    INSERT INTO user_streaks
+                    (user_id, msg_count, current_streak, last_msg_time)
                     VALUES (%s, 1, 0, %s);
                 """, (user_id, now))
+
                 conn.commit()
                 await bot.process_commands(message)
                 return
 
             msg_count, current_streak, last_streak_time = user_data
 
-            cursor.execute(
-                "UPDATE user_streaks SET last_msg_time = %s WHERE user_id = %s;",
-                (now, user_id)
-            )
+            cursor.execute("""
+                UPDATE user_streaks
+                SET last_msg_time = %s
+                WHERE user_id = %s;
+            """, (now, user_id))
 
             can_progress = (
                 last_streak_time is None or
@@ -417,7 +335,7 @@ async def on_message(message):
                 new_streak = current_streak + 1
 
                 cursor.execute("""
-                    UPDATE user_streaks 
+                    UPDATE user_streaks
                     SET msg_count = 0,
                         current_streak = %s,
                         last_streak_time = %s
@@ -426,10 +344,12 @@ async def on_message(message):
 
                 conn.commit()
 
-                cursor.execute(
-                    "SELECT announcement_channel_id FROM streak_config WHERE guild_id = %s;",
-                    (message.guild.id,)
-                )
+                cursor.execute("""
+                    SELECT announcement_channel_id
+                    FROM streak_config
+                    WHERE guild_id = %s;
+                """, (message.guild.id,))
+
                 config = cursor.fetchone()
 
                 if config and config[0]:
@@ -443,10 +363,12 @@ async def on_message(message):
                 await update_streak_roles(message.author, new_streak)
 
             else:
-                cursor.execute(
-                    "UPDATE user_streaks SET msg_count = %s WHERE user_id = %s;",
-                    (new_msg_count, user_id)
-                )
+                cursor.execute("""
+                    UPDATE user_streaks
+                    SET msg_count = %s
+                    WHERE user_id = %s;
+                """, (new_msg_count, user_id))
+
                 conn.commit()
 
     await bot.process_commands(message)
@@ -456,6 +378,7 @@ async def on_message(message):
 # ============================
 
 token = os.environ.get("DISCORD_TOKEN")
+
 if token:
     bot.run(token)
 else:
