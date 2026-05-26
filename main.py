@@ -27,8 +27,9 @@ DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
 CC_ROLE_ID = 1495165348654219344
 CC_MANAGER_ROLE_ID = 1508601647880736899
 
+
 # ============================
-# DATABASE
+# DATABASE INIT
 # ============================
 
 def init_db():
@@ -64,6 +65,7 @@ def init_db():
 
             conn.commit()
 
+
 # ============================
 # BOT SETUP
 # ============================
@@ -71,6 +73,7 @@ def init_db():
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+
 
 class UnifiedBot(commands.Bot):
     def __init__(self):
@@ -81,7 +84,9 @@ class UnifiedBot(commands.Bot):
         streak_expiry_check.start()
         await self.tree.sync()
 
+
 bot = UnifiedBot()
+
 
 # ============================
 # ROLE HELPERS
@@ -91,19 +96,20 @@ async def update_streak_roles(member, streak):
     try:
         for threshold, role_id in STREAK_ROLES.items():
             role = member.guild.get_role(role_id)
+            if not role:
+                continue
 
-            if role:
-                if streak >= threshold and role not in member.roles:
-                    await member.add_roles(role)
-                elif streak < threshold and role in member.roles:
-                    await member.remove_roles(role)
+            if streak >= threshold and role not in member.roles:
+                await member.add_roles(role)
+            elif streak < threshold and role in member.roles:
+                await member.remove_roles(role)
     except discord.Forbidden:
         pass
+
 
 async def remove_all_streak_roles(member):
     try:
         roles = []
-
         for role_id in STREAK_ROLES.values():
             role = member.guild.get_role(role_id)
             if role and role in member.roles:
@@ -111,12 +117,12 @@ async def remove_all_streak_roles(member):
 
         if roles:
             await member.remove_roles(*roles)
-
     except discord.Forbidden:
         pass
 
+
 # ============================
-# STREAK EXPIRY
+# STREAK EXPIRY LOOP
 # ============================
 
 @tasks.loop(seconds=30)
@@ -127,31 +133,32 @@ async def streak_expiry_check():
         with conn.cursor() as cursor:
 
             cursor.execute("""
-                SELECT user_id, current_streak
+                SELECT user_id
                 FROM user_streaks
                 WHERE current_streak > 0
-                AND last_msg_time < %s
+                AND last_msg_time < %s;
             """, (now - timedelta(hours=24),))
 
             expired = cursor.fetchall()
 
-            for user_id, old_streak in expired:
+            for (user_id,) in expired:
+
                 cursor.execute("""
                     UPDATE user_streaks
                     SET lost_streak = current_streak,
                         current_streak = 0,
                         msg_count = 0,
                         last_streak_time = NULL
-                    WHERE user_id = %s
+                    WHERE user_id = %s;
                 """, (user_id,))
 
                 for guild in bot.guilds:
                     member = guild.get_member(user_id)
-
                     if member:
                         await remove_all_streak_roles(member)
 
             conn.commit()
+
 
 # ============================
 # READY
@@ -161,8 +168,9 @@ async def streak_expiry_check():
 async def on_ready():
     print(f"Logged in as {bot.user}")
 
+
 # ============================
-# MESSAGE TRACKING
+# MESSAGE SYSTEM
 # ============================
 
 @bot.event
@@ -170,8 +178,8 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    now = datetime.now(timezone.utc)
     user_id = message.author.id
+    now = datetime.now(timezone.utc)
 
     with psycopg.connect(DB_URL) as conn:
         with conn.cursor() as cursor:
@@ -179,7 +187,7 @@ async def on_message(message):
             cursor.execute("""
                 SELECT msg_count, current_streak, last_streak_time
                 FROM user_streaks
-                WHERE user_id = %s
+                WHERE user_id = %s;
             """, (user_id,))
 
             row = cursor.fetchone()
@@ -188,41 +196,71 @@ async def on_message(message):
                 cursor.execute("""
                     INSERT INTO user_streaks
                     (user_id, msg_count, current_streak, last_msg_time)
-                    VALUES (%s, 1, 0, %s)
+                    VALUES (%s, 1, 0, %s);
                 """, (user_id, now))
+                conn.commit()
+                await bot.process_commands(message)
+                return
 
-            else:
-                msg_count, current_streak, last_streak_time = row
-                msg_count += 1
+            msg_count, current_streak, last_streak_time = row
 
-                if msg_count >= 3:
-                    if not last_streak_time or now - last_streak_time >= timedelta(hours=20):
-                        current_streak += 1
-                        msg_count = 0
-                        last_streak_time = now
-                        await update_streak_roles(message.author, current_streak)
+            cursor.execute("""
+                UPDATE user_streaks
+                SET last_msg_time = %s
+                WHERE user_id = %s;
+            """, (now, user_id))
+
+            can_progress = (
+                last_streak_time is None or
+                now - last_streak_time >= timedelta(hours=20)
+            )
+
+            new_msg_count = msg_count + 1
+
+            if new_msg_count >= 3 and can_progress:
+                new_streak = current_streak + 1
 
                 cursor.execute("""
                     UPDATE user_streaks
-                    SET msg_count = %s,
+                    SET msg_count = 0,
                         current_streak = %s,
-                        last_streak_time = %s,
-                        last_msg_time = %s
-                    WHERE user_id = %s
-                """, (
-                    msg_count,
-                    current_streak,
-                    last_streak_time,
-                    now,
-                    user_id
-                ))
+                        last_streak_time = %s
+                    WHERE user_id = %s;
+                """, (new_streak, now, user_id))
 
-            conn.commit()
+                conn.commit()
+
+                await update_streak_roles(message.author, new_streak)
+
+                cursor.execute("""
+                    SELECT announcement_channel_id
+                    FROM streak_config
+                    WHERE guild_id = %s;
+                """, (message.guild.id,))
+
+                config = cursor.fetchone()
+
+                if config and config[0]:
+                    channel = message.guild.get_channel(config[0])
+                    if channel:
+                        await channel.send(
+                            f"🔥 {message.author.mention} streak: **{new_streak}**"
+                        )
+
+            else:
+                cursor.execute("""
+                    UPDATE user_streaks
+                    SET msg_count = %s
+                    WHERE user_id = %s;
+                """, (new_msg_count, user_id))
+
+                conn.commit()
 
     await bot.process_commands(message)
 
+
 # ============================
-# COMMANDS
+# /STREAK
 # ============================
 
 @bot.tree.command(name="messagestreak")
@@ -234,12 +272,17 @@ async def messagestreak(interaction: discord.Interaction):
             cursor.execute("""
                 SELECT current_streak
                 FROM user_streaks
-                WHERE user_id = %s
+                WHERE user_id = %s;
             """, (interaction.user.id,))
             row = cursor.fetchone()
 
     streak = row[0] if row else 0
-    await interaction.followup.send(f"Your streak is **{streak}**")
+    await interaction.followup.send(f"📊 Your streak is **{streak}**")
+
+
+# ============================
+# /REVIVE
+# ============================
 
 @bot.tree.command(name="revivestreak")
 async def revivestreak(interaction: discord.Interaction):
@@ -253,19 +296,19 @@ async def revivestreak(interaction: discord.Interaction):
             cursor.execute("""
                 SELECT lost_streak, last_revive
                 FROM user_streaks
-                WHERE user_id = %s
+                WHERE user_id = %s;
             """, (interaction.user.id,))
 
             row = cursor.fetchone()
 
-            if not row or row[0] == 0:
+            if not row or row[0] <= 0:
                 await interaction.followup.send("No streak to revive.")
                 return
 
             lost_streak, last_revive = row
 
             if last_revive and now - last_revive < timedelta(days=7):
-                await interaction.followup.send("You can only revive once every 7 days.")
+                await interaction.followup.send("Cooldown: 7 days.")
                 return
 
             cursor.execute("""
@@ -273,13 +316,18 @@ async def revivestreak(interaction: discord.Interaction):
                 SET current_streak = %s,
                     lost_streak = 0,
                     last_revive = %s
-                WHERE user_id = %s
+                WHERE user_id = %s;
             """, (lost_streak, now, interaction.user.id))
 
             conn.commit()
 
     await update_streak_roles(interaction.user, lost_streak)
-    await interaction.followup.send(f"Revived streak to **{lost_streak}**")
+    await interaction.followup.send(f"Revived **{lost_streak}** streak.")
+
+
+# ============================
+# /GIVE STREAK
+# ============================
 
 @bot.tree.command(name="givestreak")
 async def givestreak(interaction: discord.Interaction, user: discord.Member, amount: int):
@@ -295,12 +343,17 @@ async def givestreak(interaction: discord.Interaction, user: discord.Member, amo
                 INSERT INTO user_streaks (user_id, current_streak)
                 VALUES (%s, %s)
                 ON CONFLICT (user_id)
-                DO UPDATE SET current_streak = %s
-            """, (user.id, amount, amount))
+                DO UPDATE SET current_streak = EXCLUDED.current_streak;
+            """, (user.id, amount))
             conn.commit()
 
     await update_streak_roles(user, amount)
-    await interaction.followup.send("Done.")
+    await interaction.followup.send("Streak given.")
+
+
+# ============================
+# /REMOVE STREAK
+# ============================
 
 @bot.tree.command(name="removestreak")
 async def removestreak(interaction: discord.Interaction, user: discord.Member):
@@ -316,54 +369,17 @@ async def removestreak(interaction: discord.Interaction, user: discord.Member):
                 UPDATE user_streaks
                 SET current_streak = 0,
                     msg_count = 0
-                WHERE user_id = %s
+                WHERE user_id = %s;
             """, (user.id,))
             conn.commit()
 
     await remove_all_streak_roles(user)
-    await interaction.followup.send("Removed streak.")
+    await interaction.followup.send("Streak removed.")
 
-@bot.tree.command(name="channel")
-async def channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    await interaction.response.defer(ephemeral=True)
 
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.followup.send("Missing permission.")
-        return
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO streak_config (guild_id, announcement_channel_id)
-                VALUES (%s, %s)
-                ON CONFLICT (guild_id)
-                DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id
-            """, (interaction.guild_id, channel.id))
-            conn.commit()
-
-    await interaction.followup.send("Channel set.")
-
-@bot.tree.command(name="adddreamteam")
-async def adddreamteam(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-
-    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.followup.send("No permission.")
-        return
-
-    await user.add_roles(interaction.guild.get_role(DREAM_TEAM_ROLE_ID))
-    await interaction.followup.send("Role added.")
-
-@bot.tree.command(name="removedreamteam")
-async def removedreamteam(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-
-    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.followup.send("No permission.")
-        return
-
-    await user.remove_roles(interaction.guild.get_role(DREAM_TEAM_ROLE_ID))
-    await interaction.followup.send("Role removed.")
+# ============================
+# CC SYSTEM
+# ============================
 
 @bot.tree.command(name="addccrole")
 async def addccrole(interaction: discord.Interaction, user: discord.Member):
@@ -373,8 +389,11 @@ async def addccrole(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("No permission.")
         return
 
-    await user.add_roles(interaction.guild.get_role(CC_ROLE_ID))
+    role = interaction.guild.get_role(CC_ROLE_ID)
+    await user.add_roles(role)
+
     await interaction.followup.send("CC role added.")
+
 
 @bot.tree.command(name="removeccrole")
 async def removeccrole(interaction: discord.Interaction, user: discord.Member):
@@ -384,8 +403,39 @@ async def removeccrole(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("No permission.")
         return
 
-    await user.remove_roles(interaction.guild.get_role(CC_ROLE_ID))
+    role = interaction.guild.get_role(CC_ROLE_ID)
+    await user.remove_roles(role)
+
     await interaction.followup.send("CC role removed.")
+
+
+# ============================
+# DREAM TEAM
+# ============================
+
+@bot.tree.command(name="adddreamteam")
+async def adddreamteam(interaction: discord.Interaction, user: discord.Member):
+    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
+        await interaction.response.send_message("No permission.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
+    await user.add_roles(role)
+
+    await interaction.response.send_message("Dream Team added.", ephemeral=True)
+
+
+@bot.tree.command(name="removedreamteam")
+async def removedreamteam(interaction: discord.Interaction, user: discord.Member):
+    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
+        await interaction.response.send_message("No permission.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
+    await user.remove_roles(role)
+
+    await interaction.response.send_message("Dream Team removed.", ephemeral=True)
+
 
 # ============================
 # RUN
