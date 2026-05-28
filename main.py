@@ -27,6 +27,14 @@ DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
 CC_ROLE_ID = 1495165348654219344
 CC_MANAGER_ROLE_ID = 1508601647880736899
 
+EVENT_MANAGER_ROLE_ID = 1509630177779646495
+
+EVENT_ROLES = {
+    "helper": 1504584843063988424,
+    "lead": 1504578478253805698,
+    "host": 1504578548726239262
+}
+
 
 # ============================
 # DATABASE INIT
@@ -210,7 +218,6 @@ async def on_message(message):
                 WHERE user_id = %s;
             """, (now, user_id))
 
-            # 24h requirement
             can_progress = (
                 last_streak_time is None or
                 now - last_streak_time >= timedelta(hours=24)
@@ -467,6 +474,68 @@ async def removedreamteam(interaction: discord.Interaction, user: discord.Member
 
     role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
     await user.remove_roles(role)
+    await interaction.response.send_message("Done.", ephemeral=True)
+
+
+# ============================
+# EVENT ROLE COMMANDS
+# ============================
+
+@bot.tree.command(
+    name="addeventrole",
+    description="Give an event role (helper/lead/host)."
+)
+async def addeventrole(interaction: discord.Interaction, role: str, user: discord.Member):
+
+    if not any(r.id == EVENT_MANAGER_ROLE_ID for r in interaction.user.roles):
+        await interaction.response.send_message("No permission.", ephemeral=True)
+        return
+
+    role = role.lower()
+
+    if role not in EVENT_ROLES:
+        await interaction.response.send_message(
+            "Invalid role. Use: helper, lead, host",
+            ephemeral=True
+        )
+        return
+
+    target_role = interaction.guild.get_role(EVENT_ROLES[role])
+
+    if not target_role:
+        await interaction.response.send_message("Role not found.", ephemeral=True)
+        return
+
+    await user.add_roles(target_role)
+    await interaction.response.send_message("Done.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="removeeventrole",
+    description="Remove an event role (helper/lead/host)."
+)
+async def removeeventrole(interaction: discord.Interaction, role: str, user: discord.Member):
+
+    if not any(r.id == EVENT_MANAGER_ROLE_ID for r in interaction.user.roles):
+        await interaction.response.send_message("No permission.", ephemeral=True)
+        return
+
+    role = role.lower()
+
+    if role not in EVENT_ROLES:
+        await interaction.response.send_message(
+            "Invalid role. Use: helper, lead, host",
+            ephemeral=True
+        )
+        return
+
+    target_role = interaction.guild.get_role(EVENT_ROLES[role])
+
+    if not target_role:
+        await interaction.response.send_message("Role not found.", ephemeral=True)
+        return
+
+    await user.remove_roles(target_role)
     await interaction.response.send_message("Done.", ephemeral=True)
 
 
