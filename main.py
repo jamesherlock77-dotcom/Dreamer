@@ -22,6 +22,18 @@ CHECK_INTERVAL          = 300  # 5 minutes
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 RAPIDAPI_KEY    = os.environ["RAPIDAPI_KEY"]
+ 
+# ── Tier config (role_id, view threshold, label) ─────────────────────────
+# Tiers are ordered lowest to highest. View threshold of 0 = video-count only tier.
+TIERS = [
+    {"role_id": 1512870343310835974, "min_views": 0,      "min_videos": 5,  "label": "5+ Videos"},
+    {"role_id": 1512871854308589648, "min_views": 5000,   "min_videos": 0,  "label": "5k Views"},
+    {"role_id": 1512871100361478375, "min_views": 10000,  "min_videos": 0,  "label": "10k Views"},
+    {"role_id": 1512872854926917874, "min_views": 20000,  "min_videos": 0,  "label": "20k Views"},
+    {"role_id": 1512873532374122516, "min_views": 30000,  "min_videos": 0,  "label": "30k Views"},
+    {"role_id": 1512874309641699399, "min_views": 50000,  "min_videos": 0,  "label": "50k Views"},
+    {"role_id": 1512874841240375436, "min_views": 100000, "min_videos": 0,  "label": "100k Views"},
+]
 # ────────────────────────────────────────────────────────────────────────
  
 intents = discord.Intents.default()
@@ -37,6 +49,10 @@ processed_forum_posts    = set()
 # In-memory CC database:
 # {user_id: {"youtube": {"handle": "...", "confirmed": bool}, "tiktok": {"handle": "...", "confirmed": bool}}}
 cc_database = {}
+ 
+# Tracks the highest tier index (into TIERS list) each user has already been notified for.
+# {user_id: int}  — -1 means no tier yet
+user_tier_cache = {}
  
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
 TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
@@ -212,7 +228,6 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
  
 async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict:
     """Get count and total views of #dreamyvr videos posted in the last 30 days."""
-    # Resolve handle to channel ID
     url = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
     async with session.get(url, params=params) as r:
@@ -222,7 +237,6 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
             return {"videos": 0, "views": 0}
         channel_id = items[0]["id"]
  
-    # Search for videos in last 30 days
     since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {
@@ -240,7 +254,6 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
             return {"videos": 0, "views": 0}
         video_ids = [item["id"]["videoId"] for item in items]
  
-    # Get snippet + statistics for those videos
     url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
         "part": "snippet,statistics",
@@ -254,15 +267,10 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
     dreamyvr_count = 0
  
     for item in data.get("items", []):
-        snippet = item.get("snippet", {})
-        title       = snippet.get("title", "")
-        description = snippet.get("description", "")
-        tags        = " ".join(snippet.get("tags", []))
-        combined    = f"{title} {description} {tags}"
- 
+        snippet  = item.get("snippet", {})
+        combined = f"{snippet.get('title', '')} {snippet.get('description', '')} {' '.join(snippet.get('tags', []))}"
         if not re.search(r'#dreamyvr', combined, re.IGNORECASE):
             continue
- 
         dreamyvr_count += 1
         total_views += int(item.get("statistics", {}).get("viewCount", 0))
  
@@ -278,7 +286,6 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
     }
  
     try:
-        # Step 1: Resolve handle to user_id
         async with session.get(
             "https://tiktok-scraper7.p.rapidapi.com/user/info",
             headers=headers,
@@ -287,7 +294,6 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
             user_data = await r.json()
             user_id = user_data["data"]["user"]["id"]
  
-        # Step 2: Get user's posts
         async with session.get(
             "https://tiktok-scraper7.p.rapidapi.com/user/posts",
             headers=headers,
@@ -299,7 +305,6 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
         if not videos:
             return {"videos": 0, "views": 0}
  
-        # Step 3: Filter to last 30 days AND #dreamyvr in title
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
         total_views = 0
         dreamyvr_count = 0
@@ -308,11 +313,8 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
             create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
             if create_time < cutoff:
                 continue
- 
-            title = video.get("title", "")
-            if not re.search(r'#dreamyvr', title, re.IGNORECASE):
+            if not re.search(r'#dreamyvr', video.get("title", ""), re.IGNORECASE):
                 continue
- 
             dreamyvr_count += 1
             total_views += video.get("play_count", 0)
  
@@ -321,6 +323,94 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
     except Exception as e:
         print(f"TikTok RapidAPI error: {e}")
         return {"videos": 0, "views": 0}
+ 
+ 
+async def get_combined_stats(session: aiohttp.ClientSession, user_id: int) -> dict:
+    """Fetch and combine stats across all confirmed platforms for a user."""
+    user_entry = cc_database.get(user_id, {})
+    total_videos = 0
+    total_views  = 0
+ 
+    yt_entry = user_entry.get("youtube")
+    if yt_entry and yt_entry["confirmed"]:
+        stats = await get_youtube_stats(session, yt_entry["handle"])
+        total_videos += stats["videos"]
+        total_views  += stats["views"]
+ 
+    tt_entry = user_entry.get("tiktok")
+    if tt_entry and tt_entry["confirmed"]:
+        stats = await get_tiktok_stats(session, tt_entry["handle"])
+        total_videos += stats["videos"]
+        total_views  += stats["views"]
+ 
+    # If they hit 5+ videos, count views as full 30-day regardless of timing
+    return {"videos": total_videos, "views": total_views}
+ 
+ 
+def get_highest_qualifying_tier_index(videos: int, views: int) -> int:
+    """Return the index of the highest tier the user qualifies for, or -1 if none."""
+    highest = -1
+    for i, tier in enumerate(TIERS):
+        qualifies = False
+        if tier["min_videos"] > 0 and videos >= tier["min_videos"]:
+            qualifies = True
+        if tier["min_views"] > 0 and videos >= 5 and views >= tier["min_views"]:
+            qualifies = True
+        if qualifies:
+            highest = i
+    return highest
+ 
+ 
+# ── Tier check task ───────────────────────────────────────────────────────
+ 
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_tiers():
+    if not bot.guilds:
+        return
+    guild = bot.guilds[0]
+    submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
+    if not submissions_channel:
+        return
+ 
+    print(f"Checking tiers for {len(cc_database)} linked users...")
+ 
+    async with aiohttp.ClientSession() as session:
+        for user_id, platforms in cc_database.items():
+            # Skip if no confirmed platforms
+            has_confirmed = any(p.get("confirmed") for p in platforms.values())
+            if not has_confirmed:
+                continue
+ 
+            try:
+                stats = await get_combined_stats(session, user_id)
+                videos = stats["videos"]
+                views  = stats["views"]
+ 
+                current_highest = get_highest_qualifying_tier_index(videos, views)
+                previously_notified = user_tier_cache.get(user_id, -1)
+ 
+                if current_highest > previously_notified:
+                    # Notify for each new tier they've unlocked
+                    for tier_index in range(previously_notified + 1, current_highest + 1):
+                        tier = TIERS[tier_index]
+                        member = guild.get_member(user_id)
+                        mention = member.mention if member else f"<@{user_id}>"
+                        role_mention = f"<@&{tier['role_id']}>"
+                        await submissions_channel.send(
+                            f"🎉 {mention} is ready for the **{tier['label']}** tier! {role_mention}"
+                        )
+                        await asyncio.sleep(0.5)
+ 
+                    user_tier_cache[user_id] = current_highest
+ 
+                await asyncio.sleep(1)
+ 
+            except Exception as e:
+                print(f"Tier check error for user {user_id}: {e}")
+ 
+@check_tiers.before_loop
+async def before_check_tiers():
+    await bot.wait_until_ready()
  
  
 # ── /ccstats command ──────────────────────────────────────────────────────
@@ -351,28 +441,65 @@ async def ccstats(interaction: discord.Interaction, platform: str):
         return
  
     await interaction.response.defer(ephemeral=True)
- 
     handle = platform_entry["handle"]
  
     async with aiohttp.ClientSession() as session:
         if platform == "youtube":
             stats = await get_youtube_stats(session, handle)
-            await interaction.followup.send(
-                f"📊 **Your YouTube stats (last 30 days, #dreamyvr videos only)**\n"
-                f"Handle: `@{handle}`\n"
-                f"#dreamyvr videos posted: **{stats['videos']}**\n"
-                f"Total views: **{stats['views']:,}**",
-                ephemeral=True
-            )
         else:
             stats = await get_tiktok_stats(session, handle)
-            await interaction.followup.send(
-                f"📊 **Your TikTok stats (last 30 days, #dreamyvr videos only)**\n"
-                f"Handle: `@{handle}`\n"
-                f"#dreamyvr videos posted: **{stats['videos']}**\n"
-                f"Total views: **{stats['views']:,}**",
-                ephemeral=True
-            )
+ 
+    platform_label = "YouTube" if platform == "youtube" else "TikTok"
+    await interaction.followup.send(
+        f"📊 **Your {platform_label} stats (last 30 days, #dreamyvr videos only)**\n"
+        f"Handle: `@{handle}`\n"
+        f"#dreamyvr videos posted: **{stats['videos']}**\n"
+        f"Total views: **{stats['views']:,}**",
+        ephemeral=True
+    )
+ 
+ 
+# ── /linkleaderboard command ──────────────────────────────────────────────
+ 
+@bot.tree.command(name="linkleaderboard", description="See all linked content creators")
+async def linkleaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+ 
+    if not cc_database:
+        await interaction.followup.send("No linked accounts yet.")
+        return
+ 
+    lines = ["📋 **Linked Content Creators**\n"]
+ 
+    for user_id, platforms in cc_database.items():
+        confirmed_platforms = {p: d for p, d in platforms.items() if d.get("confirmed")}
+        if not confirmed_platforms:
+            continue
+ 
+        member = interaction.guild.get_member(user_id)
+        mention = member.mention if member else f"<@{user_id}>"
+ 
+        platform_parts = []
+        for platform, data in confirmed_platforms.items():
+            emoji = "▶️" if platform == "youtube" else "🎵"
+            platform_parts.append(f"{emoji} {platform.capitalize()}: `@{data['handle']}`")
+ 
+        lines.append(f"{mention} — {' | '.join(platform_parts)}")
+ 
+    # Split into chunks to avoid Discord's 2000 char limit
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 1900:
+            chunks.append(current)
+            current = line + "\n"
+        else:
+            current += line + "\n"
+    if current:
+        chunks.append(current)
+ 
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
  
  
 # ── Member count ─────────────────────────────────────────────────────────
@@ -643,10 +770,8 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync commands: {e}")
  
-    # Register persistent button views
     bot.add_view(CCConfirmView(user_id=0, platform="youtube", handle=""))
  
-    # Load CC database from channel history
     await load_cc_database()
  
     for guild in bot.guilds:
@@ -654,6 +779,7 @@ async def on_ready():
  
     check_socials.start()
     check_forum.start()
+    check_tiers.start()
  
  
 bot.run(DISCORD_TOKEN)
