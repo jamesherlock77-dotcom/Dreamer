@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -27,7 +28,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 last_youtube_video_id    = None
 last_tiktok_video_id     = None
 youtube_channel_id_cache = None
-processed_forum_posts    = set()  # track posts we've already handled
+processed_forum_posts    = set()
 
 
 # ── Member count helper ──────────────────────────────────────────────────
@@ -37,8 +38,6 @@ async def update_member_count(guild: discord.Guild):
     if channel:
         await channel.edit(name=f"☁️・Members: {guild.member_count}")
 
-
-# ── Member join/leave events ─────────────────────────────────────────────
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -50,10 +49,10 @@ async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
 
 
-# ── Forum checker ────────────────────────────────────────────────────────
+# ── Forum helpers ────────────────────────────────────────────────────────
 
-YOUTUBE_REGEX = re.compile(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)')
-TIKTOK_REGEX  = re.compile(r'(https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+)')
+YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+')
+TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+')
 
 def has_video_link(content: str) -> bool:
     return bool(YOUTUBE_REGEX.search(content) or TIKTOK_REGEX.search(content))
@@ -66,67 +65,67 @@ def has_required_tag(thread: discord.Thread) -> bool:
         return False
     return any(tag.id == REQUIRED_TAG_ID for tag in thread.applied_tags)
 
+def already_reacted(message: discord.Message) -> bool:
+    for reaction in message.reactions:
+        if str(reaction.emoji) == "👍":
+            # Check if our bot already reacted
+            return reaction.me
+    return False
 
-async def check_forum_post(thread: discord.Thread):
-    """Check a single forum thread and process it if it meets requirements."""
-    if thread.id in processed_forum_posts:
-        return
 
-    # Must have the required tag
-    if not has_required_tag(thread):
-        return
-
-    # Fetch the first message (the post itself)
+async def process_thread(thread: discord.Thread):
+    """Check a thread and react + post to submissions if it meets requirements."""
     try:
+        # Must have the required tag
+        if not has_required_tag(thread):
+            return
+
+        # Fetch the first (original) message
         messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
         if not messages:
             return
         first_message = messages[0]
+        content = first_message.content
+
+        # Must have #dreamyvr and a video link
+        if not has_dreamyvr_hashtag(content) or not has_video_link(content):
+            return
+
+        # React with thumbs up if we haven't already
+        if not already_reacted(first_message):
+            await first_message.add_reaction("👍")
+
+        # Post to submissions channel if not already done
+        if thread.id not in processed_forum_posts:
+            submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
+            if submissions_channel:
+                post_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{first_message.id}"
+                await submissions_channel.send(f"📹 New community video submission!\n{post_link}")
+            processed_forum_posts.add(thread.id)
+
     except Exception as e:
-        print(f"Error fetching forum post messages: {e}")
-        return
-
-    content = first_message.content
-
-    # Must have #dreamyvr hashtag and a YouTube or TikTok link
-    if not has_dreamyvr_hashtag(content):
-        return
-    if not has_video_link(content):
-        return
-
-    # All requirements met — react and post to submissions channel
-    try:
-        await first_message.add_reaction("👍")
-    except Exception as e:
-        print(f"Error adding reaction: {e}")
-
-    try:
-        submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
-        if submissions_channel:
-            post_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{first_message.id}"
-            await submissions_channel.send(
-                f"📹 New community video submission!\n{post_link}"
-            )
-    except Exception as e:
-        print(f"Error posting to submissions channel: {e}")
-
-    processed_forum_posts.add(thread.id)
+        print(f"Error processing thread {thread.id}: {e}")
 
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_forum():
     forum_channel = bot.get_channel(FORUM_CHANNEL_ID)
     if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+        print("Forum channel not found or not a ForumChannel!")
         return
 
-    # Check all active threads
-    for thread in forum_channel.threads:
-        await check_forum_post(thread)
+    print(f"Checking forum... ({len(forum_channel.threads)} active threads)")
 
-    # Also check archived threads
+    # Check active threads
+    for thread in forum_channel.threads:
+        await process_thread(thread)
+        await asyncio.sleep(0.5)  # small delay to avoid rate limits
+
+    # Check archived threads
     try:
-        async for thread in forum_channel.archived_threads(limit=50):
-            await check_forum_post(thread)
+        async for thread in forum_channel.archived_threads(limit=100):
+            await process_thread(thread)
+            await asyncio.sleep(0.5)
     except Exception as e:
         print(f"Error fetching archived threads: {e}")
 
@@ -134,20 +133,6 @@ async def check_forum():
 @check_forum.before_loop
 async def before_check_forum():
     await bot.wait_until_ready()
-
-
-# ── Detect new forum posts in real time ──────────────────────────────────
-
-@bot.event
-async def on_thread_create(thread: discord.Thread):
-    if thread.parent_id == FORUM_CHANNEL_ID:
-        # Wait a moment for the first message to be posted
-        await discord.utils.sleep_until(
-            discord.utils.utcnow().replace(microsecond=0).__class__.utcnow()
-        )
-        import asyncio
-        await asyncio.sleep(2)
-        await check_forum_post(thread)
 
 
 # ── YouTube helpers ──────────────────────────────────────────────────────
@@ -226,21 +211,19 @@ async def send_notification(video_url: str):
         )
 
 
-# ── Background task ──────────────────────────────────────────────────────
+# ── Social media check loop ──────────────────────────────────────────────
 
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_socials():
     global last_youtube_video_id, last_tiktok_video_id
 
     async with aiohttp.ClientSession() as session:
-        # — YouTube —
         yt_id, yt_url = await get_latest_youtube_video(session)
         if yt_id and yt_id != last_youtube_video_id:
             if last_youtube_video_id is not None:
                 await send_notification(yt_url)
             last_youtube_video_id = yt_id
 
-        # — TikTok —
         tt_id, tt_url = await get_latest_tiktok_video(session)
         if tt_id and tt_id != last_tiktok_video_id:
             if last_tiktok_video_id is not None:
@@ -299,7 +282,6 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
-    # Set initial member count on startup
     for guild in bot.guilds:
         await update_member_count(guild)
 
