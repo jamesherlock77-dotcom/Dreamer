@@ -21,6 +21,7 @@ CHECK_INTERVAL          = 300  # 5 minutes
 
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
+RAPIDAPI_KEY    = os.environ["RAPIDAPI_KEY"]
 # ────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -59,7 +60,6 @@ async def load_cc_database():
         content = message.content
 
         # Parse confirmed entries
-        # Format: ✅ CONFIRMED | USER_ID:<id> | PLATFORM:<platform> | HANDLE:<handle>
         confirmed_match = re.search(
             r'✅ CONFIRMED \| USER_ID:(\d+) \| PLATFORM:(\w+) \| HANDLE:(.+)',
             content
@@ -71,8 +71,7 @@ async def load_cc_database():
             cc_database[user_id] = {"platform": platform, "handle": handle, "confirmed": True}
             continue
 
-        # Parse declined entries — remove from db if previously added
-        # Format: ❌ DECLINED | USER_ID:<id>
+        # Parse declined entries
         declined_match = re.search(r'❌ DECLINED \| USER_ID:(\d+)', content)
         if declined_match:
             user_id = int(declined_match.group(1))
@@ -80,7 +79,6 @@ async def load_cc_database():
             continue
 
         # Parse pending entries
-        # Format: 🕐 PENDING | USER_ID:<id> | PLATFORM:<platform> | HANDLE:<handle>
         pending_match = re.search(
             r'🕐 PENDING \| USER_ID:(\d+) \| PLATFORM:(\w+) \| HANDLE:(.+)',
             content
@@ -177,7 +175,6 @@ class CCConfirmView(discord.ui.View):
     discord.app_commands.Choice(name="TikTok",  value="tiktok"),
 ])
 async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
-    # Only users with the CC role can use this command
     role = interaction.guild.get_role(CC_ROLE_ID)
     if not role or role not in interaction.user.roles:
         await interaction.response.send_message(
@@ -185,17 +182,14 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
         )
         return
 
-    # Clean up handle
     handle = handle.lstrip("@").strip()
 
-    # Update pending in memory
     cc_database[interaction.user.id] = {
         "platform": platform,
         "handle": handle,
         "confirmed": False
     }
 
-    # Post to database channel with confirm/decline buttons
     db_channel = bot.get_channel(CC_DATABASE_CHANNEL_ID)
     if db_channel:
         view = CCConfirmView(
@@ -216,11 +210,10 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
     )
 
 
-# ── /ccstats command ──────────────────────────────────────────────────────
+# ── Stats fetchers ────────────────────────────────────────────────────────
 
 async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict:
     """Get video count and total views for the last 30 days."""
-    # First resolve handle to channel ID
     url = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
     async with session.get(url, params=params) as r:
@@ -230,7 +223,6 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
             return {"videos": 0, "views": 0}
         channel_id = items[0]["id"]
 
-    # Search for videos in last 30 days
     since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {
@@ -248,7 +240,6 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
             return {"videos": 0, "views": 0}
         video_ids = [item["id"]["videoId"] for item in items]
 
-    # Get view counts for those videos
     url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
         "part": "statistics",
@@ -266,30 +257,63 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
 
 
 async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
-    """Scrape TikTok profile for recent video count and approximate views."""
-    url = f"https://www.tiktok.com/@{handle}"
+    """Get video count and total views for the last 30 days via RapidAPI."""
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
+        "Content-Type": "application/json"
     }
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            html = await r.text()
-            # Count videos found on profile page (usually last ~30)
-            video_ids = re.findall(rf'/@{re.escape(handle)}/video/(\d+)', html)
-            unique_ids = list(dict.fromkeys(video_ids))  # deduplicate
-            # TikTok doesn't expose view counts easily via scraping
-            return {"videos": len(unique_ids), "views": None}
-    except Exception as e:
-        print(f"TikTok stats scrape error: {e}")
-    return {"videos": 0, "views": None}
 
+    try:
+        # Step 1: Resolve handle to user_id
+        async with session.get(
+            "https://tiktok-scraper7.p.rapidapi.com/user/info",
+            headers=headers,
+            params={"unique_id": handle}
+        ) as r:
+            user_data = await r.json()
+            user_id = user_data["data"]["user"]["id"]
+
+        # Step 2: Get user's posts
+        async with session.get(
+            "https://tiktok-scraper7.p.rapidapi.com/user/posts",
+            headers=headers,
+            params={"user_id": user_id, "count": "35", "cursor": "0", "sort_type": "0"}
+        ) as r:
+            posts_data = await r.json()
+
+        videos = posts_data.get("data", {}).get("videos", [])
+        if not videos:
+            return {"videos": 0, "views": 0}
+
+        # Step 3: Filter to last 30 days and sum play_count
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        total_views = 0
+        recent_count = 0
+
+        for video in videos:
+            create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
+            if create_time < cutoff:
+                continue
+            recent_count += 1
+            total_views += video.get("play_count", 0)
+
+        return {"videos": recent_count, "views": total_views}
+
+    except Exception as e:
+        print(f"TikTok RapidAPI error: {e}")
+        return {"videos": 0, "views": 0}
+
+
+# ── /ccstats command ──────────────────────────────────────────────────────
 
 @bot.tree.command(name="ccstats", description="See your linked channel stats for the last 30 days")
-async def ccstats(interaction: discord.Interaction):
+@discord.app_commands.describe(platform="Which platform to check (youtube or tiktok)")
+@discord.app_commands.choices(platform=[
+    discord.app_commands.Choice(name="YouTube", value="youtube"),
+    discord.app_commands.Choice(name="TikTok",  value="tiktok"),
+])
+async def ccstats(interaction: discord.Interaction, platform: str):
     user_id = interaction.user.id
     entry = cc_database.get(user_id)
 
@@ -305,15 +329,21 @@ async def ccstats(interaction: discord.Interaction):
         )
         return
 
+    if entry["platform"] != platform:
+        await interaction.response.send_message(
+            f"❌ Your linked platform is `{entry['platform']}`, not `{platform}`. "
+            f"Use `/linkcc` to update your handle.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(ephemeral=True)
 
-    platform = entry["platform"]
-    handle   = entry["handle"]
+    handle = entry["handle"]
 
     async with aiohttp.ClientSession() as session:
         if platform == "youtube":
             stats = await get_youtube_stats(session, handle)
-            views_str = f"{stats['views']:,}" if stats['views'] is not None else "N/A"
+            views_str = f"{stats['views']:,}"
             await interaction.followup.send(
                 f"📊 **Your YouTube stats (last 30 days)**\n"
                 f"Handle: `@{handle}`\n"
@@ -323,11 +353,12 @@ async def ccstats(interaction: discord.Interaction):
             )
         else:
             stats = await get_tiktok_stats(session, handle)
+            views_str = f"{stats['views']:,}"
             await interaction.followup.send(
                 f"📊 **Your TikTok stats (last 30 days)**\n"
                 f"Handle: `@{handle}`\n"
-                f"Videos found: **{stats['videos']}**\n"
-                f"Views: **Not available** *(TikTok doesn't expose view counts publicly)*",
+                f"Videos posted: **{stats['videos']}**\n"
+                f"Total views: **{views_str}**",
                 ephemeral=True
             )
 
