@@ -9,6 +9,9 @@ YOUTUBE_CHANNEL_HANDLE  = "dreamyvrofficial"
 TIKTOK_USERNAME         = "dreamyvrofficial"
 DISCORD_CHANNEL_ID      = 1512853017920143560
 MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
+FORUM_CHANNEL_ID        = 1498288028630913055
+REQUIRED_TAG_ID         = 1512877289900081305
+SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 300  # 5 minutes in seconds
 
@@ -24,6 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 last_youtube_video_id    = None
 last_tiktok_video_id     = None
 youtube_channel_id_cache = None
+processed_forum_posts    = set()  # track posts we've already handled
 
 
 # ── Member count helper ──────────────────────────────────────────────────
@@ -44,6 +48,106 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
+
+
+# ── Forum checker ────────────────────────────────────────────────────────
+
+YOUTUBE_REGEX = re.compile(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+)')
+TIKTOK_REGEX  = re.compile(r'(https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+)')
+
+def has_video_link(content: str) -> bool:
+    return bool(YOUTUBE_REGEX.search(content) or TIKTOK_REGEX.search(content))
+
+def has_dreamyvr_hashtag(content: str) -> bool:
+    return bool(re.search(r'#dreamyvr', content, re.IGNORECASE))
+
+def has_required_tag(thread: discord.Thread) -> bool:
+    if not hasattr(thread, 'applied_tags'):
+        return False
+    return any(tag.id == REQUIRED_TAG_ID for tag in thread.applied_tags)
+
+
+async def check_forum_post(thread: discord.Thread):
+    """Check a single forum thread and process it if it meets requirements."""
+    if thread.id in processed_forum_posts:
+        return
+
+    # Must have the required tag
+    if not has_required_tag(thread):
+        return
+
+    # Fetch the first message (the post itself)
+    try:
+        messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
+        if not messages:
+            return
+        first_message = messages[0]
+    except Exception as e:
+        print(f"Error fetching forum post messages: {e}")
+        return
+
+    content = first_message.content
+
+    # Must have #dreamyvr hashtag and a YouTube or TikTok link
+    if not has_dreamyvr_hashtag(content):
+        return
+    if not has_video_link(content):
+        return
+
+    # All requirements met — react and post to submissions channel
+    try:
+        await first_message.add_reaction("👍")
+    except Exception as e:
+        print(f"Error adding reaction: {e}")
+
+    try:
+        submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
+        if submissions_channel:
+            post_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{first_message.id}"
+            await submissions_channel.send(
+                f"📹 New community video submission!\n{post_link}"
+            )
+    except Exception as e:
+        print(f"Error posting to submissions channel: {e}")
+
+    processed_forum_posts.add(thread.id)
+
+
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_forum():
+    forum_channel = bot.get_channel(FORUM_CHANNEL_ID)
+    if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+        return
+
+    # Check all active threads
+    for thread in forum_channel.threads:
+        await check_forum_post(thread)
+
+    # Also check archived threads
+    try:
+        async for thread in forum_channel.archived_threads(limit=50):
+            await check_forum_post(thread)
+    except Exception as e:
+        print(f"Error fetching archived threads: {e}")
+
+
+@check_forum.before_loop
+async def before_check_forum():
+    await bot.wait_until_ready()
+
+
+# ── Detect new forum posts in real time ──────────────────────────────────
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    if thread.parent_id == FORUM_CHANNEL_ID:
+        # Wait a moment for the first message to be posted
+        await discord.utils.sleep_until(
+            discord.utils.utcnow().replace(microsecond=0).__class__.utcnow()
+        )
+        import asyncio
+        await asyncio.sleep(2)
+        await check_forum_post(thread)
 
 
 # ── YouTube helpers ──────────────────────────────────────────────────────
@@ -200,6 +304,7 @@ async def on_ready():
         await update_member_count(guild)
 
     check_socials.start()
+    check_forum.start()
 
 
 bot.run(DISCORD_TOKEN)
