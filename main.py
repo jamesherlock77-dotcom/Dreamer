@@ -1,551 +1,178 @@
 import os
-from datetime import datetime, timedelta, timezone
-
-import psycopg
+import re
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-# ============================
-# CONFIG
-# ============================
+# ── Config ──────────────────────────────────────────────────────────────
+YOUTUBE_CHANNEL_HANDLE = "dreamyvrofficial"
+TIKTOK_USERNAME        = "dreamyvrofficial"
+DISCORD_CHANNEL_ID     = 1512853017920143560
+ROLE_MENTION           = "<@&1512854249174863882>"
+CHECK_INTERVAL         = 300  # 5 minutes in seconds
 
-DB_URL = os.environ.get("DATABASE_URL")
-
-STREAK_ROLES = {
-    1: 1495573627217641604,
-    3: 1495573632984813639,
-    7: 1495573635459448842,
-    14: 1495573637800136844,
-    30: 1495573640132034670,
-    60: 1495573754921877687,
-    100: 1495573763004039380
-}
-
-DREAM_TEAM_ROLE_ID = 1497337678960791632
-DREAM_TEAM_MANAGER_ROLE_ID = 1508231579288342569
-
-CC_ROLE_ID = 1495165348654219344
-CC_MANAGER_ROLE_ID = 1508601647880736899
-
-EVENT_MANAGER_ROLE_ID = 1509630177779646495
-
-EVENT_ROLES = {
-    "helper": 1504584843063988424,
-    "lead": 1504578478253805698,
-    "host": 1504578548726239262
-}
-
-
-# ============================
-# DATABASE INIT
-# ============================
-
-def init_db():
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS streak_config (
-                    guild_id BIGINT PRIMARY KEY,
-                    announcement_channel_id BIGINT
-                );
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_streaks (
-                    user_id BIGINT PRIMARY KEY,
-                    msg_count INT DEFAULT 0,
-                    current_streak INT DEFAULT 0,
-                    last_streak_time TIMESTAMP WITH TIME ZONE DEFAULT NULL,
-                    last_msg_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cursor.execute("""
-                ALTER TABLE user_streaks
-                ADD COLUMN IF NOT EXISTS lost_streak INT DEFAULT 0;
-            """)
-
-            cursor.execute("""
-                ALTER TABLE user_streaks
-                ADD COLUMN IF NOT EXISTS last_revive TIMESTAMP WITH TIME ZONE DEFAULT NULL;
-            """)
-
-            conn.commit()
-
-
-# ============================
-# BOT SETUP
-# ============================
+DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
+YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
+# ────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+last_youtube_video_id    = None
+last_tiktok_video_id     = None
+youtube_channel_id_cache = None
 
 
-class UnifiedBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+# ── YouTube helpers ──────────────────────────────────────────────────────
 
-    async def setup_hook(self):
-        init_db()
-        streak_expiry_check.start()
-        await self.tree.sync()
+async def get_youtube_channel_id(session: aiohttp.ClientSession) -> str | None:
+    global youtube_channel_id_cache
+    if youtube_channel_id_cache:
+        return youtube_channel_id_cache
+
+    url = "https://www.googleapis.com/youtube/v3/channels"
+    params = {"part": "id", "forHandle": YOUTUBE_CHANNEL_HANDLE, "key": YOUTUBE_API_KEY}
+    async with session.get(url, params=params) as r:
+        data = await r.json()
+        items = data.get("items", [])
+        if items:
+            youtube_channel_id_cache = items[0]["id"]
+            return youtube_channel_id_cache
+    return None
 
 
-bot = UnifiedBot()
+async def get_latest_youtube_video(session: aiohttp.ClientSession):
+    channel_id = await get_youtube_channel_id(session)
+    if not channel_id:
+        return None, None
+
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "channelId": channel_id,
+        "order": "date",
+        "maxResults": 1,
+        "type": "video",
+        "key": YOUTUBE_API_KEY,
+    }
+    async with session.get(url, params=params) as r:
+        data = await r.json()
+        items = data.get("items", [])
+        if items:
+            vid_id = items[0]["id"]["videoId"]
+            return vid_id, f"https://www.youtube.com/watch?v={vid_id}"
+    return None, None
 
 
-# ============================
-# ROLE HELPERS
-# ============================
+# ── TikTok helpers ───────────────────────────────────────────────────────
 
-async def update_streak_roles(member, streak):
+async def get_latest_tiktok_video(session: aiohttp.ClientSession):
+    url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
     try:
-        for threshold, role_id in STREAK_ROLES.items():
-            role = member.guild.get_role(role_id)
-            if role and role not in member.roles:
-                if streak >= threshold:
-                    await member.add_roles(role)
-
-            if role and streak < threshold and role in member.roles:
-                await member.remove_roles(role)
-    except discord.Forbidden:
-        pass
-
-
-async def remove_all_streak_roles(member):
-    try:
-        roles = [
-            member.guild.get_role(r)
-            for r in STREAK_ROLES.values()
-        ]
-        roles = [r for r in roles if r and r in member.roles]
-
-        if roles:
-            await member.remove_roles(*roles)
-
-    except discord.Forbidden:
-        pass
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            html = await r.text()
+            matches = re.findall(r'/@' + TIKTOK_USERNAME + r'/video/(\d+)', html)
+            if matches:
+                vid_id = matches[0]
+                return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
+    except Exception as e:
+        print(f"TikTok scrape error: {e}")
+    return None, None
 
 
-# ============================
-# STREAK EXPIRY LOOP (29 HOURS)
-# ============================
+# ── Notification helper ──────────────────────────────────────────────────
 
-@tasks.loop(seconds=30)
-async def streak_expiry_check():
-    now = datetime.now(timezone.utc)
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-
-            cursor.execute("""
-                SELECT user_id
-                FROM user_streaks
-                WHERE current_streak > 0
-                AND last_msg_time < %s;
-            """, (now - timedelta(hours=29),))
-
-            expired = cursor.fetchall()
-
-            for (user_id,) in expired:
-
-                cursor.execute("""
-                    UPDATE user_streaks
-                    SET lost_streak = current_streak,
-                        current_streak = 0,
-                        msg_count = 0,
-                        last_streak_time = NULL
-                    WHERE user_id = %s;
-                """, (user_id,))
-
-                for guild in bot.guilds:
-                    member = guild.get_member(user_id)
-                    if member:
-                        await remove_all_streak_roles(member)
-
-            conn.commit()
+async def send_notification(video_url: str):
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        await channel.send(
+            f"Hey everyone, we just posted a video! Go check it out!\n"
+            f"{ROLE_MENTION}\n"
+            f"{video_url}"
+        )
 
 
-# ============================
-# READY
-# ============================
+# ── Background task ──────────────────────────────────────────────────────
+
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def check_socials():
+    global last_youtube_video_id, last_tiktok_video_id
+
+    async with aiohttp.ClientSession() as session:
+        # — YouTube —
+        yt_id, yt_url = await get_latest_youtube_video(session)
+        if yt_id and yt_id != last_youtube_video_id:
+            if last_youtube_video_id is not None:
+                await send_notification(yt_url)
+            last_youtube_video_id = yt_id
+
+        # — TikTok —
+        tt_id, tt_url = await get_latest_tiktok_video(session)
+        if tt_id and tt_id != last_tiktok_video_id:
+            if last_tiktok_video_id is not None:
+                await send_notification(tt_url)
+            last_tiktok_video_id = tt_id
+
+
+@check_socials.before_loop
+async def before_check():
+    await bot.wait_until_ready()
+
+
+# ── Slash command: /testsocialmedia ─────────────────────────────────────
+
+@bot.tree.command(name="testsocialmedia", description="Test the social media notification format")
+async def testsocialmedia(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    async with aiohttp.ClientSession() as session:
+        yt_id, yt_url = await get_latest_youtube_video(session)
+        tt_id, tt_url = await get_latest_tiktok_video(session)
+
+    lines = []
+
+    if yt_url:
+        lines.append(
+            f"**YouTube** ✅\n"
+            f"Hey everyone, we just posted a video! Go check it out!\n"
+            f"{ROLE_MENTION}\n"
+            f"{yt_url}"
+        )
+    else:
+        lines.append("**YouTube** ❌ Could not fetch latest video.")
+
+    if tt_url:
+        lines.append(
+            f"**TikTok** ✅\n"
+            f"Hey everyone, we just posted a video! Go check it out!\n"
+            f"{ROLE_MENTION}\n"
+            f"{tt_url}"
+        )
+    else:
+        lines.append("**TikTok** ❌ Could not fetch latest video.")
+
+    await interaction.followup.send("\n\n".join(lines))
+
+
+# ── Bot startup ──────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
-
-
-# ============================
-# MESSAGE SYSTEM
-# ============================
-
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        return
-
-    user_id = message.author.id
-    now = datetime.now(timezone.utc)
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-
-            cursor.execute("""
-                SELECT msg_count, current_streak, last_streak_time
-                FROM user_streaks
-                WHERE user_id = %s;
-            """, (user_id,))
-
-            row = cursor.fetchone()
-
-            if not row:
-                cursor.execute("""
-                    INSERT INTO user_streaks
-                    (user_id, msg_count, current_streak, last_msg_time)
-                    VALUES (%s, 1, 0, %s);
-                """, (user_id, now))
-                conn.commit()
-                await bot.process_commands(message)
-                return
-
-            msg_count, current_streak, last_streak_time = row
-
-            cursor.execute("""
-                UPDATE user_streaks
-                SET last_msg_time = %s
-                WHERE user_id = %s;
-            """, (now, user_id))
-
-            can_progress = (
-                last_streak_time is None or
-                now - last_streak_time >= timedelta(hours=24)
-            )
-
-            new_msg_count = msg_count + 1
-
-            if new_msg_count >= 3 and can_progress:
-                new_streak = current_streak + 1
-
-                cursor.execute("""
-                    UPDATE user_streaks
-                    SET msg_count = 0,
-                        current_streak = %s,
-                        last_streak_time = %s
-                    WHERE user_id = %s;
-                """, (new_streak, now, user_id))
-
-                conn.commit()
-
-                await update_streak_roles(message.author, new_streak)
-
-                cursor.execute("""
-                    SELECT announcement_channel_id
-                    FROM streak_config
-                    WHERE guild_id = %s;
-                """, (message.guild.id,))
-
-                config = cursor.fetchone()
-
-                if config and config[0]:
-                    channel = message.guild.get_channel(config[0])
-                    if channel:
-                        await channel.send(
-                            f"<:Sneeze:1495243609035899023> {message.author.mention}, you've acquired a chat streak!\n"
-                            f"**Streak:** `{new_streak}`"
-                        )
-
-            else:
-                cursor.execute("""
-                    UPDATE user_streaks
-                    SET msg_count = %s
-                    WHERE user_id = %s;
-                """, (new_msg_count, user_id))
-
-                conn.commit()
-
-    await bot.process_commands(message)
-
-
-# ============================
-# /CHANNEL
-# ============================
-
-@bot.tree.command(
-    name="channel",
-    description="Set the channel for streak announcements."
-)
-async def channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("Missing permissions.", ephemeral=True)
-        return
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO streak_config (guild_id, announcement_channel_id)
-                VALUES (%s, %s)
-                ON CONFLICT (guild_id)
-                DO UPDATE SET announcement_channel_id = EXCLUDED.announcement_channel_id;
-            """, (interaction.guild_id, channel.id))
-            conn.commit()
-
-    await interaction.response.send_message(f"Set to {channel.mention}", ephemeral=True)
-
-
-# ============================
-# /STREAK
-# ============================
-
-@bot.tree.command(
-    name="messagestreak",
-    description="Check your current streak."
-)
-async def messagestreak(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT current_streak
-                FROM user_streaks
-                WHERE user_id = %s;
-            """, (interaction.user.id,))
-
-            row = cursor.fetchone()
-
-    streak = row[0] if row else 0
-    await interaction.followup.send(f"You have a message streak of `{streak}`")
-
-
-# ============================
-# /GIVE STREAK (ADMIN)
-# ============================
-
-@bot.tree.command(
-    name="givestreak",
-    description="Give a user a streak (Admin only)."
-)
-async def givestreak(interaction: discord.Interaction, user: discord.Member, amount: int):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("Admins only.")
-        return
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO user_streaks (user_id, current_streak)
-                VALUES (%s, %s)
-                ON CONFLICT (user_id)
-                DO UPDATE SET current_streak = EXCLUDED.current_streak;
-            """, (user.id, amount))
-            conn.commit()
-
-    await update_streak_roles(user, amount)
-    await interaction.followup.send("Done.")
-
-
-# ============================
-# /REMOVE STREAK (ADMIN)
-# ============================
-
-@bot.tree.command(
-    name="removestreak",
-    description="Remove a user's streak (Admin only)."
-)
-async def removestreak(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("Admins only.")
-        return
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                UPDATE user_streaks
-                SET current_streak = 0,
-                    msg_count = 0
-                WHERE user_id = %s;
-            """, (user.id,))
-            conn.commit()
-
-    await remove_all_streak_roles(user)
-    await interaction.followup.send("Removed.")
-
-
-# ============================
-# /REVIVE STREAK
-# ============================
-
-@bot.tree.command(
-    name="revivestreak",
-    description="Revive your last lost streak (1 per 7 days)."
-)
-async def revivestreak(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    now = datetime.now(timezone.utc)
-
-    with psycopg.connect(DB_URL) as conn:
-        with conn.cursor() as cursor:
-
-            cursor.execute("""
-                SELECT lost_streak, last_revive
-                FROM user_streaks
-                WHERE user_id = %s;
-            """, (interaction.user.id,))
-
-            row = cursor.fetchone()
-
-            if not row or row[0] <= 0:
-                await interaction.followup.send("No streak to revive.")
-                return
-
-            lost, last_revive = row
-
-            if last_revive and now - last_revive < timedelta(days=7):
-                await interaction.followup.send("Cooldown: 7 days.")
-                return
-
-            cursor.execute("""
-                UPDATE user_streaks
-                SET current_streak = %s,
-                    lost_streak = 0,
-                    last_revive = %s
-                WHERE user_id = %s;
-            """, (lost, now, interaction.user.id))
-
-            conn.commit()
-
-    await update_streak_roles(interaction.user, lost)
-    await interaction.followup.send(f"Revived `{lost}`")
-
-
-# ============================
-# CC COMMANDS
-# ============================
-
-@bot.tree.command(name="addccrole", description="Give CC role.")
-async def addccrole(interaction: discord.Interaction, user: discord.Member):
-    if not any(r.id == CC_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = interaction.guild.get_role(CC_ROLE_ID)
-    await user.add_roles(role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-@bot.tree.command(name="removeccrole", description="Remove CC role.")
-async def removeccrole(interaction: discord.Interaction, user: discord.Member):
-    if not any(r.id == CC_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = interaction.guild.get_role(CC_ROLE_ID)
-    await user.remove_roles(role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-# ============================
-# DREAM TEAM
-# ============================
-
-@bot.tree.command(name="adddreamteam", description="Add Dream Team role.")
-async def adddreamteam(interaction: discord.Interaction, user: discord.Member):
-    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
-    await user.add_roles(role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-@bot.tree.command(name="removedreamteam", description="Remove Dream Team role.")
-async def removedreamteam(interaction: discord.Interaction, user: discord.Member):
-    if not any(r.id == DREAM_TEAM_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = interaction.guild.get_role(DREAM_TEAM_ROLE_ID)
-    await user.remove_roles(role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-# ============================
-# EVENT ROLE COMMANDS
-# ============================
-
-@bot.tree.command(
-    name="addeventrole",
-    description="Give an event role (helper/lead/host)."
-)
-async def addeventrole(interaction: discord.Interaction, role: str, user: discord.Member):
-
-    if not any(r.id == EVENT_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = role.lower()
-
-    if role not in EVENT_ROLES:
-        await interaction.response.send_message(
-            "Invalid role. Use: helper, lead, host",
-            ephemeral=True
-        )
-        return
-
-    target_role = interaction.guild.get_role(EVENT_ROLES[role])
-
-    if not target_role:
-        await interaction.response.send_message("Role not found.", ephemeral=True)
-        return
-
-    await user.add_roles(target_role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-@bot.tree.command(
-    name="removeeventrole",
-    description="Remove an event role (helper/lead/host)."
-)
-async def removeeventrole(interaction: discord.Interaction, role: str, user: discord.Member):
-
-    if not any(r.id == EVENT_MANAGER_ROLE_ID for r in interaction.user.roles):
-        await interaction.response.send_message("No permission.", ephemeral=True)
-        return
-
-    role = role.lower()
-
-    if role not in EVENT_ROLES:
-        await interaction.response.send_message(
-            "Invalid role. Use: helper, lead, host",
-            ephemeral=True
-        )
-        return
-
-    target_role = interaction.guild.get_role(EVENT_ROLES[role])
-
-    if not target_role:
-        await interaction.response.send_message("Role not found.", ephemeral=True)
-        return
-
-    await user.remove_roles(target_role)
-    await interaction.response.send_message("Done.", ephemeral=True)
-
-
-# ============================
-# RUN BOT
-# ============================
-
-token = os.environ.get("DISCORD_TOKEN")
-
-if token:
-    bot.run(token)
-else:
-    print("Missing DISCORD_TOKEN")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+    check_socials.start()
+
+
+bot.run(DISCORD_TOKEN)
