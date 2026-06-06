@@ -14,7 +14,7 @@ FORUM_CHANNEL_ID        = 1498288028630913055
 REQUIRED_TAG_ID         = 1512877289900081305
 SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
 ROLE_MENTION            = "<@&1512854249174863882>"
-CHECK_INTERVAL          = 300  # 5 minutes in seconds
+CHECK_INTERVAL          = 300  # 5 minutes
 
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
@@ -30,72 +30,135 @@ last_tiktok_video_id     = None
 youtube_channel_id_cache = None
 processed_forum_posts    = set()
 
+YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
+TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@[\w.]+/video/(\d+)')
 
-# ── Member count helper ──────────────────────────────────────────────────
+
+# ── Member count ─────────────────────────────────────────────────────────
 
 async def update_member_count(guild: discord.Guild):
     channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
     if channel:
         await channel.edit(name=f"☁️・Members: {guild.member_count}")
 
-
 @bot.event
 async def on_member_join(member: discord.Member):
     await update_member_count(member.guild)
-
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
 
 
-# ── Forum helpers ────────────────────────────────────────────────────────
+# ── Video description fetchers ───────────────────────────────────────────
 
-YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+')
-TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+')
+async def get_youtube_description(session: aiohttp.ClientSession, video_id: str) -> str:
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {
+        "part": "snippet",
+        "id": video_id,
+        "key": YOUTUBE_API_KEY,
+    }
+    try:
+        async with session.get(url, params=params) as r:
+            data = await r.json()
+            items = data.get("items", [])
+            if items:
+                snippet = items[0]["snippet"]
+                # Combine title + description + tags
+                tags = " ".join(snippet.get("tags", []))
+                return f"{snippet.get('title', '')} {snippet.get('description', '')} {tags}"
+    except Exception as e:
+        print(f"YouTube description fetch error: {e}")
+    return ""
 
-def has_video_link(content: str) -> bool:
-    return bool(YOUTUBE_REGEX.search(content) or TIKTOK_REGEX.search(content))
 
-def has_dreamyvr_hashtag(content: str) -> bool:
-    return bool(re.search(r'#dreamyvr', content, re.IGNORECASE))
+async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, username: str) -> str:
+    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            html = await r.text()
+            # TikTok embeds description in meta tags
+            match = re.search(r'<meta name="description" content="([^"]*)"', html)
+            if match:
+                return match.group(1)
+            # Fallback: search raw HTML for #dreamyvr
+            return html
+    except Exception as e:
+        print(f"TikTok description fetch error: {e}")
+    return ""
+
+
+async def video_has_dreamyvr_tag(session: aiohttp.ClientSession, content: str) -> bool:
+    """Check if any video link in the post content has #dreamyvr in its description."""
+
+    # Check YouTube links
+    for match in YOUTUBE_REGEX.finditer(content):
+        video_id = match.group(1)
+        description = await get_youtube_description(session, video_id)
+        if re.search(r'#dreamyvr', description, re.IGNORECASE):
+            return True
+
+    # Check TikTok links
+    for match in TIKTOK_REGEX.finditer(content):
+        video_id = match.group(1)
+        # Extract username from URL
+        url_match = re.search(r'tiktok\.com/@([\w.]+)/video/', content)
+        username = url_match.group(1) if url_match else TIKTOK_USERNAME
+        description = await get_tiktok_description(session, video_id, username)
+        if re.search(r'#dreamyvr', description, re.IGNORECASE):
+            return True
+
+    return False
+
 
 def has_required_tag(thread: discord.Thread) -> bool:
     if not hasattr(thread, 'applied_tags'):
         return False
     return any(tag.id == REQUIRED_TAG_ID for tag in thread.applied_tags)
 
+def has_video_link(content: str) -> bool:
+    return bool(YOUTUBE_REGEX.search(content) or TIKTOK_REGEX.search(content))
+
 def already_reacted(message: discord.Message) -> bool:
     for reaction in message.reactions:
         if str(reaction.emoji) == "👍":
-            # Check if our bot already reacted
             return reaction.me
     return False
 
 
-async def process_thread(thread: discord.Thread):
-    """Check a thread and react + post to submissions if it meets requirements."""
+# ── Forum processor ──────────────────────────────────────────────────────
+
+async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession):
     try:
-        # Must have the required tag
         if not has_required_tag(thread):
             return
 
-        # Fetch the first (original) message
         messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
         if not messages:
             return
         first_message = messages[0]
         content = first_message.content
 
-        # Must have #dreamyvr and a video link
-        if not has_dreamyvr_hashtag(content) or not has_video_link(content):
+        if not has_video_link(content):
             return
 
-        # React with thumbs up if we haven't already
+        # Fetch the video and check if it has #dreamyvr in its description
+        if not await video_has_dreamyvr_tag(session, content):
+            return
+
+        # React with 👍 if we haven't already
         if not already_reacted(first_message):
             await first_message.add_reaction("👍")
 
-        # Post to submissions channel if not already done
+        # Post to submissions channel once
         if thread.id not in processed_forum_posts:
             submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
             if submissions_channel:
@@ -116,26 +179,24 @@ async def check_forum():
 
     print(f"Checking forum... ({len(forum_channel.threads)} active threads)")
 
-    # Check active threads
-    for thread in forum_channel.threads:
-        await process_thread(thread)
-        await asyncio.sleep(0.5)  # small delay to avoid rate limits
-
-    # Check archived threads
-    try:
-        async for thread in forum_channel.archived_threads(limit=100):
-            await process_thread(thread)
+    async with aiohttp.ClientSession() as session:
+        for thread in forum_channel.threads:
+            await process_thread(thread, session)
             await asyncio.sleep(0.5)
-    except Exception as e:
-        print(f"Error fetching archived threads: {e}")
 
+        try:
+            async for thread in forum_channel.archived_threads(limit=100):
+                await process_thread(thread, session)
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"Error fetching archived threads: {e}")
 
 @check_forum.before_loop
 async def before_check_forum():
     await bot.wait_until_ready()
 
 
-# ── YouTube helpers ──────────────────────────────────────────────────────
+# ── YouTube channel helpers ──────────────────────────────────────────────
 
 async def get_youtube_channel_id(session: aiohttp.ClientSession) -> str | None:
     global youtube_channel_id_cache
@@ -176,7 +237,7 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession):
     return None, None
 
 
-# ── TikTok helpers ───────────────────────────────────────────────────────
+# ── TikTok latest video ──────────────────────────────────────────────────
 
 async def get_latest_tiktok_video(session: aiohttp.ClientSession):
     url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
@@ -229,7 +290,6 @@ async def check_socials():
             if last_tiktok_video_id is not None:
                 await send_notification(tt_url)
             last_tiktok_video_id = tt_id
-
 
 @check_socials.before_loop
 async def before_check():
