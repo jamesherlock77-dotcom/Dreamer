@@ -13,6 +13,7 @@ MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
 FORUM_CHANNEL_ID        = 1498288028630913055
 REQUIRED_TAG_ID         = 1512877289900081305
 SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
+SUBMISSION_ROLE_ID      = 1495165348654219344
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 300  # 5 minutes
 
@@ -31,7 +32,53 @@ youtube_channel_id_cache = None
 processed_forum_posts    = set()
 
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
-TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@[\w.]+/video/(\d+)')
+TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
+
+
+# ── Accept / Decline buttons ─────────────────────────────────────────────
+
+class SubmissionView(discord.ui.View):
+    def __init__(self, submitter_id: int):
+        super().__init__(timeout=None)  # persistent — never expires
+        self.submitter_id = submitter_id
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅", custom_id="submission_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        member = guild.get_member(self.submitter_id)
+
+        if not member:
+            await interaction.response.send_message("❌ Could not find the member.", ephemeral=True)
+            return
+
+        role = guild.get_role(SUBMISSION_ROLE_ID)
+        if not role:
+            await interaction.response.send_message("❌ Could not find the role.", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role)
+            # Disable both buttons after accepting
+            for child in self.children:
+                child.disabled = True
+            await interaction.message.edit(
+                content=f"{interaction.message.content}\n\n✅ **Accepted** by {interaction.user.mention} — {member.mention} given {role.mention}",
+                view=self
+            )
+            await interaction.response.send_message(f"✅ Gave {role.name} to {member.mention}!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I don't have permission to assign that role.", ephemeral=True)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌", custom_id="submission_decline")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable both buttons after declining
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(
+            content=f"{interaction.message.content}\n\n❌ **Declined** by {interaction.user.mention}",
+            view=self
+        )
+        await interaction.response.send_message("❌ Submission declined.", ephemeral=True)
 
 
 # ── Member count ─────────────────────────────────────────────────────────
@@ -65,7 +112,6 @@ async def get_youtube_description(session: aiohttp.ClientSession, video_id: str)
             items = data.get("items", [])
             if items:
                 snippet = items[0]["snippet"]
-                # Combine title + description + tags
                 tags = " ".join(snippet.get("tags", []))
                 return f"{snippet.get('title', '')} {snippet.get('description', '')} {tags}"
     except Exception as e:
@@ -85,11 +131,9 @@ async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, 
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
             html = await r.text()
-            # TikTok embeds description in meta tags
             match = re.search(r'<meta name="description" content="([^"]*)"', html)
             if match:
                 return match.group(1)
-            # Fallback: search raw HTML for #dreamyvr
             return html
     except Exception as e:
         print(f"TikTok description fetch error: {e}")
@@ -97,21 +141,15 @@ async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, 
 
 
 async def video_has_dreamyvr_tag(session: aiohttp.ClientSession, content: str) -> bool:
-    """Check if any video link in the post content has #dreamyvr in its description."""
-
-    # Check YouTube links
     for match in YOUTUBE_REGEX.finditer(content):
         video_id = match.group(1)
         description = await get_youtube_description(session, video_id)
         if re.search(r'#dreamyvr', description, re.IGNORECASE):
             return True
 
-    # Check TikTok links
     for match in TIKTOK_REGEX.finditer(content):
-        video_id = match.group(1)
-        # Extract username from URL
-        url_match = re.search(r'tiktok\.com/@([\w.]+)/video/', content)
-        username = url_match.group(1) if url_match else TIKTOK_USERNAME
+        username = match.group(1)
+        video_id = match.group(2)
         description = await get_tiktok_description(session, video_id, username)
         if re.search(r'#dreamyvr', description, re.IGNORECASE):
             return True
@@ -150,20 +188,23 @@ async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession)
         if not has_video_link(content):
             return
 
-        # Fetch the video and check if it has #dreamyvr in its description
         if not await video_has_dreamyvr_tag(session, content):
             return
 
-        # React with 👍 if we haven't already
+        # React with 👍
         if not already_reacted(first_message):
             await first_message.add_reaction("👍")
 
-        # Post to submissions channel once
+        # Post to submissions channel with Accept/Decline buttons
         if thread.id not in processed_forum_posts:
             submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
             if submissions_channel:
                 post_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{first_message.id}"
-                await submissions_channel.send(f"📹 New community video submission!\n{post_link}")
+                view = SubmissionView(submitter_id=first_message.author.id)
+                await submissions_channel.send(
+                    f"📹 New community video submission from {first_message.author.mention}!\n{post_link}",
+                    view=view
+                )
             processed_forum_posts.add(thread.id)
 
     except Exception as e:
@@ -341,6 +382,9 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
+
+    # Re-register persistent views so buttons work after restarts
+    bot.add_view(SubmissionView(submitter_id=0))
 
     for guild in bot.guilds:
         await update_member_count(guild)
