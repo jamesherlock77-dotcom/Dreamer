@@ -430,7 +430,7 @@ async def ccstats(interaction: discord.Interaction, platform: str):
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     handle = platform_entry["handle"]
 
     async with aiohttp.ClientSession() as session:
@@ -441,11 +441,10 @@ async def ccstats(interaction: discord.Interaction, platform: str):
 
     platform_label = "YouTube" if platform == "youtube" else "TikTok"
     await interaction.followup.send(
-        f"📊 **Your {platform_label} stats (last 30 days, #dreamyvr videos only)**\n"
+        f"📊 **{interaction.user.mention}'s {platform_label} stats (last 30 days, #dreamyvr videos only)**\n"
         f"Handle: `@{handle}`\n"
         f"#dreamyvr videos posted: **{stats['videos']}**\n"
-        f"Total views: **{stats['views']:,}**",
-        ephemeral=True
+        f"Total views: **{stats['views']:,}**"
     )
 
 
