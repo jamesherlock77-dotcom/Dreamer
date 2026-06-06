@@ -1,5 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
 import os
 import re
 import aiohttp
@@ -7,11 +5,12 @@ import discord
 from discord.ext import commands, tasks
 
 # ── Config ──────────────────────────────────────────────────────────────
-YOUTUBE_CHANNEL_HANDLE = "dreamyvrofficial"
-TIKTOK_USERNAME        = "dreamyvrofficial"
-DISCORD_CHANNEL_ID     = 1512853017920143560
-ROLE_MENTION           = "<@&1512854249174863882>"
-CHECK_INTERVAL         = 300  # 5 minutes in seconds
+YOUTUBE_CHANNEL_HANDLE  = "dreamyvrofficial"
+TIKTOK_USERNAME         = "dreamyvrofficial"
+DISCORD_CHANNEL_ID      = 1512853017920143560
+MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
+ROLE_MENTION            = "<@&1512854249174863882>"
+CHECK_INTERVAL          = 300  # 5 minutes in seconds
 
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
@@ -19,11 +18,32 @@ YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 last_youtube_video_id    = None
 last_tiktok_video_id     = None
 youtube_channel_id_cache = None
+
+
+# ── Member count helper ──────────────────────────────────────────────────
+
+async def update_member_count(guild: discord.Guild):
+    channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    if channel:
+        await channel.edit(name=f"☁️・Members: {guild.member_count}")
+
+
+# ── Member join/leave events ─────────────────────────────────────────────
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    await update_member_count(member.guild)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    await update_member_count(member.guild)
 
 
 # ── YouTube helpers ──────────────────────────────────────────────────────
@@ -174,6 +194,11 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
+
+    # Set initial member count on startup
+    for guild in bot.guilds:
+        await update_member_count(guild)
+
     check_socials.start()
 
 
