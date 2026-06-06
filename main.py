@@ -16,6 +16,7 @@ REQUIRED_TAG_ID         = 1512877289900081305
 SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
 CC_DATABASE_CHANNEL_ID  = 1512899799077093546
 CC_ROLE_ID              = 1495165348654219344
+LINKCC_CHANNEL_ID       = 1512954067327127632
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 300  # 5 minutes
 
@@ -134,7 +135,7 @@ class CCConfirmView(discord.ui.View):
                 f"✅ CONFIRMED | USER_ID:{self.user_id} | PLATFORM:{self.platform} | HANDLE:{self.handle}"
             )
 
-        member = interaction.guild.get_member(self.user_id)
+        member  = interaction.guild.get_member(self.user_id)
         mention = member.mention if member else f"<@{self.user_id}>"
 
         await interaction.response.send_message(
@@ -159,7 +160,7 @@ class CCConfirmView(discord.ui.View):
         if db_channel:
             await db_channel.send(f"❌ DECLINED | USER_ID:{self.user_id} | PLATFORM:{self.platform}")
 
-        member = interaction.guild.get_member(self.user_id)
+        member  = interaction.guild.get_member(self.user_id)
         mention = member.mention if member else f"<@{self.user_id}>"
 
         await interaction.response.send_message(
@@ -181,6 +182,12 @@ class CCConfirmView(discord.ui.View):
     discord.app_commands.Choice(name="TikTok",  value="tiktok"),
 ])
 async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
+    if interaction.channel_id != LINKCC_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"❌ You can only use this command in <#{LINKCC_CHANNEL_ID}>.", ephemeral=True
+        )
+        return
+
     role = interaction.guild.get_role(CC_ROLE_ID)
     if not role or role not in interaction.user.roles:
         await interaction.response.send_message(
@@ -217,17 +224,17 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
 # ── Stats fetchers ────────────────────────────────────────────────────────
 
 async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict:
-    url = "https://www.googleapis.com/youtube/v3/channels"
+    url    = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
     async with session.get(url, params=params) as r:
-        data = await r.json()
+        data  = await r.json()
         items = data.get("items", [])
         if not items:
             return {"videos": 0, "views": 0}
         channel_id = items[0]["id"]
 
-    since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = "https://www.googleapis.com/youtube/v3/search"
+    since  = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url    = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "part": "id",
         "channelId": channel_id,
@@ -237,13 +244,13 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
         "key": YOUTUBE_API_KEY,
     }
     async with session.get(url, params=params) as r:
-        data = await r.json()
+        data  = await r.json()
         items = data.get("items", [])
         if not items:
             return {"videos": 0, "views": 0}
         video_ids = [item["id"]["videoId"] for item in items]
 
-    url = "https://www.googleapis.com/youtube/v3/videos"
+    url    = "https://www.googleapis.com/youtube/v3/videos"
     params = {
         "part": "snippet,statistics",
         "id": ",".join(video_ids),
@@ -280,7 +287,7 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
             params={"unique_id": handle}
         ) as r:
             user_data = await r.json()
-            user_id = user_data["data"]["user"]["id"]
+            user_id   = user_data["data"]["user"]["id"]
 
         async with session.get(
             "https://tiktok-scraper7.p.rapidapi.com/user/posts",
@@ -293,7 +300,7 @@ async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
         if not videos:
             return {"videos": 0, "views": 0}
 
-        cutoff     = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff         = datetime.now(timezone.utc) - timedelta(days=30)
         total_views    = 0
         dreamyvr_count = 0
 
@@ -320,13 +327,13 @@ async def get_combined_stats(session: aiohttp.ClientSession, user_id: int) -> di
 
     yt_entry = user_entry.get("youtube")
     if yt_entry and yt_entry["confirmed"]:
-        stats = await get_youtube_stats(session, yt_entry["handle"])
+        stats         = await get_youtube_stats(session, yt_entry["handle"])
         total_videos += stats["videos"]
         total_views  += stats["views"]
 
     tt_entry = user_entry.get("tiktok")
     if tt_entry and tt_entry["confirmed"]:
-        stats = await get_tiktok_stats(session, tt_entry["handle"])
+        stats         = await get_tiktok_stats(session, tt_entry["handle"])
         total_videos += stats["videos"]
         total_views  += stats["views"]
 
@@ -352,7 +359,7 @@ def get_highest_qualifying_tier_index(videos: int, views: int) -> int:
 async def check_tiers():
     if not bot.guilds:
         return
-    guild = bot.guilds[0]
+    guild               = bot.guilds[0]
     submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
     if not submissions_channel:
         return
@@ -370,7 +377,7 @@ async def check_tiers():
                 videos  = stats["videos"]
                 views   = stats["views"]
 
-                current_highest    = get_highest_qualifying_tier_index(videos, views)
+                current_highest     = get_highest_qualifying_tier_index(videos, views)
                 previously_notified = user_tier_cache.get(user_id, -1)
 
                 if current_highest > previously_notified:
@@ -446,7 +453,6 @@ async def ccstats(interaction: discord.Interaction, platform: str):
 
 @bot.tree.command(name="linkleaderboard", description="See all linked content creators [Admin only]")
 async def linkleaderboard(interaction: discord.Interaction):
-    # Admin only check
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
@@ -510,11 +516,11 @@ async def on_member_remove(member: discord.Member):
 # ── Video description fetchers ───────────────────────────────────────────
 
 async def get_youtube_description(session: aiohttp.ClientSession, video_id: str) -> str:
-    url = "https://www.googleapis.com/youtube/v3/videos"
+    url    = "https://www.googleapis.com/youtube/v3/videos"
     params = {"part": "snippet", "id": video_id, "key": YOUTUBE_API_KEY}
     try:
         async with session.get(url, params=params) as r:
-            data = await r.json()
+            data  = await r.json()
             items = data.get("items", [])
             if items:
                 snippet = items[0]["snippet"]
@@ -536,7 +542,7 @@ async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, 
     }
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            html = await r.text()
+            html  = await r.text()
             match = re.search(r'<meta name="description" content="([^"]*)"', html)
             if match:
                 return match.group(1)
