@@ -13,7 +13,6 @@ MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
 FORUM_CHANNEL_ID        = 1498288028630913055
 REQUIRED_TAG_ID         = 1512877289900081305
 SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
-SUBMISSION_ROLE_ID      = 1495165348654219344
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 300  # 5 minutes
 
@@ -33,52 +32,6 @@ processed_forum_posts    = set()
 
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
 TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
-
-
-# ── Accept / Decline buttons ─────────────────────────────────────────────
-
-class SubmissionView(discord.ui.View):
-    def __init__(self, submitter_id: int):
-        super().__init__(timeout=None)  # persistent — never expires
-        self.submitter_id = submitter_id
-
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅", custom_id="submission_accept")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        member = guild.get_member(self.submitter_id)
-
-        if not member:
-            await interaction.response.send_message("❌ Could not find the member.", ephemeral=True)
-            return
-
-        role = guild.get_role(SUBMISSION_ROLE_ID)
-        if not role:
-            await interaction.response.send_message("❌ Could not find the role.", ephemeral=True)
-            return
-
-        try:
-            await member.add_roles(role)
-            # Disable both buttons after accepting
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(
-                content=f"{interaction.message.content}\n\n✅ **Accepted** by {interaction.user.mention} — {member.mention} given {role.mention}",
-                view=self
-            )
-            await interaction.response.send_message(f"✅ Gave {role.name} to {member.mention}!", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ I don't have permission to assign that role.", ephemeral=True)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌", custom_id="submission_decline")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable both buttons after declining
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(
-            content=f"{interaction.message.content}\n\n❌ **Declined** by {interaction.user.mention}",
-            view=self
-        )
-        await interaction.response.send_message("❌ Submission declined.", ephemeral=True)
 
 
 # ── Member count ─────────────────────────────────────────────────────────
@@ -195,15 +148,13 @@ async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession)
         if not already_reacted(first_message):
             await first_message.add_reaction("👍")
 
-        # Post to submissions channel with Accept/Decline buttons
+        # Post to submissions channel
         if thread.id not in processed_forum_posts:
             submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
             if submissions_channel:
                 post_link = f"https://discord.com/channels/{thread.guild.id}/{thread.id}/{first_message.id}"
-                view = SubmissionView(submitter_id=first_message.author.id)
                 await submissions_channel.send(
-                    f"📹 New community video submission from {first_message.author.mention}!\n{post_link}",
-                    view=view
+                    f"📹 New community video submission from {first_message.author.mention}!\n{post_link}"
                 )
             processed_forum_posts.add(thread.id)
 
@@ -382,9 +333,6 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
-
-    # Re-register persistent views so buttons work after restarts
-    bot.add_view(SubmissionView(submitter_id=0))
 
     for guild in bot.guilds:
         await update_member_count(guild)
