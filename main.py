@@ -918,4 +918,4 @@ async def on_ready():
     check_tiers.start()
  
  
-bot.run(DISCORD_TOKEN
+bot.run(DISCORD_TOKEN)
