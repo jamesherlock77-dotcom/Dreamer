@@ -1,4 +1,4 @@
-import os
+import osq
 import re
 import asyncio
 import aiohttp
