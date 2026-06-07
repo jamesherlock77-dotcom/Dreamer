@@ -39,7 +39,7 @@ TIERS = [
     {"role_id": 1512873532374122516, "label": "Platinum", "level": 5},
     {"role_id": 1512874309641699399, "label": "Level 6",  "level": 6},
 ]
-# ────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────���─────
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -259,6 +259,12 @@ class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok/YouTube Views
         required=True,
         max_length=200,
     )
+    tier_eligible = discord.ui.TextInput(
+        label="Which tier do you think you're eligible for?",
+        placeholder="e.g. Gold (Level 4)",
+        required=True,
+        max_length=50,
+    )
     screenshot_url = discord.ui.TextInput(
         label="Screenshot URL (Discord link)",
         placeholder="https://cdn.discordapp.com/...",
@@ -283,6 +289,7 @@ class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok/YouTube Views
         embed.add_field(name="Creator", value=interaction.user.mention, inline=True)
         embed.add_field(name="Account URL", value=self.account_url.value, inline=False)
         embed.add_field(name="Group Account", value=self.is_group_account.value, inline=False)
+        embed.add_field(name="Tier Eligible", value=self.tier_eligible.value, inline=False)
         embed.set_image(url=self.screenshot_url.value)
         embed.set_footer(text=f"User ID: {interaction.user.id}")
 
