@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import aiohttp
 import discord
@@ -18,11 +19,11 @@ CC_DATABASE_CHANNEL_ID  = 1512899799077093546
 CC_ROLE_ID              = 1495165348654219344
 LINKCC_CHANNEL_ID       = 1512954067327127632
 ROLE_MENTION            = "<@&1512854249174863882>"
-CHECK_INTERVAL          = 300  # 5 minutes
+CHECK_INTERVAL          = 1800  # 30 minutes
  
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
-RAPIDAPI_KEY    = os.environ["RAPIDAPI_KEY"]
+# RAPIDAPI_KEY removed — no longer needed
  
 # ── Tier config ──────────────────────────────────────────────────────────
 TIERS = [
@@ -35,6 +36,29 @@ TIERS = [
     {"role_id": 1512874841240375436, "min_views": 100000, "min_videos": 0,  "label": "100k Views"},
 ]
 # ────────────────────────────────────────────────────────────────────────
+ 
+# Rotate user agents to reduce TikTok blocks
+TIKTOK_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+_ua_index = 0
+ 
+def next_user_agent() -> str:
+    global _ua_index
+    ua = TIKTOK_USER_AGENTS[_ua_index % len(TIKTOK_USER_AGENTS)]
+    _ua_index += 1
+    return ua
+ 
+def tiktok_headers() -> dict:
+    return {
+        "User-Agent": next_user_agent(),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.tiktok.com/",
+    }
  
 intents = discord.Intents.default()
 intents.message_content = True
@@ -50,6 +74,133 @@ user_tier_cache          = {}
  
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
 TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
+ 
+ 
+# ── TikTok scraper helpers ────────────────────────────────────────────────
+ 
+def extract_tiktok_json(html: str) -> dict:
+    """Pull the embedded JSON data blob TikTok puts in every page."""
+    # Try __UNIVERSAL_DATA_FOR_REHYDRATION__ first (newer TikTok)
+    match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    # Fallback: SIGI_STATE
+    match = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    return {}
+ 
+ 
+async def scrape_tiktok_user_videos(session: aiohttp.ClientSession, username: str) -> list:
+    """
+    Scrape a TikTok user's profile page and return a list of video dicts
+    with keys: video_id, desc, play_count, create_time
+    """
+    url = f"https://www.tiktok.com/@{username}"
+    try:
+        async with session.get(
+            url,
+            headers=tiktok_headers(),
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status != 200:
+                print(f"TikTok profile scrape got status {r.status} for @{username}")
+                return []
+            html = await r.text()
+ 
+        data = extract_tiktok_json(html)
+        videos = []
+ 
+        # Navigate the nested JSON — structure varies slightly by TikTok version
+        # Try __DEFAULT_SCOPE__ -> webapp.user-detail path
+        default_scope = data.get("__DEFAULT_SCOPE__", {})
+        user_post = (
+            default_scope
+            .get("webapp.user-post", {})
+            .get("itemList", [])
+        )
+        if not user_post:
+            # Try SIGI_STATE path
+            user_post = []
+            item_module = data.get("ItemModule", {})
+            for vid_id, item in item_module.items():
+                user_post.append(item)
+ 
+        for item in user_post:
+            try:
+                desc       = item.get("desc", "")
+                play_count = item.get("stats", {}).get("playCount", 0)
+                create_time = item.get("createTime", 0)
+                video_id   = item.get("id", "")
+                if video_id:
+                    videos.append({
+                        "video_id":   video_id,
+                        "desc":       desc,
+                        "play_count": play_count,
+                        "create_time": int(create_time),
+                    })
+            except Exception:
+                continue
+ 
+        print(f"[TikTok scrape] @{username}: found {len(videos)} videos")
+        return videos
+ 
+    except Exception as e:
+        print(f"TikTok profile scrape error for @{username}: {e}")
+        return []
+ 
+ 
+async def scrape_tiktok_video(session: aiohttp.ClientSession, video_id: str, username: str) -> dict:
+    """
+    Scrape a single TikTok video page and return desc/caption text.
+    Used for the forum post checker.
+    """
+    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    try:
+        async with session.get(
+            url,
+            headers=tiktok_headers(),
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
+            if r.status != 200:
+                print(f"TikTok video scrape got status {r.status}")
+                return {}
+            html = await r.text()
+ 
+        data = extract_tiktok_json(html)
+ 
+        # Try to find the video item in the JSON
+        default_scope = data.get("__DEFAULT_SCOPE__", {})
+        item_detail   = default_scope.get("webapp.video-detail", {}).get("itemInfo", {}).get("itemStruct", {})
+        if item_detail:
+            return {
+                "desc":       item_detail.get("desc", ""),
+                "play_count": item_detail.get("stats", {}).get("playCount", 0),
+            }
+ 
+        # Fallback: check ItemModule
+        item_module = data.get("ItemModule", {})
+        item = item_module.get(video_id, {})
+        if item:
+            return {
+                "desc":       item.get("desc", ""),
+                "play_count": item.get("stats", {}).get("playCount", 0),
+            }
+ 
+        # Last resort: grab meta description tag
+        match = re.search(r'<meta name="description" content="([^"]*)"', html)
+        if match:
+            return {"desc": match.group(1), "play_count": 0}
+ 
+    except Exception as e:
+        print(f"TikTok video scrape error: {e}")
+    return {}
  
  
 # ── Database channel parser ───────────────────────────────────────────────
@@ -274,56 +425,26 @@ async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict
  
  
 async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
-        "Content-Type": "application/json"
-    }
- 
-    try:
-        async with session.get(
-            "https://tiktok-scraper7.p.rapidapi.com/user/info",
-            headers=headers,
-            params={"unique_id": handle}
-        ) as r:
-            user_data = await r.json()
-            user_id   = user_data["data"]["user"]["id"]
- 
-        async with session.get(
-            "https://tiktok-scraper7.p.rapidapi.com/user/posts",
-            headers=headers,
-            params={"user_id": user_id, "count": "50", "cursor": "0", "sort_type": "0"}
-        ) as r:
-            posts_data = await r.json()
- 
-        videos = posts_data.get("data", {}).get("videos", [])
-        if not videos:
-            return {"videos": 0, "views": 0}
- 
-        cutoff         = datetime.now(timezone.utc) - timedelta(days=30)
-        total_views    = 0
-        dreamyvr_count = 0
- 
-        for video in videos:
-            create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
-            if create_time < cutoff:
-                continue
- 
-            # FIX: check title AND desc fields — TikTok API returns hashtags in both
-            title = video.get("title", "")
-            desc  = video.get("desc", "")  # ← some API versions use "desc" not "title"
-            combined = f"{title} {desc}"
- 
-            if not re.search(r'#dreamyvr', combined, re.IGNORECASE):
-                continue
-            dreamyvr_count += 1
-            total_views += video.get("play_count", 0)
- 
-        return {"videos": dreamyvr_count, "views": total_views}
- 
-    except Exception as e:
-        print(f"TikTok RapidAPI error: {e}")
+    """Scrape TikTok profile page directly — no API key needed."""
+    videos = await scrape_tiktok_user_videos(session, handle)
+    if not videos:
         return {"videos": 0, "views": 0}
+ 
+    cutoff         = datetime.now(timezone.utc) - timedelta(days=30)
+    total_views    = 0
+    dreamyvr_count = 0
+ 
+    for video in videos:
+        create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
+        if create_time < cutoff:
+            continue
+        desc = video.get("desc", "")
+        if not re.search(r'#dreamyvr', desc, re.IGNORECASE):
+            continue
+        dreamyvr_count += 1
+        total_views += video.get("play_count", 0)
+ 
+    return {"videos": dreamyvr_count, "views": total_views}
  
  
 async def get_combined_stats(session: aiohttp.ClientSession, user_id: int) -> dict:
@@ -352,8 +473,6 @@ def get_highest_qualifying_tier_index(videos: int, views: int) -> int:
         qualifies = False
         if tier["min_videos"] > 0 and videos >= tier["min_videos"]:
             qualifies = True
-        # FIX: removed the hidden "videos >= 5" gate — view tiers should only
-        # require views, not a minimum video count too
         if tier["min_views"] > 0 and views >= tier["min_views"]:
             qualifies = True
         if qualifies:
@@ -518,49 +637,26 @@ async def debugstats(interaction: discord.Interaction, platform: str, handle: st
             await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
  
         else:
-            headers = {
-                "x-rapidapi-key": RAPIDAPI_KEY,
-                "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
-            }
-            async with session.get(
-                "https://tiktok-scraper7.p.rapidapi.com/user/info",
-                headers=headers,
-                params={"unique_id": handle}
-            ) as r:
-                user_data = await r.json()
- 
-            if "data" not in user_data:
-                await interaction.followup.send(f"❌ TikTok API error:\n```{str(user_data)[:500]}```", ephemeral=True)
-                return
- 
-            tt_user_id = user_data["data"]["user"]["id"]
- 
-            async with session.get(
-                "https://tiktok-scraper7.p.rapidapi.com/user/posts",
-                headers=headers,
-                params={"user_id": tt_user_id, "count": "50", "cursor": "0", "sort_type": "0"}
-            ) as r:
-                posts_data = await r.json()
- 
-            videos = posts_data.get("data", {}).get("videos", [])
+            # TikTok debug — scrape and show raw results
+            videos = await scrape_tiktok_user_videos(session, handle)
             if not videos:
-                await interaction.followup.send(f"✅ TikTok user ID: `{tt_user_id}`\n❌ No videos returned from API.", ephemeral=True)
+                await interaction.followup.send(
+                    f"❌ Could not scrape TikTok profile for `@{handle}`.\n"
+                    f"TikTok may be blocking the request. Try again in a few minutes.",
+                    ephemeral=True
+                )
                 return
  
             cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-            lines  = [f"✅ TikTok user ID: `{tt_user_id}`\n📹 Last {len(videos)} video(s):\n"]
-            for video in videos:
-                # FIX: show both title and desc fields so you can see what the API actually returns
-                title       = video.get("title", "N/A")
-                desc        = video.get("desc", "")
+            lines  = [f"✅ Scraped `@{handle}` — {len(videos)} video(s) found:\n"]
+            for video in videos[:8]:  # show up to 8 for debug
+                desc        = video.get("desc", "N/A")
                 views       = video.get("play_count", 0)
                 create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
                 in_range    = create_time >= cutoff
-                combined    = f"{title} {desc}"
-                has_tag     = bool(re.search(r'#dreamyvr', combined, re.IGNORECASE))
+                has_tag     = bool(re.search(r'#dreamyvr', desc, re.IGNORECASE))
                 lines.append(
-                    f"**{title[:80]}**\n"
-                    f"Desc: `{desc[:80]}`\n"
+                    f"**{desc[:80]}**\n"
                     f"Views: {views} | In last 30 days: {'✅' if in_range else '❌'} | #dreamyvr: {'✅' if has_tag else '❌'}\n"
                 )
  
@@ -650,47 +746,9 @@ async def get_youtube_description(session: aiohttp.ClientSession, video_id: str)
  
  
 async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, username: str) -> str:
-    """
-    FIX: Use RapidAPI to fetch TikTok video details instead of scraping HTML.
-    TikTok's page is JavaScript-rendered so the meta description tag rarely
-    contains the actual caption/hashtags.
-    """
-    headers = {
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
-    }
-    try:
-        async with session.get(
-            "https://tiktok-scraper7.p.rapidapi.com/video/info",
-            headers=headers,
-            params={"url": f"https://www.tiktok.com/@{username}/video/{video_id}"}
-        ) as r:
-            data = await r.json()
-            video_data = data.get("data", {})
-            title = video_data.get("title", "")
-            desc  = video_data.get("desc", "")
-            return f"{title} {desc}"
-    except Exception as e:
-        print(f"TikTok description fetch error (RapidAPI): {e}")
- 
-    # Fallback: try scraping as a last resort
-    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
-    scrape_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    }
-    try:
-        async with session.get(url, headers=scrape_headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            html  = await r.text()
-            match = re.search(r'<meta name="description" content="([^"]*)"', html)
-            if match:
-                return match.group(1)
-    except Exception as e:
-        print(f"TikTok description scrape fallback error: {e}")
-    return ""
+    """Scrape a single TikTok video page for its caption/hashtags."""
+    video_data = await scrape_tiktok_video(session, video_id, username)
+    return video_data.get("desc", "")
  
  
 async def video_has_dreamyvr_tag(session: aiohttp.ClientSession, content: str) -> bool:
@@ -815,23 +873,21 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession):
  
  
 async def get_latest_tiktok_video(session: aiohttp.ClientSession):
+    """Scrape the TikTok profile page to find the latest video."""
     url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    }
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with session.get(
+            url,
+            headers=tiktok_headers(),
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as r:
             html    = await r.text()
-            matches = re.findall(r'/@' + TIKTOK_USERNAME + r'/video/(\d+)', html)
+            matches = re.findall(r'/@' + re.escape(TIKTOK_USERNAME) + r'/video/(\d+)', html)
             if matches:
                 vid_id = matches[0]
                 return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
     except Exception as e:
-        print(f"TikTok scrape error: {e}")
+        print(f"TikTok latest video scrape error: {e}")
     return None, None
  
  
