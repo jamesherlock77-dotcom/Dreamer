@@ -1,12 +1,11 @@
 import os
 import re
-import json
 import asyncio
 import aiohttp
 import discord
 from discord.ext import commands, tasks
 from datetime import datetime, timezone, timedelta
- 
+
 # ── Config ──────────────────────────────────────────────────────────────
 YOUTUBE_CHANNEL_HANDLE  = "dreamyvrofficial"
 TIKTOK_USERNAME         = "dreamyvrofficial"
@@ -18,209 +17,58 @@ SUBMISSIONS_CHANNEL_ID  = 1512877823168090173
 CC_DATABASE_CHANNEL_ID  = 1512899799077093546
 CC_ROLE_ID              = 1495165348654219344
 LINKCC_CHANNEL_ID       = 1512954067327127632
+SUBMIT_VIEWS_CHANNEL_ID = 1513272619439226980
+MOD_REVIEW_CHANNEL_ID   = 1513276845104304278
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 1800  # 30 minutes
- 
+
 DISCORD_TOKEN   = os.environ["DISCORD_TOKEN"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
-# RAPIDAPI_KEY removed — no longer needed
- 
+
 # ── Tier config ──────────────────────────────────────────────────────────
 TIERS = [
-    {"role_id": 1512870343310835974, "min_views": 0,      "min_videos": 5,  "label": "5+ Videos"},
-    {"role_id": 1512871854308589648, "min_views": 5000,   "min_videos": 0,  "label": "5k Views"},
-    {"role_id": 1512871100361478375, "min_views": 10000,  "min_videos": 0,  "label": "10k Views"},
-    {"role_id": 1512872854926917874, "min_views": 20000,  "min_videos": 0,  "label": "20k Views"},
-    {"role_id": 1512873532374122516, "min_views": 30000,  "min_videos": 0,  "label": "30k Views"},
-    {"role_id": 1512874309641699399, "min_views": 50000,  "min_videos": 0,  "label": "50k Views"},
-    {"role_id": 1512874841240375436, "min_views": 100000, "min_videos": 0,  "label": "100k Views"},
+    {"role_id": 1512870343310835974, "label": "Copper",   "level": 1},
+    {"role_id": 1512871854308589648, "label": "Bronze",   "level": 2},
+    {"role_id": 1512871100361478375, "label": "Metal",    "level": 3},
+    {"role_id": 1512872854926917874, "label": "Gold",     "level": 4},
+    {"role_id": 1512873532374122516, "label": "Platinum", "level": 5},
+    {"role_id": 1512874309641699399, "label": "Level 6",  "level": 6},
 ]
 # ────────────────────────────────────────────────────────────────────────
- 
-# Rotate user agents to reduce TikTok blocks
-TIKTOK_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-]
-_ua_index = 0
- 
-def next_user_agent() -> str:
-    global _ua_index
-    ua = TIKTOK_USER_AGENTS[_ua_index % len(TIKTOK_USER_AGENTS)]
-    _ua_index += 1
-    return ua
- 
-def tiktok_headers() -> dict:
-    return {
-        "User-Agent": next_user_agent(),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://www.tiktok.com/",
-    }
- 
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
- 
+
 last_youtube_video_id    = None
 last_tiktok_video_id     = None
 youtube_channel_id_cache = None
 processed_forum_posts    = set()
 cc_database              = {}
-user_tier_cache          = {}
- 
+
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
 TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
- 
- 
-# ── TikTok scraper helpers ────────────────────────────────────────────────
- 
-def extract_tiktok_json(html: str) -> dict:
-    """Pull the embedded JSON data blob TikTok puts in every page."""
-    # Try __UNIVERSAL_DATA_FOR_REHYDRATION__ first (newer TikTok)
-    match = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-    # Fallback: SIGI_STATE
-    match = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-    return {}
- 
- 
-async def scrape_tiktok_user_videos(session: aiohttp.ClientSession, username: str) -> list:
-    """
-    Scrape a TikTok user's profile page and return a list of video dicts
-    with keys: video_id, desc, play_count, create_time
-    """
-    url = f"https://www.tiktok.com/@{username}"
-    try:
-        async with session.get(
-            url,
-            headers=tiktok_headers(),
-            timeout=aiohttp.ClientTimeout(total=20)
-        ) as r:
-            if r.status != 200:
-                print(f"TikTok profile scrape got status {r.status} for @{username}")
-                return []
-            html = await r.text()
- 
-        data = extract_tiktok_json(html)
-        videos = []
- 
-        # Navigate the nested JSON — structure varies slightly by TikTok version
-        # Try __DEFAULT_SCOPE__ -> webapp.user-detail path
-        default_scope = data.get("__DEFAULT_SCOPE__", {})
-        user_post = (
-            default_scope
-            .get("webapp.user-post", {})
-            .get("itemList", [])
-        )
-        if not user_post:
-            # Try SIGI_STATE path
-            user_post = []
-            item_module = data.get("ItemModule", {})
-            for vid_id, item in item_module.items():
-                user_post.append(item)
- 
-        for item in user_post:
-            try:
-                desc       = item.get("desc", "")
-                play_count = item.get("stats", {}).get("playCount", 0)
-                create_time = item.get("createTime", 0)
-                video_id   = item.get("id", "")
-                if video_id:
-                    videos.append({
-                        "video_id":   video_id,
-                        "desc":       desc,
-                        "play_count": play_count,
-                        "create_time": int(create_time),
-                    })
-            except Exception:
-                continue
- 
-        print(f"[TikTok scrape] @{username}: found {len(videos)} videos")
-        return videos
- 
-    except Exception as e:
-        print(f"TikTok profile scrape error for @{username}: {e}")
-        return []
- 
- 
-async def scrape_tiktok_video(session: aiohttp.ClientSession, video_id: str, username: str) -> dict:
-    """
-    Scrape a single TikTok video page and return desc/caption text.
-    Used for the forum post checker.
-    """
-    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
-    try:
-        async with session.get(
-            url,
-            headers=tiktok_headers(),
-            timeout=aiohttp.ClientTimeout(total=20)
-        ) as r:
-            if r.status != 200:
-                print(f"TikTok video scrape got status {r.status}")
-                return {}
-            html = await r.text()
- 
-        data = extract_tiktok_json(html)
- 
-        # Try to find the video item in the JSON
-        default_scope = data.get("__DEFAULT_SCOPE__", {})
-        item_detail   = default_scope.get("webapp.video-detail", {}).get("itemInfo", {}).get("itemStruct", {})
-        if item_detail:
-            return {
-                "desc":       item_detail.get("desc", ""),
-                "play_count": item_detail.get("stats", {}).get("playCount", 0),
-            }
- 
-        # Fallback: check ItemModule
-        item_module = data.get("ItemModule", {})
-        item = item_module.get(video_id, {})
-        if item:
-            return {
-                "desc":       item.get("desc", ""),
-                "play_count": item.get("stats", {}).get("playCount", 0),
-            }
- 
-        # Last resort: grab meta description tag
-        match = re.search(r'<meta name="description" content="([^"]*)"', html)
-        if match:
-            return {"desc": match.group(1), "play_count": 0}
- 
-    except Exception as e:
-        print(f"TikTok video scrape error: {e}")
-    return {}
- 
- 
+
+
 # ── Database channel parser ───────────────────────────────────────────────
- 
+
 async def load_cc_database():
     global cc_database
     channel = bot.get_channel(CC_DATABASE_CHANNEL_ID)
     if not channel:
         print("CC database channel not found!")
         return
- 
+
     print("Loading CC database from channel history...")
     cc_database = {}
- 
+
     async for message in channel.history(limit=1000, oldest_first=True):
         if not message.author.bot:
             continue
- 
+
         content = message.content
- 
+
         confirmed_match = re.search(
             r'✅ CONFIRMED \| USER_ID:(\d+) \| PLATFORM:(\w+) \| HANDLE:(.+)',
             content
@@ -233,7 +81,7 @@ async def load_cc_database():
                 cc_database[user_id] = {}
             cc_database[user_id][platform] = {"handle": handle, "confirmed": True}
             continue
- 
+
         declined_match = re.search(r'❌ DECLINED \| USER_ID:(\d+) \| PLATFORM:(\w+)', content)
         if declined_match:
             user_id  = int(declined_match.group(1))
@@ -241,7 +89,7 @@ async def load_cc_database():
             if user_id in cc_database:
                 cc_database[user_id].pop(platform, None)
             continue
- 
+
         pending_match = re.search(
             r'🕐 PENDING \| USER_ID:(\d+) \| PLATFORM:(\w+) \| HANDLE:(.+)',
             content
@@ -254,75 +102,75 @@ async def load_cc_database():
                 cc_database[user_id] = {}
             if platform not in cc_database[user_id]:
                 cc_database[user_id][platform] = {"handle": handle, "confirmed": False}
- 
+
     print(f"Loaded {len(cc_database)} CC entries.")
- 
- 
+
+
 # ── CC Confirm/Decline buttons ────────────────────────────────────────────
- 
+
 class CCConfirmView(discord.ui.View):
     def __init__(self, user_id: int, platform: str, handle: str):
         super().__init__(timeout=None)
         self.user_id  = user_id
         self.platform = platform
         self.handle   = handle
- 
+
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅", custom_id="cc_confirm")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.manage_roles:
             await interaction.response.send_message("❌ You don't have permission to do this.", ephemeral=True)
             return
- 
+
         if self.user_id not in cc_database:
             cc_database[self.user_id] = {}
         cc_database[self.user_id][self.platform] = {"handle": self.handle, "confirmed": True}
- 
+
         for child in self.children:
             child.disabled = True
- 
+
         db_channel = bot.get_channel(CC_DATABASE_CHANNEL_ID)
         if db_channel:
             await db_channel.send(
                 f"✅ CONFIRMED | USER_ID:{self.user_id} | PLATFORM:{self.platform} | HANDLE:{self.handle}"
             )
- 
+
         member  = interaction.guild.get_member(self.user_id)
         mention = member.mention if member else f"<@{self.user_id}>"
- 
+
         await interaction.response.send_message(
             f"✅ Confirmed {mention}'s {self.platform} handle as `{self.handle}`!",
             ephemeral=True
         )
         await interaction.message.delete()
- 
+
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌", custom_id="cc_decline")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.user.guild_permissions.manage_roles:
             await interaction.response.send_message("❌ You don't have permission to do this.", ephemeral=True)
             return
- 
+
         if self.user_id in cc_database:
             cc_database[self.user_id].pop(self.platform, None)
- 
+
         for child in self.children:
             child.disabled = True
- 
+
         db_channel = bot.get_channel(CC_DATABASE_CHANNEL_ID)
         if db_channel:
             await db_channel.send(f"❌ DECLINED | USER_ID:{self.user_id} | PLATFORM:{self.platform}")
- 
+
         member  = interaction.guild.get_member(self.user_id)
         mention = member.mention if member else f"<@{self.user_id}>"
- 
+
         await interaction.response.send_message(
             f"❌ Declined {mention}'s {self.platform} handle submission.",
             ephemeral=True
         )
         await interaction.message.delete()
- 
- 
+
+
 # ── /linkcc command ───────────────────────────────────────────────────────
- 
+
 @bot.tree.command(name="linkcc", description="Link your YouTube or TikTok handle (you can link both)")
 @discord.app_commands.describe(
     platform="Your platform (youtube or tiktok)",
@@ -338,20 +186,20 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
             f"❌ You can only use this command in <#{LINKCC_CHANNEL_ID}>.", ephemeral=True
         )
         return
- 
+
     role = interaction.guild.get_role(CC_ROLE_ID)
     if not role or role not in interaction.user.roles:
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
         return
- 
+
     handle = handle.lstrip("@").strip()
- 
+
     if interaction.user.id not in cc_database:
         cc_database[interaction.user.id] = {}
     cc_database[interaction.user.id][platform] = {"handle": handle, "confirmed": False}
- 
+
     db_channel = bot.get_channel(CC_DATABASE_CHANNEL_ID)
     if db_channel:
         view = CCConfirmView(
@@ -365,370 +213,232 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str):
             f"An admin/mod can confirm or decline below:",
             view=view
         )
- 
+
     await interaction.response.send_message(
         f"✅ Your `{platform}` handle `{handle}` has been submitted for review!",
         ephemeral=True
     )
- 
- 
-# ── Stats fetchers ────────────────────────────────────────────────────────
- 
-async def get_youtube_stats(session: aiohttp.ClientSession, handle: str) -> dict:
-    url    = "https://www.googleapis.com/youtube/v3/channels"
-    params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
-    async with session.get(url, params=params) as r:
-        data  = await r.json()
-        items = data.get("items", [])
-        if not items:
-            return {"videos": 0, "views": 0}
-        channel_id = items[0]["id"]
- 
-    since  = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    url    = "https://www.googleapis.com/youtube/v3/search"
-    params = {
-        "part": "id",
-        "channelId": channel_id,
-        "type": "video",
-        "publishedAfter": since,
-        "maxResults": 50,
-        "key": YOUTUBE_API_KEY,
-    }
-    async with session.get(url, params=params) as r:
-        data  = await r.json()
-        items = data.get("items", [])
-        if not items:
-            return {"videos": 0, "views": 0}
-        video_ids = [item["id"]["videoId"] for item in items]
- 
-    url    = "https://www.googleapis.com/youtube/v3/videos"
-    params = {
-        "part": "snippet,statistics",
-        "id": ",".join(video_ids),
-        "key": YOUTUBE_API_KEY,
-    }
-    async with session.get(url, params=params) as r:
-        data = await r.json()
- 
-    total_views    = 0
-    dreamyvr_count = 0
- 
-    for item in data.get("items", []):
-        snippet  = item.get("snippet", {})
-        combined = f"{snippet.get('title', '')} {snippet.get('description', '')} {' '.join(snippet.get('tags', []))}"
-        if not re.search(r'#dreamyvr', combined, re.IGNORECASE):
-            continue
-        dreamyvr_count += 1
-        total_views += int(item.get("statistics", {}).get("viewCount", 0))
- 
-    return {"videos": dreamyvr_count, "views": total_views}
- 
- 
-async def get_tiktok_stats(session: aiohttp.ClientSession, handle: str) -> dict:
-    """Scrape TikTok profile page directly — no API key needed."""
-    videos = await scrape_tiktok_user_videos(session, handle)
-    if not videos:
-        return {"videos": 0, "views": 0}
- 
-    cutoff         = datetime.now(timezone.utc) - timedelta(days=30)
-    total_views    = 0
-    dreamyvr_count = 0
- 
-    for video in videos:
-        create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
-        if create_time < cutoff:
-            continue
-        desc = video.get("desc", "")
-        if not re.search(r'#dreamyvr', desc, re.IGNORECASE):
-            continue
-        dreamyvr_count += 1
-        total_views += video.get("play_count", 0)
- 
-    return {"videos": dreamyvr_count, "views": total_views}
- 
- 
-async def get_combined_stats(session: aiohttp.ClientSession, user_id: int) -> dict:
-    user_entry   = cc_database.get(user_id, {})
-    total_videos = 0
-    total_views  = 0
- 
-    yt_entry = user_entry.get("youtube")
-    if yt_entry and yt_entry["confirmed"]:
-        stats         = await get_youtube_stats(session, yt_entry["handle"])
-        total_videos += stats["videos"]
-        total_views  += stats["views"]
- 
-    tt_entry = user_entry.get("tiktok")
-    if tt_entry and tt_entry["confirmed"]:
-        stats         = await get_tiktok_stats(session, tt_entry["handle"])
-        total_videos += stats["videos"]
-        total_views  += stats["views"]
- 
-    return {"videos": total_videos, "views": total_views}
- 
- 
-def get_highest_qualifying_tier_index(videos: int, views: int) -> int:
-    highest = -1
-    for i, tier in enumerate(TIERS):
-        qualifies = False
-        if tier["min_videos"] > 0 and videos >= tier["min_videos"]:
-            qualifies = True
-        if tier["min_views"] > 0 and views >= tier["min_views"]:
-            qualifies = True
-        if qualifies:
-            highest = i
-    return highest
- 
- 
-# ── Tier check task ───────────────────────────────────────────────────────
- 
-@tasks.loop(seconds=CHECK_INTERVAL)
-async def check_tiers():
-    if not bot.guilds:
-        return
-    guild               = bot.guilds[0]
-    submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
-    if not submissions_channel:
-        return
- 
-    print(f"Checking tiers for {len(cc_database)} linked users...")
- 
-    async with aiohttp.ClientSession() as session:
-        for user_id, platforms in cc_database.items():
-            has_confirmed = any(p.get("confirmed") for p in platforms.values())
-            if not has_confirmed:
-                continue
- 
-            try:
-                stats   = await get_combined_stats(session, user_id)
-                videos  = stats["videos"]
-                views   = stats["views"]
- 
-                current_highest     = get_highest_qualifying_tier_index(videos, views)
-                previously_notified = user_tier_cache.get(user_id, -1)
- 
-                if current_highest > previously_notified:
-                    for tier_index in range(previously_notified + 1, current_highest + 1):
-                        tier         = TIERS[tier_index]
-                        member       = guild.get_member(user_id)
-                        mention      = member.mention if member else f"<@{user_id}>"
-                        role_mention = f"<@&{tier['role_id']}>"
-                        await submissions_channel.send(
-                            f"🎉 {mention} is ready for the **{tier['label']}** tier! {role_mention}"
-                        )
-                        await asyncio.sleep(0.5)
- 
-                    user_tier_cache[user_id] = current_highest
- 
-                await asyncio.sleep(1)
- 
-            except Exception as e:
-                print(f"Tier check error for user {user_id}: {e}")
- 
-@check_tiers.before_loop
-async def before_check_tiers():
-    await bot.wait_until_ready()
- 
- 
-# ── /ccstats command ──────────────────────────────────────────────────────
- 
-@bot.tree.command(name="ccstats", description="See your linked channel stats for the last 30 days (#dreamyvr videos only)")
-@discord.app_commands.describe(platform="Which platform to check (youtube or tiktok)")
-@discord.app_commands.choices(platform=[
-    discord.app_commands.Choice(name="YouTube", value="youtube"),
-    discord.app_commands.Choice(name="TikTok",  value="tiktok"),
-])
-async def ccstats(interaction: discord.Interaction, platform: str):
-    user_id        = interaction.user.id
-    user_entry     = cc_database.get(user_id, {})
-    platform_entry = user_entry.get(platform)
- 
-    if not platform_entry:
-        await interaction.response.send_message(
-            f"❌ You haven't linked a {platform} handle yet. Use `/linkcc` to add one!",
-            ephemeral=True
-        )
-        return
- 
-    if not platform_entry["confirmed"]:
-        await interaction.response.send_message(
-            f"⏳ Your {platform} handle is still pending confirmation by an admin/mod.",
-            ephemeral=True
-        )
-        return
- 
-    await interaction.response.defer()
-    handle = platform_entry["handle"]
- 
-    async with aiohttp.ClientSession() as session:
-        if platform == "youtube":
-            stats = await get_youtube_stats(session, handle)
-        else:
-            stats = await get_tiktok_stats(session, handle)
- 
-    platform_label = "YouTube" if platform == "youtube" else "TikTok"
-    await interaction.followup.send(
-        f"📊 **{interaction.user.mention}'s {platform_label} stats (last 30 days, #dreamyvr videos only)**\n"
-        f"Handle: `@{handle}`\n"
-        f"#dreamyvr videos posted: **{stats['videos']}**\n"
-        f"Total views: **{stats['views']:,}**"
+
+
+# ── Submit Views system ───────────────────────────────────────────────────
+
+class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok Views"):
+    views_count = discord.ui.TextInput(
+        label="Your total #dreamyvr views (last 30 days)",
+        placeholder="e.g. 15000",
+        required=True,
+        max_length=20,
     )
- 
- 
-# ── /debugstats command ───────────────────────────────────────────────────
- 
-@bot.tree.command(name="debugstats", description="Debug CC stats [Admin only]")
-@discord.app_commands.describe(platform="Platform to debug", handle="Handle to check")
-@discord.app_commands.choices(platform=[
-    discord.app_commands.Choice(name="YouTube", value="youtube"),
-    discord.app_commands.Choice(name="TikTok",  value="tiktok"),
-])
-async def debugstats(interaction: discord.Interaction, platform: str, handle: str):
+    tier_claimed = discord.ui.TextInput(
+        label="Which tier are you claiming?",
+        placeholder="e.g. Gold (Level 4)",
+        required=True,
+        max_length=50,
+    )
+    screenshot_url = discord.ui.TextInput(
+        label="Screenshot URL (upload to Discord, paste link)",
+        placeholder="https://cdn.discordapp.com/...",
+        required=True,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        mod_channel = bot.get_channel(MOD_REVIEW_CHANNEL_ID)
+        if not mod_channel:
+            await interaction.response.send_message("❌ Could not find mod review channel.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="📊 Views Submission",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Creator", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Views Claimed", value=self.views_count.value, inline=True)
+        embed.add_field(name="Tier Claimed", value=self.tier_claimed.value, inline=True)
+        embed.set_image(url=self.screenshot_url.value)
+        embed.set_footer(text=f"User ID: {interaction.user.id}")
+
+        view = ModReviewView(user_id=interaction.user.id)
+        await mod_channel.send(embed=embed, view=view)
+
+        await interaction.response.send_message(
+            "✅ Your submission has been sent to the mods for review! You'll receive a role once approved.",
+            ephemeral=True
+        )
+
+
+class SubmitViewsButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Submit Views",
+        style=discord.ButtonStyle.primary,
+        emoji="📊",
+        custom_id="submit_views_button"
+    )
+    async def submit_views(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role = interaction.guild.get_role(CC_ROLE_ID)
+        if not role or role not in interaction.user.roles:
+            await interaction.response.send_message(
+                "❌ You need the Creator Collective role to submit views.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(SubmitViewsModal())
+
+
+class TierRoleSelect(discord.ui.Select):
+    def __init__(self, user_id: int):
+        self.target_user_id = user_id
+        options = [
+            discord.SelectOption(
+                label=f"Level {tier['level']} — {tier['label']}",
+                value=str(tier["role_id"]),
+                emoji="🏅"
+            )
+            for tier in TIERS
+        ]
+        super().__init__(
+            placeholder="Select a tier role to assign...",
+            options=options,
+            custom_id=f"tier_select_{user_id}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+
+        role_id = int(self.values[0])
+        role    = interaction.guild.get_role(role_id)
+        member  = interaction.guild.get_member(self.target_user_id)
+
+        if not member:
+            await interaction.response.send_message("❌ Could not find that member.", ephemeral=True)
+            return
+        if not role:
+            await interaction.response.send_message("❌ Could not find that role.", ephemeral=True)
+            return
+
+        # Remove all other tier roles first
+        tier_role_ids = {tier["role_id"] for tier in TIERS}
+        roles_to_remove = [r for r in member.roles if r.id in tier_role_ids]
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove)
+
+        await member.add_roles(role)
+
+        tier_label = next((t["label"] for t in TIERS if t["role_id"] == role_id), "Unknown")
+        await interaction.response.send_message(
+            f"✅ Gave {member.mention} the **{tier_label}** role!",
+            ephemeral=True
+        )
+
+
+class ModReviewView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.add_item(TierRoleSelect(user_id=user_id))
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅", custom_id="mod_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+
+        member  = interaction.guild.get_member(self.user_id)
+        mention = member.mention if member else f"<@{self.user_id}>"
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+        await interaction.response.send_message(
+            f"✅ Approved {mention}'s submission! Make sure to assign their tier role using the dropdown above.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌", custom_id="mod_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
+            return
+
+        member  = interaction.guild.get_member(self.user_id)
+        mention = member.mention if member else f"<@{self.user_id}>"
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+        await interaction.response.send_message(
+            f"❌ Denied {mention}'s submission.",
+            ephemeral=True
+        )
+
+        # Try to DM the user
+        if member:
+            try:
+                await member.send(
+                    "❌ Your views submission was denied. Please make sure your screenshot clearly shows "
+                    "your TikTok analytics with #dreamyvr views. Feel free to resubmit!"
+                )
+            except Exception:
+                pass
+
+
+# ── Post persistent submit views message ─────────────────────────────────
+
+@bot.tree.command(name="setupsubmitviews", description="Post the Submit Views button [Admin only]")
+async def setupsubmitviews(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ No permission.", ephemeral=True)
         return
- 
-    await interaction.response.defer(ephemeral=True)
- 
-    async with aiohttp.ClientSession() as session:
-        if platform == "youtube":
-            url    = "https://www.googleapis.com/youtube/v3/channels"
-            params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
-            async with session.get(url, params=params) as r:
-                data  = await r.json()
-                items = data.get("items", [])
-                if not items:
-                    await interaction.followup.send("❌ Could not resolve YouTube channel ID. Handle may be wrong.", ephemeral=True)
-                    return
-                channel_id = items[0]["id"]
- 
-            since  = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            url    = "https://www.googleapis.com/youtube/v3/search"
-            params = {"part": "id", "channelId": channel_id, "type": "video", "publishedAfter": since, "maxResults": 5, "key": YOUTUBE_API_KEY}
-            async with session.get(url, params=params) as r:
-                data  = await r.json()
-                items = data.get("items", [])
-                if not items:
-                    await interaction.followup.send(f"✅ Channel ID: `{channel_id}`\n❌ No videos found in last 30 days.", ephemeral=True)
-                    return
-                video_ids = [item["id"]["videoId"] for item in items]
- 
-            url    = "https://www.googleapis.com/youtube/v3/videos"
-            params = {"part": "snippet,statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
-            async with session.get(url, params=params) as r:
-                data = await r.json()
- 
-            lines = [f"✅ Channel ID: `{channel_id}`\n📹 Last {len(video_ids)} video(s):\n"]
-            for item in data.get("items", []):
-                snippet  = item.get("snippet", {})
-                title    = snippet.get("title", "N/A")
-                desc     = snippet.get("description", "")[:100]
-                tags     = snippet.get("tags", [])[:5]
-                views    = item.get("statistics", {}).get("viewCount", 0)
-                combined = f"{snippet.get('title', '')} {snippet.get('description', '')} {' '.join(snippet.get('tags', []))}"
-                has_tag  = bool(re.search(r'#dreamyvr', combined, re.IGNORECASE))
-                lines.append(
-                    f"**{title}**\n"
-                    f"Views: {views} | #dreamyvr detected: {'✅' if has_tag else '❌'}\n"
-                    f"Desc preview: `{desc}`\n"
-                    f"Tags: `{tags}`\n"
-                )
- 
-            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
- 
-        else:
-            # TikTok debug — scrape and show raw results
-            videos = await scrape_tiktok_user_videos(session, handle)
-            if not videos:
-                await interaction.followup.send(
-                    f"❌ Could not scrape TikTok profile for `@{handle}`.\n"
-                    f"TikTok may be blocking the request. Try again in a few minutes.",
-                    ephemeral=True
-                )
-                return
- 
-            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-            lines  = [f"✅ Scraped `@{handle}` — {len(videos)} video(s) found:\n"]
-            for video in videos[:8]:  # show up to 8 for debug
-                desc        = video.get("desc", "N/A")
-                views       = video.get("play_count", 0)
-                create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
-                in_range    = create_time >= cutoff
-                has_tag     = bool(re.search(r'#dreamyvr', desc, re.IGNORECASE))
-                lines.append(
-                    f"**{desc[:80]}**\n"
-                    f"Views: {views} | In last 30 days: {'✅' if in_range else '❌'} | #dreamyvr: {'✅' if has_tag else '❌'}\n"
-                )
- 
-            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
- 
- 
-# ── /linkleaderboard command (admins only) ────────────────────────────────
- 
-@bot.tree.command(name="linkleaderboard", description="See all linked content creators [Admin only]")
-async def linkleaderboard(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ You don't have permission to use this command.", ephemeral=True
-        )
+
+    channel = bot.get_channel(SUBMIT_VIEWS_CHANNEL_ID)
+    if not channel:
+        await interaction.response.send_message("❌ Submit views channel not found.", ephemeral=True)
         return
- 
-    await interaction.response.defer(ephemeral=True)
- 
-    if not cc_database:
-        await interaction.followup.send("No linked accounts yet.", ephemeral=True)
-        return
- 
-    lines = ["📋 **Linked Content Creators**\n"]
- 
-    for user_id, platforms in cc_database.items():
-        confirmed_platforms = {p: d for p, d in platforms.items() if d.get("confirmed")}
-        if not confirmed_platforms:
-            continue
- 
-        member  = interaction.guild.get_member(user_id)
-        mention = member.mention if member else f"<@{user_id}>"
- 
-        platform_parts = []
-        for platform, data in confirmed_platforms.items():
-            emoji = "▶️" if platform == "youtube" else "🎵"
-            platform_parts.append(f"{emoji} {platform.capitalize()}: `@{data['handle']}`")
- 
-        lines.append(f"{mention} — {' | '.join(platform_parts)}")
- 
-    chunks  = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 1900:
-            chunks.append(current)
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current:
-        chunks.append(current)
- 
-    for chunk in chunks:
-        await interaction.followup.send(chunk, ephemeral=True)
- 
- 
+
+    embed = discord.Embed(
+        title="📊 Submit Your TikTok Views",
+        description=(
+            "Are you a Creator Collective member? Submit your TikTok analytics to claim your tier role!\n\n"
+            "**How it works:**\n"
+            "1. Open TikTok → Profile → Creator Tools → Analytics\n"
+            "2. Screenshot your total views for the last 28 days\n"
+            "3. Upload the screenshot to Discord and copy the link\n"
+            "4. Click **Submit Views** below and fill in the form\n\n"
+            "A mod will review your submission and assign your role!"
+        ),
+        color=discord.Color.blurple()
+    )
+
+    await channel.send(embed=embed, view=SubmitViewsButton())
+    await interaction.response.send_message("✅ Submit views message posted!", ephemeral=True)
+
+
 # ── Member count ─────────────────────────────────────────────────────────
- 
+
 async def update_member_count(guild: discord.Guild):
     channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
     if channel:
         await channel.edit(name=f"☁️・Members: {guild.member_count}")
- 
+
 @bot.event
 async def on_member_join(member: discord.Member):
     await update_member_count(member.guild)
- 
+
 @bot.event
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
- 
- 
+
+
 # ── Video description fetchers ───────────────────────────────────────────
- 
+
 async def get_youtube_description(session: aiohttp.ClientSession, video_id: str) -> str:
     url    = "https://www.googleapis.com/youtube/v3/videos"
     params = {"part": "snippet", "id": video_id, "key": YOUTUBE_API_KEY}
@@ -743,14 +453,29 @@ async def get_youtube_description(session: aiohttp.ClientSession, video_id: str)
     except Exception as e:
         print(f"YouTube description fetch error: {e}")
     return ""
- 
- 
+
+
 async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, username: str) -> str:
-    """Scrape a single TikTok video page for its caption/hashtags."""
-    video_data = await scrape_tiktok_video(session, video_id, username)
-    return video_data.get("desc", "")
- 
- 
+    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            html  = await r.text()
+            match = re.search(r'<meta name="description" content="([^"]*)"', html)
+            if match:
+                return match.group(1)
+            return html
+    except Exception as e:
+        print(f"TikTok description fetch error: {e}")
+    return ""
+
+
 async def video_has_dreamyvr_tag(session: aiohttp.ClientSession, content: str) -> bool:
     for match in YOUTUBE_REGEX.finditer(content):
         video_id    = match.group(1)
@@ -764,25 +489,25 @@ async def video_has_dreamyvr_tag(session: aiohttp.ClientSession, content: str) -
         if re.search(r'#dreamyvr', description, re.IGNORECASE):
             return True
     return False
- 
- 
+
+
 def has_required_tag(thread: discord.Thread) -> bool:
     if not hasattr(thread, 'applied_tags'):
         return False
     return any(tag.id == REQUIRED_TAG_ID for tag in thread.applied_tags)
- 
+
 def has_video_link(content: str) -> bool:
     return bool(YOUTUBE_REGEX.search(content) or TIKTOK_REGEX.search(content))
- 
+
 def already_reacted(message: discord.Message) -> bool:
     for reaction in message.reactions:
         if str(reaction.emoji) == "👍":
             return reaction.me
     return False
- 
- 
+
+
 # ── Forum processor ──────────────────────────────────────────────────────
- 
+
 async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession):
     try:
         if not has_required_tag(thread):
@@ -808,8 +533,8 @@ async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession)
             processed_forum_posts.add(thread.id)
     except Exception as e:
         print(f"Error processing thread {thread.id}: {e}")
- 
- 
+
+
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_forum():
     forum_channel = bot.get_channel(FORUM_CHANNEL_ID)
@@ -827,14 +552,14 @@ async def check_forum():
                 await asyncio.sleep(0.5)
         except Exception as e:
             print(f"Error fetching archived threads: {e}")
- 
+
 @check_forum.before_loop
 async def before_check_forum():
     await bot.wait_until_ready()
- 
- 
+
+
 # ── YouTube channel helpers ──────────────────────────────────────────────
- 
+
 async def get_youtube_channel_id(session: aiohttp.ClientSession) -> str | None:
     global youtube_channel_id_cache
     if youtube_channel_id_cache:
@@ -848,8 +573,8 @@ async def get_youtube_channel_id(session: aiohttp.ClientSession) -> str | None:
             youtube_channel_id_cache = items[0]["id"]
             return youtube_channel_id_cache
     return None
- 
- 
+
+
 async def get_latest_youtube_video(session: aiohttp.ClientSession):
     channel_id = await get_youtube_channel_id(session)
     if not channel_id:
@@ -870,27 +595,29 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession):
             vid_id = items[0]["id"]["videoId"]
             return vid_id, f"https://www.youtube.com/watch?v={vid_id}"
     return None, None
- 
- 
+
+
 async def get_latest_tiktok_video(session: aiohttp.ClientSession):
-    """Scrape the TikTok profile page to find the latest video."""
     url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
     try:
-        async with session.get(
-            url,
-            headers=tiktok_headers(),
-            timeout=aiohttp.ClientTimeout(total=20)
-        ) as r:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
             html    = await r.text()
-            matches = re.findall(r'/@' + re.escape(TIKTOK_USERNAME) + r'/video/(\d+)', html)
+            matches = re.findall(r'/@' + TIKTOK_USERNAME + r'/video/(\d+)', html)
             if matches:
                 vid_id = matches[0]
                 return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
     except Exception as e:
-        print(f"TikTok latest video scrape error: {e}")
+        print(f"TikTok scrape error: {e}")
     return None, None
- 
- 
+
+
 async def send_notification(video_url: str):
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel:
@@ -899,8 +626,8 @@ async def send_notification(video_url: str):
             f"{ROLE_MENTION}\n"
             f"{video_url}"
         )
- 
- 
+
+
 @tasks.loop(seconds=CHECK_INTERVAL)
 async def check_socials():
     global last_youtube_video_id, last_tiktok_video_id
@@ -915,14 +642,14 @@ async def check_socials():
             if last_tiktok_video_id is not None:
                 await send_notification(tt_url)
             last_tiktok_video_id = tt_id
- 
+
 @check_socials.before_loop
 async def before_check():
     await bot.wait_until_ready()
- 
- 
+
+
 # ── /testsocialmedia command ─────────────────────────────────────────────
- 
+
 @bot.tree.command(name="testsocialmedia", description="Test the social media notification format")
 async def testsocialmedia(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -949,10 +676,10 @@ async def testsocialmedia(interaction: discord.Interaction):
     else:
         lines.append("**TikTok** ❌ Could not fetch latest video.")
     await interaction.followup.send("\n\n".join(lines))
- 
- 
+
+
 # ── Bot startup ──────────────────────────────────────────────────────────
- 
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
@@ -961,17 +688,19 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
- 
+
+    # Re-register persistent views
     bot.add_view(CCConfirmView(user_id=0, platform="youtube", handle=""))
- 
+    bot.add_view(SubmitViewsButton())
+    bot.add_view(ModReviewView(user_id=0))
+
     await load_cc_database()
- 
+
     for guild in bot.guilds:
         await update_member_count(guild)
- 
+
     check_socials.start()
     check_forum.start()
-    check_tiers.start()
- 
- 
+
+
 bot.run(DISCORD_TOKEN)
