@@ -20,6 +20,7 @@ CC_ROLE_ID              = 1495165348654219344
 LINKCC_CHANNEL_ID       = 1512954067327127632
 SUBMIT_VIEWS_CHANNEL_ID = 1513272619439226980
 MOD_REVIEW_CHANNEL_ID   = 1513276845104304278
+MOD_PING_ROLE_ID        = 1513292038550978700
 ROLE_MENTION            = "<@&1512854249174863882>"
 CHECK_INTERVAL          = 1800  # 30 minutes
 
@@ -245,18 +246,18 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str) -
 
 # ── Submit Views system ───────────────────────────────────────────────────
 
-class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok Views"):
-    views_count = discord.ui.TextInput(
-        label="Total #dreamyvr views (last 30 days)",
-        placeholder="e.g. 15000",
+class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok/YouTube Views"):
+    account_url = discord.ui.TextInput(
+        label="URL to your account",
+        placeholder="https://www.tiktok.com/@yourhandle",
         required=True,
-        max_length=20,
+        max_length=500,
     )
-    tier_claimed = discord.ui.TextInput(
-        label="Which tier are you claiming?",
-        placeholder="e.g. Gold (Level 4)",
+    is_group_account = discord.ui.TextInput(
+        label="Is it a group account? (If so include their @s max is 4 people)",
+        placeholder="e.g. No or @person1 @person2",
         required=True,
-        max_length=50,
+        max_length=200,
     )
     screenshot_url = discord.ui.TextInput(
         label="Screenshot URL (Discord link)",
@@ -271,20 +272,23 @@ class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok Views"):
             await interaction.response.send_message("❌ Could not find mod review channel.", ephemeral=True)
             return
 
+        mod_role = interaction.guild.get_role(MOD_PING_ROLE_ID)
+        mod_mention = mod_role.mention if mod_role else f"<@&{MOD_PING_ROLE_ID}>"
+
         embed = discord.Embed(
             title="📊 Views Submission",
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.add_field(name="Creator", value=interaction.user.mention, inline=True)
-        embed.add_field(name="Views Claimed", value=self.views_count.value, inline=True)
-        embed.add_field(name="Tier Claimed", value=self.tier_claimed.value, inline=True)
+        embed.add_field(name="Account URL", value=self.account_url.value, inline=False)
+        embed.add_field(name="Group Account", value=self.is_group_account.value, inline=False)
         embed.set_image(url=self.screenshot_url.value)
         embed.set_footer(text=f"User ID: {interaction.user.id}")
 
         view = ModReviewView(user_id=interaction.user.id)
         try:
-            await mod_channel.send(embed=embed, view=view)
+            await mod_channel.send(f"{mod_mention}", embed=embed, view=view)
         except Exception as e:
             print(f"❌ Error sending submission to mod channel: {e}")
 
@@ -423,7 +427,7 @@ class ModReviewView(discord.ui.View):
             try:
                 await member.send(
                     "❌ Your views submission was denied. Please make sure your screenshot clearly shows "
-                    "your TikTok analytics with #dreamyvr views. Feel free to resubmit!"
+                    "your TikTok/YouTube analytics. Feel free to resubmit!"
                 )
             except Exception:
                 pass
@@ -443,11 +447,11 @@ async def setupsubmitviews(interaction: discord.Interaction) -> None:
         return
 
     embed = discord.Embed(
-        title="📊 Submit Your TikTok Views",
+        title="📊 Submit Your TikTok/YouTube Views",
         description=(
             "Are you a Creator member? Submit your TikTok/YouTube analytics to claim your tier role!\n\n"
             "**How it works:**\n"
-            "1. Open TikTok → Profile → Creator Tools → Analytics\n"
+            "1. Open TikTok/YouTube → Profile → Creator Tools → Analytics\n"
             "2. Screenshot your total views for the last 28 days\n"
             "3. Upload the screenshot to Discord and copy the link\n"
             "4. Click **Submit Views** below and fill in the form\n\n"
