@@ -254,7 +254,7 @@ class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok/YouTube Views
         max_length=500,
     )
     is_group_account = discord.ui.TextInput(
-        label="Is it a group account? (If so include their @s max is 4 people)",
+        label="Group account? (max 4 people @s)",
         placeholder="e.g. No or @person1 @person2",
         required=True,
         max_length=200,
