@@ -448,6 +448,113 @@ async def ccstats(interaction: discord.Interaction, platform: str):
     )
 
 
+# ── /debugstats command ───────────────────────────────────────────────────
+
+@bot.tree.command(name="debugstats", description="Debug CC stats [Admin only]")
+@discord.app_commands.describe(platform="Platform to debug", handle="Handle to check")
+@discord.app_commands.choices(platform=[
+    discord.app_commands.Choice(name="YouTube", value="youtube"),
+    discord.app_commands.Choice(name="TikTok",  value="tiktok"),
+])
+async def debugstats(interaction: discord.Interaction, platform: str, handle: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ No permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async with aiohttp.ClientSession() as session:
+        if platform == "youtube":
+            url    = "https://www.googleapis.com/youtube/v3/channels"
+            params = {"part": "id", "forHandle": handle, "key": YOUTUBE_API_KEY}
+            async with session.get(url, params=params) as r:
+                data  = await r.json()
+                items = data.get("items", [])
+                if not items:
+                    await interaction.followup.send("❌ Could not resolve YouTube channel ID. Handle may be wrong.", ephemeral=True)
+                    return
+                channel_id = items[0]["id"]
+
+            since  = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            url    = "https://www.googleapis.com/youtube/v3/search"
+            params = {"part": "id", "channelId": channel_id, "type": "video", "publishedAfter": since, "maxResults": 5, "key": YOUTUBE_API_KEY}
+            async with session.get(url, params=params) as r:
+                data  = await r.json()
+                items = data.get("items", [])
+                if not items:
+                    await interaction.followup.send(f"✅ Channel ID: `{channel_id}`\n❌ No videos found in last 30 days.", ephemeral=True)
+                    return
+                video_ids = [item["id"]["videoId"] for item in items]
+
+            url    = "https://www.googleapis.com/youtube/v3/videos"
+            params = {"part": "snippet,statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
+            async with session.get(url, params=params) as r:
+                data = await r.json()
+
+            lines = [f"✅ Channel ID: `{channel_id}`\n📹 Last {len(video_ids)} video(s):\n"]
+            for item in data.get("items", []):
+                snippet  = item.get("snippet", {})
+                title    = snippet.get("title", "N/A")
+                desc     = snippet.get("description", "")[:100]
+                tags     = snippet.get("tags", [])[:5]
+                views    = item.get("statistics", {}).get("viewCount", 0)
+                combined = f"{snippet.get('title', '')} {snippet.get('description', '')} {' '.join(snippet.get('tags', []))}"
+                has_tag  = bool(re.search(r'#dreamyvr', combined, re.IGNORECASE))
+                lines.append(
+                    f"**{title}**\n"
+                    f"Views: {views} | #dreamyvr detected: {'✅' if has_tag else '❌'}\n"
+                    f"Desc preview: `{desc}`\n"
+                    f"Tags: `{tags}`\n"
+                )
+
+            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+        else:
+            headers = {
+                "x-rapidapi-key": RAPIDAPI_KEY,
+                "x-rapidapi-host": "tiktok-scraper7.p.rapidapi.com",
+            }
+            async with session.get(
+                "https://tiktok-scraper7.p.rapidapi.com/user/info",
+                headers=headers,
+                params={"unique_id": handle}
+            ) as r:
+                user_data = await r.json()
+
+            if "data" not in user_data:
+                await interaction.followup.send(f"❌ TikTok API error:\n```{str(user_data)[:500]}```", ephemeral=True)
+                return
+
+            tt_user_id = user_data["data"]["user"]["id"]
+
+            async with session.get(
+                "https://tiktok-scraper7.p.rapidapi.com/user/posts",
+                headers=headers,
+                params={"user_id": tt_user_id, "count": "5", "cursor": "0", "sort_type": "0"}
+            ) as r:
+                posts_data = await r.json()
+
+            videos = posts_data.get("data", {}).get("videos", [])
+            if not videos:
+                await interaction.followup.send(f"✅ TikTok user ID: `{tt_user_id}`\n❌ No videos returned from API.", ephemeral=True)
+                return
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            lines  = [f"✅ TikTok user ID: `{tt_user_id}`\n📹 Last {len(videos)} video(s):\n"]
+            for video in videos:
+                title       = video.get("title", "N/A")
+                views       = video.get("play_count", 0)
+                create_time = datetime.fromtimestamp(video.get("create_time", 0), tz=timezone.utc)
+                in_range    = create_time >= cutoff
+                has_tag     = bool(re.search(r'#dreamyvr', title, re.IGNORECASE))
+                lines.append(
+                    f"**{title[:80]}**\n"
+                    f"Views: {views} | In last 30 days: {'✅' if in_range else '❌'} | #dreamyvr: {'✅' if has_tag else '❌'}\n"
+                )
+
+            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+
 # ── /linkleaderboard command (admins only) ────────────────────────────────
 
 @bot.tree.command(name="linkleaderboard", description="See all linked content creators [Admin only]")
