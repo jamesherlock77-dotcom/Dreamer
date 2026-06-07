@@ -282,7 +282,7 @@ class SubmitViewsButton(discord.ui.View):
         role = interaction.guild.get_role(CC_ROLE_ID)
         if not role or role not in interaction.user.roles:
             await interaction.response.send_message(
-                "❌ You need the Creator Collective role to submit views.",
+                "❌ You need the creator role to submit views.",
                 ephemeral=True
             )
             return
@@ -406,7 +406,7 @@ async def setupsubmitviews(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📊 Submit Your TikTok Views",
         description=(
-            "Are you a Creator Collective member? Submit your TikTok analytics to claim your tier role!\n\n"
+            "Are you a Creator member? Submit your TikTok/YouTube analytics to claim your tier role!\n\n"
             "**How it works:**\n"
             "1. Open TikTok → Profile → Creator Tools → Analytics\n"
             "2. Screenshot your total views for the last 28 days\n"
