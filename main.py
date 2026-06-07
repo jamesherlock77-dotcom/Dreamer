@@ -247,7 +247,7 @@ async def linkcc(interaction: discord.Interaction, platform: str, handle: str) -
 
 class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok Views"):
     views_count = discord.ui.TextInput(
-        label="Your total #dreamyvr views (last 30 days)",
+        label="Total #dreamyvr views (last 30 days)",
         placeholder="e.g. 15000",
         required=True,
         max_length=20,
@@ -259,7 +259,7 @@ class SubmitViewsModal(discord.ui.Modal, title="Submit Your TikTok Views"):
         max_length=50,
     )
     screenshot_url = discord.ui.TextInput(
-        label="Screenshot URL (upload to Discord, paste link)",
+        label="Screenshot URL (Discord link)",
         placeholder="https://cdn.discordapp.com/...",
         required=True,
         max_length=500,
