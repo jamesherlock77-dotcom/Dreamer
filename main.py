@@ -39,7 +39,7 @@ TIERS = [
     {"role_id": 1512873532374122516, "label": "Platinum", "level": 5},
     {"role_id": 1512874309641699399, "label": "Level 6",  "level": 6},
 ]
-# ──────────────────────────────────────────────────────────────────���─────
+# ────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -488,7 +488,39 @@ async def update_member_count(guild: discord.Guild) -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
+    """Send welcome message to new member."""
     await update_member_count(member.guild)
+    
+    try:
+        # Get guild icon as thumbnail
+        guild_icon_url = member.guild.icon.url if member.guild.icon else ""
+        
+        embed = discord.Embed(
+            title="Welcome to DreamyVR!",
+            description=f"Hey {member.mention}!",
+            color=discord.Color.dark_gray()
+        )
+        embed.add_field(
+            name="",
+            value=(
+                f"Welcome to the **DreamyVR** community. We're happy to have you here.\n\n"
+                f"Feel free to explore the server, chat with other players, and check out the latest updates "
+                f"in our announcements and changelog channels.\n\n"
+                f"If you have any questions or need help, don't hesitate to reach out in the support channel. "
+                f"We're here to help!\n\n"
+                f"See you in-game!"
+            ),
+            inline=False
+        )
+        
+        if guild_icon_url:
+            embed.set_thumbnail(url=guild_icon_url)
+        
+        embed.set_footer(text=f"DreamyVR Community • {datetime.now(timezone.utc).strftime('%A at %H:%M')}")
+        
+        await member.send(embed=embed)
+    except Exception as e:
+        print(f"❌ Error sending welcome message: {e}")
 
 @bot.event
 async def on_member_remove(member: discord.Member) -> None:
