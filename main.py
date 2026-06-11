@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Set, Tuple
 
 # ── Config ──────────────────────────────────────────────────────────────
-YOUTUBE_CHANNEL_HANDLE  = "dreamyvrofficial"
+YOUTUBE_CHANNEL_HANDLE  = "@dreamyvrofficial"
 TIKTOK_USERNAME         = "dreamyvrofficial"
 DISCORD_CHANNEL_ID      = 1512853017920143560
 MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
@@ -707,11 +707,20 @@ async def get_youtube_channel_id(session: aiohttp.ClientSession) -> Optional[str
     params = {"part": "id", "forHandle": YOUTUBE_CHANNEL_HANDLE, "key": YOUTUBE_API_KEY}
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                print(f"❌ YouTube API error: {r.status}")
+                print(f"Response: {await r.text()}")
+                return None
+            
             data  = await r.json()
             items = data.get("items", [])
             if items:
                 youtube_channel_id_cache = items[0]["id"]
                 return youtube_channel_id_cache
+            else:
+                print(f"❌ No YouTube channel found for handle: {YOUTUBE_CHANNEL_HANDLE}")
+    except asyncio.TimeoutError:
+        print(f"⏱️ YouTube API timeout getting channel ID")
     except Exception as e:
         print(f"❌ Error getting YouTube channel ID: {e}")
     return None
@@ -734,37 +743,29 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession) -> Tuple[Opti
     }
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                print(f"❌ YouTube search error: {r.status}")
+                return None, None
+            
             data  = await r.json()
             items = data.get("items", [])
             if items:
                 vid_id = items[0]["id"]["videoId"]
                 return vid_id, f"https://www.youtube.com/watch?v={vid_id}"
+            else:
+                print(f"❌ No YouTube videos found for channel {channel_id}")
+    except asyncio.TimeoutError:
+        print(f"⏱️ YouTube search timeout")
     except Exception as e:
         print(f"❌ Error fetching latest YouTube video: {e}")
     return None, None
 
 
 async def get_latest_tiktok_video(session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str]]:
-    """Get latest TikTok video ID and URL."""
-    url = f"https://www.tiktok.com/@{TIKTOK_USERNAME}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    }
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            html    = await r.text()
-            matches = re.findall(r'/@' + TIKTOK_USERNAME + r'/video/(\d+)', html)
-            if matches:
-                vid_id = matches[0]
-                return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
-    except asyncio.TimeoutError:
-        print(f"⏱️ TikTok fetch timeout")
-    except Exception as e:
-        print(f"❌ TikTok scrape error: {e}")
+    """Get latest TikTok video ID and URL (simplified approach)."""
+    # TikTok actively blocks scrapers. This returns None with a helpful message.
+    # For production, you'd need to use TikTok's official API or a third-party service.
+    print("⚠️  TikTok scraping not available - consider using TikTok API or removing TikTok checks")
     return None, None
 
 
@@ -829,7 +830,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
                 f"{yt_url}"
             )
         else:
-            lines.append("**YouTube** ❌ Could not fetch latest video.")
+            lines.append("**YouTube** ❌ Could not fetch latest video. Check API key and handle.")
         
         if tt_url:
             lines.append(
@@ -839,7 +840,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
                 f"{tt_url}"
             )
         else:
-            lines.append("**TikTok** ❌ Could not fetch latest video.")
+            lines.append("**TikTok** ❌ TikTok scraping disabled. Consider using TikTok API.")
         
         await interaction.followup.send("\n\n".join(lines))
     except Exception as e:
