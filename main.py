@@ -50,11 +50,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 last_youtube_video_id: Optional[str] = None
 last_tiktok_video_id: Optional[str] = None
 youtube_channel_id_cache: Optional[str] = None
+tiktok_sec_uid_cache: Optional[str] = None  # Cache for TikTok secUid
 processed_forum_posts: Set[int] = set()
 cc_database: Dict[int, Dict[str, Dict]] = {}
 
 YOUTUBE_REGEX = re.compile(r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]+)')
 TIKTOK_REGEX  = re.compile(r'https?://(?:www\.)?tiktok\.com/@([\w.]+)/video/(\d+)')
+
+TIKTOK_API_HOST = "tiktok-api23.p.rapidapi.com"
 
 
 # ── Database channel parser ───────────────────────────────────────────────
@@ -527,6 +530,59 @@ async def on_member_remove(member: discord.Member) -> None:
     await update_member_count(member.guild)
 
 
+# ── TikTok API helpers (tiktok-api23.p.rapidapi.com) ─────────────────────
+
+def tiktok_headers() -> dict:
+    return {
+        "X-RapidAPI-Key":  TIKTOK_API_KEY,
+        "X-RapidAPI-Host": TIKTOK_API_HOST,
+    }
+
+
+async def get_tiktok_sec_uid(session: aiohttp.ClientSession, username: str) -> Optional[str]:
+    """Look up TikTok secUid for a username via Get User Info endpoint."""
+    global tiktok_sec_uid_cache
+    if tiktok_sec_uid_cache:
+        return tiktok_sec_uid_cache
+
+    url    = f"https://{TIKTOK_API_HOST}/api/user/info"
+    params = {"uniqueId": username}
+    try:
+        async with session.get(
+            url, headers=tiktok_headers(), params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            print(f"🔍 TikTok User Info status: {r.status}")
+            if r.status != 200:
+                print(f"❌ TikTok User Info error: {r.status} — {(await r.text())[:200]}")
+                return None
+
+            try:
+                data = await r.json(content_type=None)
+            except Exception as e:
+                print(f"❌ TikTok User Info JSON parse error: {e}")
+                return None
+
+            # Response: {"userInfo": {"user": {"secUid": "..."}}}
+            sec_uid = (
+                data.get("userInfo", {}).get("user", {}).get("secUid")
+                or data.get("data", {}).get("user", {}).get("secUid")
+                or data.get("secUid")
+            )
+            if sec_uid:
+                print(f"✅ Got TikTok secUid for {username}")
+                tiktok_sec_uid_cache = sec_uid
+                return sec_uid
+
+            print(f"❌ secUid not found in response. Keys: {list(data.keys())}")
+            print(f"Full response: {data}")
+    except asyncio.TimeoutError:
+        print("⏱️ TikTok User Info timeout")
+    except Exception as e:
+        print(f"❌ Error fetching TikTok secUid: {e}")
+    return None
+
+
 # ── Video description fetchers ───────────────────────────────────────────
 
 async def get_youtube_description(session: aiohttp.ClientSession, video_id: str) -> str:
@@ -549,45 +605,44 @@ async def get_youtube_description(session: aiohttp.ClientSession, video_id: str)
 
 
 async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, username: str) -> str:
-    """Fetch TikTok video metadata using RapidAPI."""
+    """Fetch TikTok video description using RapidAPI tiktok-api23."""
     if not TIKTOK_API_KEY:
         return ""
 
-    url = "https://tiktok-api.p.rapidapi.com/user/posts"
-    headers = {
-        "X-RapidAPI-Key": TIKTOK_API_KEY,
-        "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
-    }
-    params = {
-        "username": username,  # singular — check your specific RapidAPI endpoint docs
-        "count": 1
-    }
+    sec_uid = await get_tiktok_sec_uid(session, username)
+    if not sec_uid:
+        return ""
 
+    url    = f"https://{TIKTOK_API_HOST}/api/user/posts"
+    params = {"secUid": sec_uid, "count": "35", "cursor": "0"}
     try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(
+            url, headers=tiktok_headers(), params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
             if r.status != 200:
                 return ""
 
             try:
                 data = await r.json(content_type=None)
-            except Exception as e:
-                print(f"❌ TikTok JSON parse error in description fetch: {e}")
+            except Exception:
                 return ""
 
-            # Fallback chain to handle varying response structures across RapidAPI endpoints
-            videos = (
-                data.get("videos")
-                or data.get("data", {}).get("videos")
-                or data.get("result", {}).get("list")
+            items = (
+                data.get("itemList")
+                or data.get("data", {}).get("itemList")
                 or []
             )
-
-            if videos:
-                return videos[0].get("description", "")
+            for item in items:
+                if str(item.get("id")) == str(video_id):
+                    return item.get("desc", "")
+            # If not found by ID, return description of first video
+            if items:
+                return items[0].get("desc", "")
     except asyncio.TimeoutError:
-        print(f"⏱️ TikTok API timeout for user {username}")
+        print(f"⏱️ TikTok description fetch timeout")
     except Exception as e:
-        print(f"❌ TikTok API error: {e}")
+        print(f"❌ TikTok description fetch error: {e}")
     return ""
 
 
@@ -681,12 +736,10 @@ async def check_forum() -> None:
     print(f"🔍 Checking forum... ({len(forum_channel.threads)} active threads)")
     try:
         async with aiohttp.ClientSession() as session:
-            # Check active threads
             for thread in forum_channel.threads:
                 await process_thread(thread, session)
                 await asyncio.sleep(0.5)
 
-            # Check archived threads
             try:
                 async for thread in forum_channel.archived_threads(limit=100):
                     await process_thread(thread, session)
@@ -781,56 +834,60 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession) -> Tuple[Opti
 
 
 async def get_latest_tiktok_video(session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str]]:
-    """Get latest TikTok video ID and URL using RapidAPI."""
+    """Get latest TikTok video ID and URL using tiktok-api23.p.rapidapi.com.
+    
+    Flow:
+      1. Get User Info  → secUid
+      2. Get User Posts → itemList[0]
+    """
     if not TIKTOK_API_KEY:
         print("⚠️  TIKTOK_API_KEY not set. TikTok checking disabled.")
         return None, None
 
-    url = "https://tiktok-api.p.rapidapi.com/user/posts"
-    headers = {
-        "X-RapidAPI-Key": TIKTOK_API_KEY,
-        "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
-    }
-    params = {
-        "username": TIKTOK_USERNAME,  # singular — check your specific RapidAPI endpoint docs
-        "count": 1
-    }
+    # Step 1: resolve secUid
+    sec_uid = await get_tiktok_sec_uid(session, TIKTOK_USERNAME)
+    if not sec_uid:
+        print(f"❌ Could not resolve secUid for TikTok user {TIKTOK_USERNAME}")
+        return None, None
 
+    # Step 2: fetch posts
+    url    = f"https://{TIKTOK_API_HOST}/api/user/posts"
+    params = {"secUid": sec_uid, "count": "1", "cursor": "0"}
     try:
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            print(f"🔍 TikTok API Response Status: {r.status}")
+        async with session.get(
+            url, headers=tiktok_headers(), params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            print(f"🔍 TikTok Posts status: {r.status}")
 
             if r.status != 200:
-                print(f"❌ TikTok API error: {r.status} — {(await r.text())[:200]}")
+                print(f"❌ TikTok Posts error: {r.status} — {(await r.text())[:200]}")
                 return None, None
 
             try:
-                data = await r.json(content_type=None)  # handles wrong MIME types from some proxies
+                data = await r.json(content_type=None)
             except Exception as e:
-                print(f"❌ Failed to parse TikTok JSON: {e}")
+                print(f"❌ Failed to parse TikTok Posts JSON: {e}")
                 return None, None
 
-            print(f"📊 TikTok API Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-
-            # Fallback chain to handle varying response structures across RapidAPI endpoints
-            videos = (
-                data.get("videos")
-                or data.get("data", {}).get("videos")
-                or data.get("result", {}).get("list")
+            items = (
+                data.get("itemList")
+                or data.get("data", {}).get("itemList")
                 or []
             )
 
-            if videos:
-                vid_id = videos[0].get("id")
+            if items:
+                vid_id = items[0].get("id")
                 if vid_id:
                     return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
 
-            print(f"❌ No TikTok videos found. Full response: {data}")
+            print(f"❌ No TikTok videos found. Response keys: {list(data.keys())}")
+            print(f"Full response: {data}")
 
     except asyncio.TimeoutError:
-        print("⏱️ TikTok API timeout")
+        print("⏱️ TikTok Posts timeout")
     except Exception as e:
-        print(f"❌ Error fetching latest TikTok video: {e}")
+        print(f"❌ Error fetching TikTok posts: {e}")
         import traceback
         traceback.print_exc()
 
@@ -911,7 +968,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
             if TIKTOK_API_KEY:
                 lines.append("**TikTok** ❌ Could not fetch latest video. Check API key and username.")
             else:
-                lines.append("**TikTok** ⚠️ TIKTOK_API_KEY environment variable not set. TikTok checking disabled.")
+                lines.append("**TikTok** ⚠️ TIKTOK_API_KEY not set. TikTok checking disabled.")
 
         await interaction.followup.send("\n\n".join(lines))
     except Exception as e:
@@ -925,6 +982,8 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
 async def on_ready() -> None:
     """Bot startup handler."""
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"🔑 YOUTUBE_API_KEY set: {bool(YOUTUBE_API_KEY)}")
+    print(f"🔑 TIKTOK_API_KEY set:  {bool(TIKTOK_API_KEY)}")
 
     try:
         synced = await bot.tree.sync()
