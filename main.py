@@ -981,31 +981,36 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
 @bot.event
 async def on_ready() -> None:
     """Bot startup handler."""
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"🔑 YOUTUBE_API_KEY set: {bool(YOUTUBE_API_KEY)}")
-    print(f"🔑 TIKTOK_API_KEY set:  {bool(TIKTOK_API_KEY)}")
-
     try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} slash command(s)")
+        print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+        print(f"🔑 YOUTUBE_API_KEY set: {bool(YOUTUBE_API_KEY)}")
+        print(f"🔑 TIKTOK_API_KEY set:  {bool(TIKTOK_API_KEY)}")
+
+        try:
+            synced = await bot.tree.sync()
+            print(f"✅ Synced {len(synced)} slash command(s)")
+        except Exception as e:
+            print(f"❌ Failed to sync commands: {e}")
+
+        # Re-register persistent views
+        bot.add_view(SubmitViewsButton())
+        bot.add_view(ModReviewView(user_id=0))
+
+        await load_cc_database()
+
+        for guild in bot.guilds:
+            await update_member_count(guild)
+
+        if not check_socials.is_running():
+            check_socials.start()
+        if not check_forum.is_running():
+            check_forum.start()
+
+        print("✅ Bot is ready!")
     except Exception as e:
-        print(f"❌ Failed to sync commands: {e}")
-
-    # Re-register persistent views
-    bot.add_view(SubmitViewsButton())
-    bot.add_view(ModReviewView(user_id=0))
-
-    await load_cc_database()
-
-    for guild in bot.guilds:
-        await update_member_count(guild)
-
-    if not check_socials.is_running():
-        check_socials.start()
-    if not check_forum.is_running():
-        check_forum.start()
-
-    print("✅ Bot is ready!")
+        import traceback
+        print(f"❌ CRASH IN on_ready: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
