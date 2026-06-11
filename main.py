@@ -491,11 +491,10 @@ async def update_member_count(guild: discord.Guild) -> None:
 async def on_member_join(member: discord.Member) -> None:
     """Send welcome message to new member."""
     await update_member_count(member.guild)
-    
+
     try:
-        # Get guild icon as thumbnail
         guild_icon_url = member.guild.icon.url if member.guild.icon else ""
-        
+
         embed = discord.Embed(
             title="Welcome to DreamyVR!",
             description=f"Hey {member.mention}!",
@@ -513,12 +512,12 @@ async def on_member_join(member: discord.Member) -> None:
             ),
             inline=False
         )
-        
+
         if guild_icon_url:
             embed.set_thumbnail(url=guild_icon_url)
-        
+
         embed.set_footer(text=f"DreamyVR Community • {datetime.now(timezone.utc).strftime('%A at %H:%M')}")
-        
+
         await member.send(embed=embed)
     except Exception as e:
         print(f"❌ Error sending welcome message: {e}")
@@ -553,27 +552,38 @@ async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, 
     """Fetch TikTok video metadata using RapidAPI."""
     if not TIKTOK_API_KEY:
         return ""
-    
+
     url = "https://tiktok-api.p.rapidapi.com/user/posts"
     headers = {
         "X-RapidAPI-Key": TIKTOK_API_KEY,
         "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
     }
     params = {
-        "usernames": username,
+        "username": username,  # singular — check your specific RapidAPI endpoint docs
         "count": 1
     }
-    
+
     try:
         async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
                 return ""
-            
-            data = await r.json()
-            if data.get("videos") and len(data["videos"]) > 0:
-                video = data["videos"][0]
-                description = video.get("description", "")
-                return description
+
+            try:
+                data = await r.json(content_type=None)
+            except Exception as e:
+                print(f"❌ TikTok JSON parse error in description fetch: {e}")
+                return ""
+
+            # Fallback chain to handle varying response structures across RapidAPI endpoints
+            videos = (
+                data.get("videos")
+                or data.get("data", {}).get("videos")
+                or data.get("result", {}).get("list")
+                or []
+            )
+
+            if videos:
+                return videos[0].get("description", "")
     except asyncio.TimeoutError:
         print(f"⏱️ TikTok API timeout for user {username}")
     except Exception as e:
@@ -625,26 +635,26 @@ async def process_thread(thread: discord.Thread, session: aiohttp.ClientSession)
     try:
         if not has_required_tag(thread):
             return
-        
+
         messages = [msg async for msg in thread.history(limit=1, oldest_first=True)]
         if not messages:
             return
-        
+
         first_message = messages[0]
         content       = first_message.content
-        
+
         if not has_video_link(content):
             return
-        
+
         if not await video_has_dreamyvr_tag(session, content):
             return
-        
+
         if not already_reacted(first_message):
             try:
                 await first_message.add_reaction("👍")
             except Exception as e:
                 print(f"❌ Error adding reaction: {e}")
-        
+
         if thread.id not in processed_forum_posts:
             submissions_channel = bot.get_channel(SUBMISSIONS_CHANNEL_ID)
             if submissions_channel:
@@ -667,7 +677,7 @@ async def check_forum() -> None:
     if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
         print("❌ Forum channel not found or not a ForumChannel!")
         return
-    
+
     print(f"🔍 Checking forum... ({len(forum_channel.threads)} active threads)")
     try:
         async with aiohttp.ClientSession() as session:
@@ -675,7 +685,7 @@ async def check_forum() -> None:
             for thread in forum_channel.threads:
                 await process_thread(thread, session)
                 await asyncio.sleep(0.5)
-            
+
             # Check archived threads
             try:
                 async for thread in forum_channel.archived_threads(limit=100):
@@ -695,7 +705,7 @@ async def on_thread_create(thread: discord.Thread) -> None:
     """Process newly created forum threads."""
     if thread.parent_id != FORUM_CHANNEL_ID:
         return
-    
+
     print(f"🆕 New forum thread: {thread.name}")
     try:
         async with aiohttp.ClientSession() as session:
@@ -711,7 +721,7 @@ async def get_youtube_channel_id(session: aiohttp.ClientSession) -> Optional[str
     global youtube_channel_id_cache
     if youtube_channel_id_cache:
         return youtube_channel_id_cache
-    
+
     url    = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "id", "forHandle": YOUTUBE_CHANNEL_HANDLE, "key": YOUTUBE_API_KEY}
     try:
@@ -720,7 +730,7 @@ async def get_youtube_channel_id(session: aiohttp.ClientSession) -> Optional[str
                 print(f"❌ YouTube API error: {r.status}")
                 print(f"Response: {await r.text()}")
                 return None
-            
+
             data  = await r.json()
             items = data.get("items", [])
             if items:
@@ -740,7 +750,7 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession) -> Tuple[Opti
     channel_id = await get_youtube_channel_id(session)
     if not channel_id:
         return None, None
-    
+
     url    = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "part": "snippet",
@@ -755,7 +765,7 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession) -> Tuple[Opti
             if r.status != 200:
                 print(f"❌ YouTube search error: {r.status}")
                 return None, None
-            
+
             data  = await r.json()
             items = data.get("items", [])
             if items:
@@ -775,35 +785,55 @@ async def get_latest_tiktok_video(session: aiohttp.ClientSession) -> Tuple[Optio
     if not TIKTOK_API_KEY:
         print("⚠️  TIKTOK_API_KEY not set. TikTok checking disabled.")
         return None, None
-    
+
     url = "https://tiktok-api.p.rapidapi.com/user/posts"
     headers = {
         "X-RapidAPI-Key": TIKTOK_API_KEY,
         "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
     }
     params = {
-        "usernames": TIKTOK_USERNAME,
+        "username": TIKTOK_USERNAME,  # singular — check your specific RapidAPI endpoint docs
         "count": 1
     }
-    
+
     try:
         async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            print(f"🔍 TikTok API Response Status: {r.status}")
+
             if r.status != 200:
-                print(f"❌ TikTok API error: {r.status}")
+                print(f"❌ TikTok API error: {r.status} — {(await r.text())[:200]}")
                 return None, None
-            
-            data = await r.json()
-            if data.get("videos") and len(data["videos"]) > 0:
-                video = data["videos"][0]
-                vid_id = video.get("id")
+
+            try:
+                data = await r.json(content_type=None)  # handles wrong MIME types from some proxies
+            except Exception as e:
+                print(f"❌ Failed to parse TikTok JSON: {e}")
+                return None, None
+
+            print(f"📊 TikTok API Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+            # Fallback chain to handle varying response structures across RapidAPI endpoints
+            videos = (
+                data.get("videos")
+                or data.get("data", {}).get("videos")
+                or data.get("result", {}).get("list")
+                or []
+            )
+
+            if videos:
+                vid_id = videos[0].get("id")
                 if vid_id:
                     return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
-            else:
-                print(f"❌ No TikTok videos found for user {TIKTOK_USERNAME}")
+
+            print(f"❌ No TikTok videos found. Full response: {data}")
+
     except asyncio.TimeoutError:
-        print(f"⏱️ TikTok API timeout")
+        print("⏱️ TikTok API timeout")
     except Exception as e:
         print(f"❌ Error fetching latest TikTok video: {e}")
+        import traceback
+        traceback.print_exc()
+
     return None, None
 
 
@@ -825,7 +855,7 @@ async def send_notification(video_url: str) -> None:
 async def check_socials() -> None:
     """Periodically check social media for new videos."""
     global last_youtube_video_id, last_tiktok_video_id
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             yt_id, yt_url = await get_latest_youtube_video(session)
@@ -834,7 +864,7 @@ async def check_socials() -> None:
                     print(f"🎬 New YouTube video: {yt_url}")
                     await send_notification(yt_url)
                 last_youtube_video_id = yt_id
-            
+
             tt_id, tt_url = await get_latest_tiktok_video(session)
             if tt_id and tt_id != last_tiktok_video_id:
                 if last_tiktok_video_id is not None:
@@ -858,7 +888,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
         async with aiohttp.ClientSession() as session:
             yt_id, yt_url = await get_latest_youtube_video(session)
             tt_id, tt_url = await get_latest_tiktok_video(session)
-        
+
         lines = []
         if yt_url:
             lines.append(
@@ -869,7 +899,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
             )
         else:
             lines.append("**YouTube** ❌ Could not fetch latest video. Check API key and handle.")
-        
+
         if tt_url:
             lines.append(
                 f"**TikTok** ✅\n"
@@ -882,7 +912,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
                 lines.append("**TikTok** ❌ Could not fetch latest video. Check API key and username.")
             else:
                 lines.append("**TikTok** ⚠️ TIKTOK_API_KEY environment variable not set. TikTok checking disabled.")
-        
+
         await interaction.followup.send("\n\n".join(lines))
     except Exception as e:
         print(f"❌ Error in testsocialmedia: {e}")
@@ -895,7 +925,7 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
 async def on_ready() -> None:
     """Bot startup handler."""
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    
+
     try:
         synced = await bot.tree.sync()
         print(f"✅ Synced {len(synced)} slash command(s)")
@@ -905,7 +935,7 @@ async def on_ready() -> None:
     # Re-register persistent views
     bot.add_view(SubmitViewsButton())
     bot.add_view(ModReviewView(user_id=0))
-    
+
     await load_cc_database()
 
     for guild in bot.guilds:
@@ -915,7 +945,7 @@ async def on_ready() -> None:
         check_socials.start()
     if not check_forum.is_running():
         check_forum.start()
-    
+
     print("✅ Bot is ready!")
 
 
