@@ -26,6 +26,7 @@ CHECK_INTERVAL          = 60  # 1 minute
 
 DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+TIKTOK_API_KEY  = os.environ.get("TIKTOK_API_KEY")  # RapidAPI key for TikTok
 
 if not DISCORD_TOKEN or not YOUTUBE_API_KEY:
     raise ValueError("Missing required environment variables: DISCORD_TOKEN and/or YOUTUBE_API_KEY")
@@ -549,26 +550,34 @@ async def get_youtube_description(session: aiohttp.ClientSession, video_id: str)
 
 
 async def get_tiktok_description(session: aiohttp.ClientSession, video_id: str, username: str) -> str:
-    """Fetch TikTok video metadata."""
-    url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    """Fetch TikTok video metadata using RapidAPI."""
+    if not TIKTOK_API_KEY:
+        return ""
+    
+    url = "https://tiktok-api.p.rapidapi.com/user/posts"
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
+        "X-RapidAPI-Key": TIKTOK_API_KEY,
+        "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
     }
+    params = {
+        "usernames": username,
+        "count": 1
+    }
+    
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            html  = await r.text()
-            match = re.search(r'<meta name="description" content="([^"]*)"', html)
-            if match:
-                return match.group(1)
-            return html
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return ""
+            
+            data = await r.json()
+            if data.get("videos") and len(data["videos"]) > 0:
+                video = data["videos"][0]
+                description = video.get("description", "")
+                return description
     except asyncio.TimeoutError:
-        print(f"⏱️ TikTok fetch timeout for {username}/video/{video_id}")
+        print(f"⏱️ TikTok API timeout for user {username}")
     except Exception as e:
-        print(f"❌ TikTok description fetch error: {e}")
+        print(f"❌ TikTok API error: {e}")
     return ""
 
 
@@ -762,10 +771,39 @@ async def get_latest_youtube_video(session: aiohttp.ClientSession) -> Tuple[Opti
 
 
 async def get_latest_tiktok_video(session: aiohttp.ClientSession) -> Tuple[Optional[str], Optional[str]]:
-    """Get latest TikTok video ID and URL (simplified approach)."""
-    # TikTok actively blocks scrapers. This returns None with a helpful message.
-    # For production, you'd need to use TikTok's official API or a third-party service.
-    print("⚠️  TikTok scraping not available - consider using TikTok API or removing TikTok checks")
+    """Get latest TikTok video ID and URL using RapidAPI."""
+    if not TIKTOK_API_KEY:
+        print("⚠️  TIKTOK_API_KEY not set. TikTok checking disabled.")
+        return None, None
+    
+    url = "https://tiktok-api.p.rapidapi.com/user/posts"
+    headers = {
+        "X-RapidAPI-Key": TIKTOK_API_KEY,
+        "X-RapidAPI-Host": "tiktok-api.p.rapidapi.com"
+    }
+    params = {
+        "usernames": TIKTOK_USERNAME,
+        "count": 1
+    }
+    
+    try:
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                print(f"❌ TikTok API error: {r.status}")
+                return None, None
+            
+            data = await r.json()
+            if data.get("videos") and len(data["videos"]) > 0:
+                video = data["videos"][0]
+                vid_id = video.get("id")
+                if vid_id:
+                    return vid_id, f"https://www.tiktok.com/@{TIKTOK_USERNAME}/video/{vid_id}"
+            else:
+                print(f"❌ No TikTok videos found for user {TIKTOK_USERNAME}")
+    except asyncio.TimeoutError:
+        print(f"⏱️ TikTok API timeout")
+    except Exception as e:
+        print(f"❌ Error fetching latest TikTok video: {e}")
     return None, None
 
 
@@ -840,7 +878,10 @@ async def testsocialmedia(interaction: discord.Interaction) -> None:
                 f"{tt_url}"
             )
         else:
-            lines.append("**TikTok** ❌ TikTok scraping disabled. Consider using TikTok API.")
+            if TIKTOK_API_KEY:
+                lines.append("**TikTok** ❌ Could not fetch latest video. Check API key and username.")
+            else:
+                lines.append("**TikTok** ⚠️ TIKTOK_API_KEY environment variable not set. TikTok checking disabled.")
         
         await interaction.followup.send("\n\n".join(lines))
     except Exception as e:
