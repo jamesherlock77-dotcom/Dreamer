@@ -12,7 +12,7 @@ from typing import Literal
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
 YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg04"
-RAPIDAPI_KEY       = "ae92fc6f3bmsh5bacceeaaecb548p164d3ejsn0ef636bc8645"
+RAPIDAPI_KEY       = "198832eaf9msh232c07889d9c419p17ba5cjsne14e458f9a88"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -206,6 +206,7 @@ async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: d
         headers={
             "x-rapidapi-host": "scraptik.p.rapidapi.com",
             "x-rapidapi-key":  RAPIDAPI_KEY,
+            "Content-Type":    "application/json",
         },
         params=params,
     ) as r:
