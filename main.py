@@ -3,6 +3,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import os
 import re
+import json
 import aiohttp
 from datetime import datetime, time
 import pytz
@@ -63,10 +64,6 @@ async def tally_counts() -> dict:
 
 # ── Helper: find approved link for a user ────────────────────────────────────
 async def get_approved_link(user_id: int):
-    """
-    Scan LINK_LOG_CHANNEL for an approved embed belonging to this user.
-    Returns (platform, url) or (None, None).
-    """
     log_channel = bot.get_channel(LINK_LOG_CHANNEL)
     uid_str = str(user_id)
     async for msg in log_channel.history(limit=None, oldest_first=False):
@@ -84,6 +81,32 @@ async def get_approved_link(user_id: int):
             if platform and url:
                 return platform, url
     return None, None
+
+# ── Helper: get all approved links ───────────────────────────────────────────
+async def get_all_approved_links() -> list[dict]:
+    log_channel = bot.get_channel(LINK_LOG_CHANNEL)
+    seen_users  = {}
+    async for msg in log_channel.history(limit=None, oldest_first=True):
+        if not msg.embeds:
+            continue
+        embed = msg.embeds[0]
+        if not (embed.footer and embed.footer.text):
+            continue
+        footer    = embed.footer.text
+        uid_match = re.search(r"User ID:\s*(\d+)", footer)
+        if not uid_match:
+            continue
+        uid      = uid_match.group(1)
+        platform = None
+        url      = None
+        for field in embed.fields:
+            if field.name == "Platform":
+                platform = field.value
+            if field.name == "URL":
+                url = field.value
+        if platform and url:
+            seen_users[uid] = {"user_id": uid, "platform": platform, "url": url}
+    return list(seen_users.values())
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 def extract_youtube_channel_id_from_url(url: str):
@@ -157,15 +180,15 @@ async def fetch_youtube_stats(url: str):
         if not items:
             raise ValueError("Could not fetch YouTube channel stats.")
 
-        ch       = items[0]
-        stats    = ch.get("statistics", {})
-        snippet  = ch.get("snippet", {})
+        ch      = items[0]
+        stats   = ch.get("statistics", {})
+        snippet = ch.get("snippet", {})
         return {
-            "channel_name":  snippet.get("title", "Unknown"),
-            "subscribers":   int(stats.get("subscriberCount", 0)),
-            "total_views":   int(stats.get("viewCount", 0)),
-            "video_count":   int(stats.get("videoCount", 0)),
-            "channel_url":   f"https://www.youtube.com/channel/{channel_id}",
+            "channel_name": snippet.get("title", "Unknown"),
+            "subscribers":  int(stats.get("subscriberCount", 0)),
+            "total_views":  int(stats.get("viewCount", 0)),
+            "video_count":  int(stats.get("videoCount", 0)),
+            "channel_url":  f"https://www.youtube.com/channel/{channel_id}",
         }
 
 # ── TikTok helpers ────────────────────────────────────────────────────────────
@@ -173,32 +196,52 @@ def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
+async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
+    """
+    GET a scraptik endpoint, reading the response as raw text then parsing JSON.
+    Dropping Content-Type from request headers avoids the API returning text/plain.
+    """
+    async with session.get(
+        f"https://scraptik.p.rapidapi.com/{endpoint}",
+        headers={
+            "x-rapidapi-host": "scraptik.p.rapidapi.com",
+            "x-rapidapi-key":  RAPIDAPI_KEY,
+        },
+        params=params,
+    ) as r:
+        raw = await r.text()
+        print(f"[ScrapTik {endpoint}] status={r.status} raw={raw[:300]}")
+        if r.status != 200:
+            raise ValueError(f"ScrapTik API returned status {r.status}: {raw[:200]}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"ScrapTik returned non-JSON ({r.status}): {raw[:200]}") from e
+
 async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
-    total_views  = 0
-    video_count  = 0
-    cursor       = 0
-    has_more     = True
+    total_views = 0
+    video_count = 0
+    cursor      = 0
+    has_more    = True
 
     async with aiohttp.ClientSession() as session:
         while has_more:
-            params = {"username": username, "count": "30", "cursor": str(cursor)}
-            async with session.get(
-                "https://scraptik.p.rapidapi.com/user-posts",
-                headers={
-                    "x-rapidapi-host": "scraptik.p.rapidapi.com",
-                    "x-rapidapi-key":  RAPIDAPI_KEY,
-                    "Content-Type":    "application/json",
-                },
-                params=params,
-            ) as r:
-                data = await r.json()
-                print(f"[ScrapTik Posts Debug] status={r.status} raw={str(data)[:1000]}")
-                if r.status != 200:
-                    break
+            try:
+                data = await _scraptik_get(session, "user-posts", {
+                    "username": username,
+                    "count":    "30",
+                    "cursor":   str(cursor),
+                })
+            except ValueError as e:
+                print(f"[ScrapTik user-posts error] {e}")
+                break
 
             videos   = data.get("data", {}).get("videos", data.get("itemList", []))
             has_more = data.get("data", {}).get("hasMore", data.get("hasMore", False))
             cursor   = data.get("data", {}).get("cursor", data.get("cursor", 0))
+
+            if not videos:
+                break
 
             for video in videos:
                 desc       = video.get("desc", "").lower()
@@ -214,9 +257,6 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     total_views += int(play_count)
                     video_count += 1
 
-            if not videos:
-                break
-
     return total_views, video_count
 
 async def fetch_tiktok_stats(url: str):
@@ -225,150 +265,35 @@ async def fetch_tiktok_stats(url: str):
         raise ValueError("Couldn't parse that TikTok URL.")
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://scraptik.p.rapidapi.com/get-user",
-            headers={
-                "x-rapidapi-host": "scraptik.p.rapidapi.com",
-                "x-rapidapi-key":  RAPIDAPI_KEY,
-                "Content-Type":    "application/json",
-            },
-            params={"username": username},
-        ) as r:
-            if r.status != 200:
-                raise ValueError(f"TikTok API returned status {r.status}.")
-            data = await r.json()
+        data = await _scraptik_get(session, "get-user", {"username": username})
 
     print(f"[TikTok User Debug] top-level keys: {list(data.keys())}")
 
     try:
         if "userInfo" in data:
-            # Original nested structure
             user  = data["userInfo"]["user"]
             stats = data["userInfo"]["stats"]
         elif "user" in data and "stats" in data:
-            # Flat structure (scraptik)
             user  = data["user"]
             stats = data["stats"]
         elif "user" in data:
-            # Flat user only, stats may be inside user
             user  = data["user"]
             stats = data["user"].get("stats", {})
         else:
             raise KeyError("no recognisable user key")
     except KeyError as exc:
-        raise ValueError(f"Unexpected response from TikTok API. Raw: {str(data)[:500]}") from exc
-
-    print(f"[TikTok User Debug] user keys: {list(user.keys())}, stats keys: {list(stats.keys())}")
+        raise ValueError(f"Unexpected TikTok API response. Raw: {str(data)[:500]}") from exc
 
     dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
 
     return {
-        "channel_name":    user.get("nickname", username),
-        "username":        username,
-        "channel_url":     f"https://www.tiktok.com/@{username}",
-        "followers":       int(stats.get("followerCount", 0)),
-        "dreamyvr_views":  dreamyvr_views,
-        "dreamyvr_count":  dreamyvr_count,
+        "channel_name":   user.get("nickname", username),
+        "username":       username,
+        "channel_url":    f"https://www.tiktok.com/@{username}",
+        "followers":      int(stats.get("followerCount", 0)),
+        "dreamyvr_views": dreamyvr_views,
+        "dreamyvr_count": dreamyvr_count,
     }
-
-# ── Helper: get all approved links ───────────────────────────────────────────
-async def get_all_approved_links() -> list[dict]:
-    """
-    Scan LINK_LOG_CHANNEL for all approved embeds.
-    Returns a list of {user_id, platform, url} dicts (one per user, most recent wins).
-    """
-    log_channel = bot.get_channel(LINK_LOG_CHANNEL)
-    seen_users  = {}  # user_id -> {platform, url}
-    async for msg in log_channel.history(limit=None, oldest_first=True):
-        if not msg.embeds:
-            continue
-        embed = msg.embeds[0]
-        if not (embed.footer and embed.footer.text):
-            continue
-        # Footer format: "Approved by X • User ID: 123456"
-        footer = embed.footer.text
-        uid_match = re.search(r"User ID:\s*(\d+)", footer)
-        if not uid_match:
-            continue
-        uid      = uid_match.group(1)
-        platform = None
-        url      = None
-        for field in embed.fields:
-            if field.name == "Platform":
-                platform = field.value
-            if field.name == "URL":
-                url = field.value
-        if platform and url:
-            seen_users[uid] = {"user_id": uid, "platform": platform, "url": url}
-    return list(seen_users.values())
-
-# ── /contentfullstats ─────────────────────────────────────────────────────────
-@tree.command(name="contentfullstats", description="Show stats for every linked creator")
-async def contentfullstats(interaction: discord.Interaction):
-    await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
-
-    all_links = await get_all_approved_links()
-    if not all_links:
-        await interaction.edit_original_response(content="No approved creator links found.")
-        return
-
-    lines  = []
-    number = 1
-
-    for entry in all_links:
-        uid      = entry["user_id"]
-        platform = entry["platform"]
-        url      = entry["url"]
-        member   = interaction.guild.get_member(int(uid))
-        mention  = member.mention if member else f"<@{uid}>"
-
-        try:
-            if platform == "TikTok":
-                stats    = await fetch_tiktok_stats(url)
-                username = stats["username"]
-                lines.append(
-                    f"**{number}.** {mention}\n"
-                    f"> URL: {url}\n"
-                    f"> Followers: {stats['followers']:,}\n"
-                    f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
-                    f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
-                )
-            elif platform == "YouTube":
-                stats = await fetch_youtube_stats(url)
-                lines.append(
-                    f"**{number}.** {mention}\n"
-                    f"> URL: {url}\n"
-                    f"> Subscribers: {stats['subscribers']:,}\n"
-                    f"> Total views: {stats['total_views']:,}\n"
-                    f"> Videos: {stats['video_count']:,}"
-                )
-            else:
-                lines.append(f"**{number}.** {mention}\n> URL: {url}\n> Platform: {platform} (unsupported)")
-        except Exception as e:
-            lines.append(f"**{number}.** {mention}\n> URL: {url}\n> ⚠️ Error: {e}")
-
-        number += 1
-
-    # Discord messages cap at 2000 chars — chunk if needed
-    chunks  = []
-    current = ""
-    for line in lines:
-        block = line + "\n\n"
-        if len(current) + len(block) > 1900:
-            chunks.append(current.strip())
-            current = block
-        else:
-            current += block
-    if current.strip():
-        chunks.append(current.strip())
-
-    if not chunks:
-        await interaction.edit_original_response(content="No data to display.")
-        return
-
-    await interaction.edit_original_response(content=chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
 
 # ── /messageleaderboard ───────────────────────────────────────────────────────
 @tree.command(name="messageleaderboard", description="Show the weekly message leaderboard")
@@ -487,11 +412,7 @@ async def ccstats(interaction: discord.Interaction):
     try:
         if platform == "YouTube":
             stats = await fetch_youtube_stats(url)
-            embed = discord.Embed(
-                title=stats["channel_name"],
-                url=stats["channel_url"],
-                color=0xFF0000,
-            )
+            embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",    value="YouTube",                     inline=True)
             embed.add_field(name="Subscribers", value=f"`{stats['subscribers']:,}`", inline=True)
             embed.add_field(name="Total Views", value=f"`{stats['total_views']:,}`", inline=True)
@@ -501,11 +422,7 @@ async def ccstats(interaction: discord.Interaction):
 
         elif platform == "TikTok":
             stats = await fetch_tiktok_stats(url)
-            embed = discord.Embed(
-                title=stats["channel_name"],
-                url=stats["channel_url"],
-                color=0x010101,
-            )
+            embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
             embed.add_field(name="Platform",         value="TikTok",                         inline=True)
             embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
@@ -517,6 +434,73 @@ async def ccstats(interaction: discord.Interaction):
         await interaction.edit_original_response(content=f"Error fetching stats: {e}")
     except Exception as e:
         await interaction.edit_original_response(content=f"Something went wrong: {e}")
+
+# ── /contentfullstats ─────────────────────────────────────────────────────────
+@tree.command(name="contentfullstats", description="Show stats for every linked creator")
+async def contentfullstats(interaction: discord.Interaction):
+    await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
+
+    all_links = await get_all_approved_links()
+    if not all_links:
+        await interaction.edit_original_response(content="No approved creator links found.")
+        return
+
+    lines  = []
+    number = 1
+
+    for entry in all_links:
+        uid      = entry["user_id"]
+        platform = entry["platform"]
+        url      = entry["url"]
+        member   = interaction.guild.get_member(int(uid))
+        mention  = member.mention if member else f"<@{uid}>"
+
+        try:
+            if platform == "TikTok":
+                stats = await fetch_tiktok_stats(url)
+                lines.append(
+                    f"**{number}.** {mention}\n"
+                    f"> URL: {url}\n"
+                    f"> Followers: {stats['followers']:,}\n"
+                    f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
+                    f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
+                )
+            elif platform == "YouTube":
+                stats = await fetch_youtube_stats(url)
+                lines.append(
+                    f"**{number}.** {mention}\n"
+                    f"> URL: {url}\n"
+                    f"> Subscribers: {stats['subscribers']:,}\n"
+                    f"> Total views: {stats['total_views']:,}\n"
+                    f"> Videos: {stats['video_count']:,}"
+                )
+            else:
+                lines.append(f"**{number}.** {mention}\n> URL: {url}\n> Platform: {platform} (unsupported)")
+        except Exception as e:
+            lines.append(f"**{number}.** {mention}\n> URL: {url}\n> ⚠️ Error: {e}")
+
+        number += 1
+
+    # Chunk into <=1900 char messages
+    chunks  = []
+    current = ""
+    for line in lines:
+        block = line + "\n\n"
+        if len(current) + len(block) > 1900:
+            chunks.append(current.strip())
+            current = block
+        else:
+            current += block
+    if current.strip():
+        chunks.append(current.strip())
+
+    if not chunks:
+        await interaction.edit_original_response(content="No data to display.")
+        return
+
+    await interaction.edit_original_response(content=chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
