@@ -223,7 +223,7 @@ async def fetch_tiktok_user_id(session: aiohttp.ClientSession, username: str) ->
     """Resolve a TikTok username to a user ID via ScrapTik."""
     data = await _scraptik_get(session, "username-to-id", {"username": username, "compact": "0"})
     # Response is typically {"user_id": "..."} or {"id": "..."}
-    uid = data.get("user_id") or data.get("id") or data.get("userId")
+    uid = data.get("uid") or data.get("user_id") or data.get("id") or data.get("userId")
     if not uid:
         raise ValueError(f"Could not resolve user ID for @{username}. Raw: {str(data)[:300]}")
     return str(uid)
