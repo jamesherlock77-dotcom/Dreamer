@@ -268,30 +268,38 @@ async def fetch_tiktok_stats(url: str):
     async with aiohttp.ClientSession() as session:
         data = await _scraptik_get(session, "get-user", {"username": username})
 
-    print(f"[TikTok User Debug] top-level keys: {list(data.keys())}")
+    print(f"[TikTok User Debug] full response: {str(data)[:1000]}")
 
     try:
         if "userInfo" in data:
+            # Standard TikTok nested structure
             user  = data["userInfo"]["user"]
             stats = data["userInfo"]["stats"]
-        elif "user" in data and "stats" in data:
-            user  = data["user"]
-            stats = data["stats"]
+            followers = int(stats.get("followerCount", 0))
         elif "user" in data:
-            user  = data["user"]
-            stats = data["user"].get("stats", {})
+            user = data["user"]
+            # ScrapTik may return stats separately or inline inside user
+            if "stats" in data:
+                followers = int(data["stats"].get("followerCount", 0))
+            elif "followerCount" in user:
+                followers = int(user.get("followerCount", 0))
+            elif "stats" in user:
+                followers = int(user["stats"].get("followerCount", 0))
+            else:
+                followers = 0
         else:
             raise KeyError("no recognisable user key")
     except KeyError as exc:
         raise ValueError(f"Unexpected TikTok API response. Raw: {str(data)[:500]}") from exc
 
+    nickname = user.get("nickname", user.get("uniqueId", username))
     dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
 
     return {
-        "channel_name":   user.get("nickname", username),
+        "channel_name":   nickname,
         "username":       username,
         "channel_url":    f"https://www.tiktok.com/@{username}",
-        "followers":      int(stats.get("followerCount", 0)),
+        "followers":      followers,
         "dreamyvr_views": dreamyvr_views,
         "dreamyvr_count": dreamyvr_count,
     }
