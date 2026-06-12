@@ -504,6 +504,14 @@ async def ccstats(interaction: discord.Interaction):
     except Exception as e:
         await interaction.edit_original_response(content=f"Something went wrong: {e}")
 
+# ── /message ─────────────────────────────────────────────────────────────────
+@tree.command(name="message", description="Send a message as the bot")
+@app_commands.describe(content="The message to send")
+@app_commands.checks.has_permissions(administrator=True)
+async def message(interaction: discord.Interaction, content: str):
+    await interaction.channel.send(content)
+    await interaction.response.send_message("Message sent!", ephemeral=True)
+
 # ── /contentfullstats ─────────────────────────────────────────────────────────
 @tree.command(name="contentfullstats", description="Show stats for every linked creator")
 async def contentfullstats(interaction: discord.Interaction):
