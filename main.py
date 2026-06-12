@@ -56,8 +56,8 @@ async def messageleaderboard(interaction: discord.Interaction):
     lines = []
     for i, (uid, count) in enumerate(sorted_users):
         member = interaction.guild.get_member(int(uid))
-        name = member.display_name if member else f"<@{uid}>"
-        lines.append(f"`{i + 1}` {name} — **{count}** msgs")
+        name = member.mention if member else f"<@{uid}>"
+        lines.append(f"**{i + 1}.** {name} — `{count}` msgs")
 
     embed = discord.Embed(
         title="Weekly Message Leaderboard",
