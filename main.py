@@ -219,11 +219,18 @@ async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: d
         except json.JSONDecodeError as e:
             raise ValueError(f"ScrapTik returned non-JSON ({r.status}): {raw[:200]}") from e
 
-async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
-    total_views = 0
-    video_count = 0
-    cursor      = 0
-    has_more    = True
+async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
+    """
+    Paginates all user posts.
+    Returns (dreamyvr_views, dreamyvr_count, follower_count).
+    Follower count is read from the first video's author stats if available.
+    """
+    total_views    = 0
+    video_count    = 0
+    follower_count = 0
+    cursor         = 0
+    has_more       = True
+    first_page     = True
 
     async with aiohttp.ClientSession() as session:
         while has_more:
@@ -244,6 +251,21 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
             if not videos:
                 break
 
+            # Grab follower count from author stats on first page
+            if first_page and videos:
+                first_page = False
+                v = videos[0]
+                author_stats = (
+                    v.get("authorStats", {})
+                    or v.get("author", {}).get("stats", {})
+                    or {}
+                )
+                follower_count = int(
+                    author_stats.get("followerCount", 0)
+                    or author_stats.get("fans", 0)
+                    or 0
+                )
+
             for video in videos:
                 desc       = video.get("desc", "").lower()
                 challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
@@ -258,7 +280,12 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     total_views += int(play_count)
                     video_count += 1
 
-    return total_views, video_count
+    return total_views, video_count, follower_count
+
+
+async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
+    views, count, _ = await fetch_tiktok_posts_data(username)
+    return views, count
 
 async def fetch_tiktok_stats(url: str):
     username = extract_tiktok_username(url)
@@ -268,13 +295,7 @@ async def fetch_tiktok_stats(url: str):
     async with aiohttp.ClientSession() as session:
         data = await _scraptik_get(session, "get-user", {"username": username})
 
-    # Send raw response to bot owner via DM for debugging
-    try:
-        app_info = await bot.application_info()
-        owner = app_info.owner
-        await owner.send(f"```[TikTok Debug]\n{str(data)[:1800]}```")
-    except Exception:
-        pass
+
 
     try:
         if "userInfo" in data:
@@ -299,7 +320,11 @@ async def fetch_tiktok_stats(url: str):
         raise ValueError(f"Unexpected TikTok API response. Raw: {str(data)[:500]}") from exc
 
     nickname = user.get("nickname", user.get("uniqueId", username))
-    dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
+    dreamyvr_views, dreamyvr_count, followers_from_posts = await fetch_tiktok_posts_data(username)
+
+    # Use followers from posts if get-user didn't return it
+    if followers == 0:
+        followers = followers_from_posts
 
     return {
         "channel_name":   nickname,
