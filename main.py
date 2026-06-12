@@ -25,8 +25,8 @@ tree = bot.tree
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    # Don't log messages sent inside the DB channel itself
-    if message.channel.id == DB_CHANNEL_ID:
+    # Don't log messages sent inside the DB channel or the excluded channel
+    if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898):
         return
 
     db_channel = bot.get_channel(DB_CHANNEL_ID)
@@ -73,7 +73,6 @@ async def messageleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     embed.set_footer(text="Resets every Sunday at 23:00 UTC")
-    embed.timestamp = discord.utils.utcnow()
 
     await interaction.followup.send(embed=embed)
 
