@@ -10,7 +10,8 @@ from typing import Literal
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
-YOUTUBE_API_KEY    = os.environ["YOUTUBE_API_KEY"]
+YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg04"
+RAPIDAPI_KEY       = "ae92fc6f3bmsh5bacceeaaecb548p164d3ejsn0ef636bc8645"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -192,28 +193,44 @@ def extract_tiktok_username(url: str):
 
 async def fetch_tiktok_stats(url: str):
     """
-    Uses TikTok's unofficial oEmbed endpoint (no API key needed) to get
-    basic info. Returns dict with channel_name, channel_url.
-    Note: TikTok's public API does not expose follower/view counts without
-    an approved developer app. We return what's available and note the rest.
+    Uses tiktok-api23.p.rapidapi.com — Get User Info endpoint.
+    Returns followers, following, likes (total views), and video count.
     """
     username = extract_tiktok_username(url)
     if not username:
         raise ValueError("Couldn't parse that TikTok URL.")
 
-    profile_url = f"https://www.tiktok.com/@{username}"
-    oembed_url  = f"https://www.tiktok.com/oembed?url={profile_url}"
+    headers = {
+        "x-rapidapi-host": "tiktok-api23.p.rapidapi.com",
+        "x-rapidapi-key":  RAPIDAPI_KEY,
+        "Content-Type":    "application/json",
+    }
+    params = {"uniqueId": username}
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(oembed_url) as r:
+        async with session.get(
+            "https://tiktok-api23.p.rapidapi.com/api/user/info",
+            headers=headers,
+            params=params,
+        ) as r:
             if r.status != 200:
-                raise ValueError("TikTok profile not found or unavailable.")
+                raise ValueError(f"TikTok API returned status {r.status}.")
             data = await r.json()
 
+    try:
+        user  = data["data"]["user"]
+        stats = data["data"]["stats"]
+    except KeyError:
+        raise ValueError("Unexpected response from TikTok API.")
+
     return {
-        "channel_name": data.get("author_name", username),
-        "channel_url":  profile_url,
+        "channel_name": user.get("nickname", username),
         "username":     username,
+        "channel_url":  f"https://www.tiktok.com/@{username}",
+        "followers":    int(stats.get("followerCount", 0)),
+        "following":    int(stats.get("followingCount", 0)),
+        "likes":        int(stats.get("heartCount", 0)),
+        "video_count":  int(stats.get("videoCount", 0)),
     }
 
 # ── /messageleaderboard ───────────────────────────────────────────────────────
@@ -353,17 +370,15 @@ async def ccstats(interaction: discord.Interaction):
             stats = await fetch_tiktok_stats(url)
 
             embed = discord.Embed(
-                title=f"{stats['channel_name']}",
+                title=stats["channel_name"],
                 url=stats["channel_url"],
                 color=0x010101,
             )
-            embed.add_field(name="Platform",  value="TikTok",                         inline=True)
-            embed.add_field(name="Profile",   value=f"@{stats['username']}",          inline=True)
-            embed.add_field(
-                name="Note",
-                value="TikTok's public API doesn't expose follower/view counts.\nCheck your full stats at [TikTok Analytics](<https://www.tiktok.com/analytics>).",
-                inline=False
-            )
+            embed.add_field(name="Platform",   value="TikTok",                        inline=True)
+            embed.add_field(name="Followers",  value=f"`{stats['followers']:,}`",     inline=True)
+            embed.add_field(name="Following",  value=f"`{stats['following']:,}`",     inline=True)
+            embed.add_field(name="Total Likes",value=f"`{stats['likes']:,}`",         inline=True)
+            embed.add_field(name="Videos",     value=f"`{stats['video_count']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.followup.send(embed=embed)
 
