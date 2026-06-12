@@ -73,7 +73,6 @@ async def get_approved_link(user_id: int):
         if not msg.embeds:
             continue
         embed = msg.embeds[0]
-        # Footer contains "User ID: <id>"
         if embed.footer and embed.footer.text and uid_str in embed.footer.text:
             platform = None
             url      = None
@@ -88,14 +87,6 @@ async def get_approved_link(user_id: int):
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 def extract_youtube_channel_id_from_url(url: str):
-    """
-    Handles:
-      youtube.com/channel/UCxxxx
-      youtube.com/@handle
-      youtube.com/c/name
-      youtube.com/user/name
-    Returns a (type, value) tuple: ("id", "UCxxx") or ("handle", "@name") etc.
-    """
     patterns = [
         (r"youtube\.com/channel/([A-Za-z0-9_\-]+)", "id"),
         (r"youtube\.com/@([A-Za-z0-9_\.\-]+)",       "handle"),
@@ -109,10 +100,6 @@ def extract_youtube_channel_id_from_url(url: str):
     return None, None
 
 async def fetch_youtube_stats(url: str):
-    """
-    Returns dict with keys: channel_name, subscribers, total_views, video_count, channel_url
-    or raises ValueError with a human-readable message.
-    """
     kind, value = extract_youtube_channel_id_from_url(url)
     if not kind:
         raise ValueError("Couldn't parse that YouTube URL.")
@@ -120,12 +107,10 @@ async def fetch_youtube_stats(url: str):
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
 
-        # Step 1 — resolve to a channel ID if needed
         channel_id = None
         if kind == "id":
             channel_id = value
         elif kind == "handle":
-            # Use search to resolve @handle
             params = {
                 "part": "snippet",
                 "q": f"@{value}",
@@ -140,7 +125,6 @@ async def fetch_youtube_stats(url: str):
                 raise ValueError("YouTube channel not found.")
             channel_id = items[0]["snippet"]["channelId"]
         else:
-            # custom / user — use forUsername or search
             params = {
                 "part": "id,snippet",
                 "forUsername": value,
@@ -150,7 +134,6 @@ async def fetch_youtube_stats(url: str):
                 data = await r.json()
             items = data.get("items", [])
             if not items:
-                # fallback to search
                 params = {"part": "snippet", "q": value, "type": "channel",
                           "maxResults": 1, "key": YOUTUBE_API_KEY}
                 async with session.get(f"{base}/search", params=params) as r:
@@ -162,7 +145,6 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        # Step 2 — fetch statistics
         params = {
             "part": "snippet,statistics",
             "id": channel_id,
@@ -192,15 +174,6 @@ def extract_tiktok_username(url: str):
     return m.group(1) if m else None
 
 async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
-    """
-    Paginates through all user posts, filters to videos tagged #dreamyvr,
-    and returns (total_dreamyvr_views, dreamyvr_video_count).
-    """
-    headers = {
-        "x-rapidapi-host": "tiktok-api23.p.rapidapi.com",
-        "x-rapidapi-key":  RAPIDAPI_KEY,
-        "Content-Type":    "application/json",
-    }
     total_views  = 0
     video_count  = 0
     cursor       = 0
@@ -223,7 +196,6 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                 if r.status != 200:
                     break
 
-            print(f"[TikTok Posts Debug] status={r.status} raw={str(data)[:1000]}")
             videos   = data.get("data", {}).get("videos", data.get("itemList", []))
             has_more = data.get("data", {}).get("hasMore", data.get("hasMore", False))
             cursor   = data.get("data", {}).get("cursor", data.get("cursor", 0))
@@ -231,7 +203,6 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
             for video in videos:
                 desc       = video.get("desc", "").lower()
                 challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
-                # also check textExtra which TikTok uses for hashtags
                 text_extra = [t.get("hashtagName", "").lower() for t in video.get("textExtra", [])]
                 has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges or "dreamyvr" in text_extra
                 if has_tag:
@@ -244,25 +215,14 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     video_count += 1
 
             if not videos:
-                # Debug: log raw response so we can see the real structure
-                print(f"[TikTok Posts Debug] Raw response: {str(data)[:1000]}")
                 break
 
     return total_views, video_count
 
 async def fetch_tiktok_stats(url: str):
-    """
-    Fetches user info + #dreamyvr video views from tiktok-api23.p.rapidapi.com.
-    """
     username = extract_tiktok_username(url)
     if not username:
         raise ValueError("Couldn't parse that TikTok URL.")
-
-    headers = {
-        "x-rapidapi-host": "tiktok-api23.p.rapidapi.com",
-        "x-rapidapi-key":  RAPIDAPI_KEY,
-        "Content-Type":    "application/json",
-    }
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
@@ -278,11 +238,27 @@ async def fetch_tiktok_stats(url: str):
                 raise ValueError(f"TikTok API returned status {r.status}.")
             data = await r.json()
 
+    print(f"[TikTok User Debug] top-level keys: {list(data.keys())}")
+
     try:
-        user  = data["userInfo"]["user"]
-        stats = data["userInfo"]["stats"]
-    except KeyError:
-        raise ValueError(f"Unexpected response from TikTok API. Raw: {str(data)[:500]}")
+        if "userInfo" in data:
+            # Original nested structure
+            user  = data["userInfo"]["user"]
+            stats = data["userInfo"]["stats"]
+        elif "user" in data and "stats" in data:
+            # Flat structure (scraptik)
+            user  = data["user"]
+            stats = data["stats"]
+        elif "user" in data:
+            # Flat user only, stats may be inside user
+            user  = data["user"]
+            stats = data["user"].get("stats", {})
+        else:
+            raise KeyError("no recognisable user key")
+    except KeyError as exc:
+        raise ValueError(f"Unexpected response from TikTok API. Raw: {str(data)[:500]}") from exc
+
+    print(f"[TikTok User Debug] user keys: {list(user.keys())}, stats keys: {list(stats.keys())}")
 
     dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
 
@@ -294,6 +270,105 @@ async def fetch_tiktok_stats(url: str):
         "dreamyvr_views":  dreamyvr_views,
         "dreamyvr_count":  dreamyvr_count,
     }
+
+# ── Helper: get all approved links ───────────────────────────────────────────
+async def get_all_approved_links() -> list[dict]:
+    """
+    Scan LINK_LOG_CHANNEL for all approved embeds.
+    Returns a list of {user_id, platform, url} dicts (one per user, most recent wins).
+    """
+    log_channel = bot.get_channel(LINK_LOG_CHANNEL)
+    seen_users  = {}  # user_id -> {platform, url}
+    async for msg in log_channel.history(limit=None, oldest_first=True):
+        if not msg.embeds:
+            continue
+        embed = msg.embeds[0]
+        if not (embed.footer and embed.footer.text):
+            continue
+        # Footer format: "Approved by X • User ID: 123456"
+        footer = embed.footer.text
+        uid_match = re.search(r"User ID:\s*(\d+)", footer)
+        if not uid_match:
+            continue
+        uid      = uid_match.group(1)
+        platform = None
+        url      = None
+        for field in embed.fields:
+            if field.name == "Platform":
+                platform = field.value
+            if field.name == "URL":
+                url = field.value
+        if platform and url:
+            seen_users[uid] = {"user_id": uid, "platform": platform, "url": url}
+    return list(seen_users.values())
+
+# ── /contentfullstats ─────────────────────────────────────────────────────────
+@tree.command(name="contentfullstats", description="Show stats for every linked creator")
+async def contentfullstats(interaction: discord.Interaction):
+    await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
+
+    all_links = await get_all_approved_links()
+    if not all_links:
+        await interaction.edit_original_response(content="No approved creator links found.")
+        return
+
+    lines  = []
+    number = 1
+
+    for entry in all_links:
+        uid      = entry["user_id"]
+        platform = entry["platform"]
+        url      = entry["url"]
+        member   = interaction.guild.get_member(int(uid))
+        mention  = member.mention if member else f"<@{uid}>"
+
+        try:
+            if platform == "TikTok":
+                stats    = await fetch_tiktok_stats(url)
+                username = stats["username"]
+                lines.append(
+                    f"**{number}.** {mention}\n"
+                    f"> URL: {url}\n"
+                    f"> Followers: {stats['followers']:,}\n"
+                    f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
+                    f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
+                )
+            elif platform == "YouTube":
+                stats = await fetch_youtube_stats(url)
+                lines.append(
+                    f"**{number}.** {mention}\n"
+                    f"> URL: {url}\n"
+                    f"> Subscribers: {stats['subscribers']:,}\n"
+                    f"> Total views: {stats['total_views']:,}\n"
+                    f"> Videos: {stats['video_count']:,}"
+                )
+            else:
+                lines.append(f"**{number}.** {mention}\n> URL: {url}\n> Platform: {platform} (unsupported)")
+        except Exception as e:
+            lines.append(f"**{number}.** {mention}\n> URL: {url}\n> ⚠️ Error: {e}")
+
+        number += 1
+
+    # Discord messages cap at 2000 chars — chunk if needed
+    chunks  = []
+    current = ""
+    for line in lines:
+        block = line + "\n\n"
+        if len(current) + len(block) > 1900:
+            chunks.append(current.strip())
+            current = block
+        else:
+            current += block
+    if current.strip():
+        chunks.append(current.strip())
+
+    if not chunks:
+        await interaction.edit_original_response(content="No data to display.")
+        return
+
+    await interaction.edit_original_response(content=chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
 
 # ── /messageleaderboard ───────────────────────────────────────────────────────
 @tree.command(name="messageleaderboard", description="Show the weekly message leaderboard")
@@ -402,7 +477,6 @@ class LinkReviewView(discord.ui.View):
 # ── /ccstats ──────────────────────────────────────────────────────────────────
 @tree.command(name="ccstats", description="View your linked YouTube or TikTok channel stats")
 async def ccstats(interaction: discord.Interaction):
-    # Respond immediately so the token doesn't expire while we fetch data
     await interaction.response.send_message("Fetching your stats, please wait...")
 
     platform, url = await get_approved_link(interaction.user.id)
