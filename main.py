@@ -402,51 +402,47 @@ class LinkReviewView(discord.ui.View):
 # ── /ccstats ──────────────────────────────────────────────────────────────────
 @tree.command(name="ccstats", description="View your linked YouTube or TikTok channel stats")
 async def ccstats(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=False)
+    # Respond immediately so the token doesn't expire while we fetch data
+    await interaction.response.send_message("Fetching your stats, please wait...")
 
     platform, url = await get_approved_link(interaction.user.id)
     if not platform:
-        await interaction.followup.send(
-            "You don't have an approved channel link yet. Use `/link` to submit one.",
-            ephemeral=True
-        )
+        await interaction.edit_original_response(content="You don't have an approved channel link yet. Use `/link` to submit one.")
         return
 
     try:
         if platform == "YouTube":
             stats = await fetch_youtube_stats(url)
-
             embed = discord.Embed(
-                title=f"{stats['channel_name']}",
+                title=stats["channel_name"],
                 url=stats["channel_url"],
                 color=0xFF0000,
             )
-            embed.add_field(name="Platform",     value="YouTube",                              inline=True)
-            embed.add_field(name="Subscribers",  value=f"`{stats['subscribers']:,}`",          inline=True)
-            embed.add_field(name="Total Views",  value=f"`{stats['total_views']:,}`",           inline=True)
-            embed.add_field(name="Videos",       value=f"`{stats['video_count']:,}`",           inline=True)
+            embed.add_field(name="Platform",    value="YouTube",                     inline=True)
+            embed.add_field(name="Subscribers", value=f"`{stats['subscribers']:,}`", inline=True)
+            embed.add_field(name="Total Views", value=f"`{stats['total_views']:,}`", inline=True)
+            embed.add_field(name="Videos",      value=f"`{stats['video_count']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
-            await interaction.followup.send(embed=embed)
+            await interaction.edit_original_response(content=None, embed=embed)
 
         elif platform == "TikTok":
             stats = await fetch_tiktok_stats(url)
-
             embed = discord.Embed(
                 title=stats["channel_name"],
                 url=stats["channel_url"],
                 color=0x010101,
             )
-            embed.add_field(name="Platform",         value="TikTok",                               inline=True)
-            embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",            inline=True)
-            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`",       inline=True)
-            embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`",       inline=True)
+            embed.add_field(name="Platform",         value="TikTok",                         inline=True)
+            embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
+            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
+            embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
-            await interaction.followup.send(embed=embed)
+            await interaction.edit_original_response(content=None, embed=embed)
 
     except ValueError as e:
-        await interaction.followup.send(f"Error fetching stats: {e}", ephemeral=True)
+        await interaction.edit_original_response(content=f"Error fetching stats: {e}")
     except Exception as e:
-        await interaction.followup.send(f"Something went wrong: {e}", ephemeral=True)
+        await interaction.edit_original_response(content=f"Something went wrong: {e}")
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
