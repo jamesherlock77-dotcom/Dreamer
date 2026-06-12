@@ -191,10 +191,54 @@ def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
+async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
+    """
+    Paginates through all user posts, filters to videos tagged #dreamyvr,
+    and returns (total_dreamyvr_views, dreamyvr_video_count).
+    """
+    headers = {
+        "x-rapidapi-host": "tiktok-api23.p.rapidapi.com",
+        "x-rapidapi-key":  RAPIDAPI_KEY,
+        "Content-Type":    "application/json",
+    }
+    total_views  = 0
+    video_count  = 0
+    cursor       = 0
+    has_more     = True
+
+    async with aiohttp.ClientSession() as session:
+        while has_more:
+            params = {"uniqueId": username, "count": "30", "cursor": str(cursor)}
+            async with session.get(
+                "https://tiktok-api23.p.rapidapi.com/api/user/posts",
+                headers=headers,
+                params=params,
+            ) as r:
+                if r.status != 200:
+                    break
+                data = await r.json()
+
+            videos   = data.get("data", {}).get("videos", [])
+            has_more = data.get("data", {}).get("hasMore", False)
+            cursor   = data.get("data", {}).get("cursor", 0)
+
+            for video in videos:
+                # Check hashtags in the video's challenge list or description
+                desc       = video.get("desc", "").lower()
+                challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
+                has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges
+                if has_tag:
+                    total_views += int(video.get("stats", {}).get("playCount", 0))
+                    video_count += 1
+
+            if not videos:
+                break
+
+    return total_views, video_count
+
 async def fetch_tiktok_stats(url: str):
     """
-    Uses tiktok-api23.p.rapidapi.com — Get User Info endpoint.
-    Returns followers, following, likes (total views), and video count.
+    Fetches user info + #dreamyvr video views from tiktok-api23.p.rapidapi.com.
     """
     username = extract_tiktok_username(url)
     if not username:
@@ -205,13 +249,12 @@ async def fetch_tiktok_stats(url: str):
         "x-rapidapi-key":  RAPIDAPI_KEY,
         "Content-Type":    "application/json",
     }
-    params = {"uniqueId": username}
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
             "https://tiktok-api23.p.rapidapi.com/api/user/info",
             headers=headers,
-            params=params,
+            params={"uniqueId": username},
         ) as r:
             if r.status != 200:
                 raise ValueError(f"TikTok API returned status {r.status}.")
@@ -223,14 +266,15 @@ async def fetch_tiktok_stats(url: str):
     except KeyError:
         raise ValueError("Unexpected response from TikTok API.")
 
+    dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
+
     return {
-        "channel_name": user.get("nickname", username),
-        "username":     username,
-        "channel_url":  f"https://www.tiktok.com/@{username}",
-        "followers":    int(stats.get("followerCount", 0)),
-        "following":    int(stats.get("followingCount", 0)),
-        "likes":        int(stats.get("heartCount", 0)),
-        "video_count":  int(stats.get("videoCount", 0)),
+        "channel_name":    user.get("nickname", username),
+        "username":        username,
+        "channel_url":     f"https://www.tiktok.com/@{username}",
+        "followers":       int(stats.get("followerCount", 0)),
+        "dreamyvr_views":  dreamyvr_views,
+        "dreamyvr_count":  dreamyvr_count,
     }
 
 # ── /messageleaderboard ───────────────────────────────────────────────────────
@@ -374,11 +418,10 @@ async def ccstats(interaction: discord.Interaction):
                 url=stats["channel_url"],
                 color=0x010101,
             )
-            embed.add_field(name="Platform",   value="TikTok",                        inline=True)
-            embed.add_field(name="Followers",  value=f"`{stats['followers']:,}`",     inline=True)
-            embed.add_field(name="Following",  value=f"`{stats['following']:,}`",     inline=True)
-            embed.add_field(name="Total Likes",value=f"`{stats['likes']:,}`",         inline=True)
-            embed.add_field(name="Videos",     value=f"`{stats['video_count']:,}`",   inline=True)
+            embed.add_field(name="Platform",         value="TikTok",                               inline=True)
+            embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",            inline=True)
+            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`",       inline=True)
+            embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`",       inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.followup.send(embed=embed)
 
