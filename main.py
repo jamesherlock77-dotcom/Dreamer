@@ -255,6 +255,13 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
             if first_page and videos:
                 first_page = False
                 v = videos[0]
+                # DM owner the first video keys for debugging
+                try:
+                    app_info = await bot.application_info()
+                    owner = app_info.owner
+                    await owner.send(f"```[Posts Debug] first video keys:\n{list(v.keys())}\n\nauthorStats: {v.get('authorStats')}\nauthor: {str(v.get('author', {}))[:500]}\nstats: {v.get('stats')}```")
+                except Exception:
+                    pass
                 author_stats = (
                     v.get("authorStats", {})
                     or v.get("author", {}).get("stats", {})
