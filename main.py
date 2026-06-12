@@ -264,7 +264,7 @@ async def fetch_tiktok_stats(url: str):
         user  = data["data"]["user"]
         stats = data["data"]["stats"]
     except KeyError:
-        raise ValueError("Unexpected response from TikTok API.")
+        raise ValueError(f"Unexpected response from TikTok API. Raw: {str(data)[:500]}")
 
     dreamyvr_views, dreamyvr_count = await fetch_tiktok_dreamyvr_views(username)
 
