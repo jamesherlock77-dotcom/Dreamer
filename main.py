@@ -218,17 +218,23 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     break
                 data = await r.json()
 
-            videos   = data.get("data", {}).get("videos", [])
-            has_more = data.get("data", {}).get("hasMore", False)
-            cursor   = data.get("data", {}).get("cursor", 0)
+            videos   = data.get("data", {}).get("videos", data.get("itemList", []))
+            has_more = data.get("data", {}).get("hasMore", data.get("hasMore", False))
+            cursor   = data.get("data", {}).get("cursor", data.get("cursor", 0))
 
             for video in videos:
-                # Check hashtags in the video's challenge list or description
                 desc       = video.get("desc", "").lower()
                 challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
-                has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges
+                # also check textExtra which TikTok uses for hashtags
+                text_extra = [t.get("hashtagName", "").lower() for t in video.get("textExtra", [])]
+                has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges or "dreamyvr" in text_extra
                 if has_tag:
-                    total_views += int(video.get("stats", {}).get("playCount", 0))
+                    play_count = (
+                        video.get("stats", {}).get("playCount")
+                        or video.get("statsV2", {}).get("playCount")
+                        or 0
+                    )
+                    total_views += int(play_count)
                     video_count += 1
 
             if not videos:
@@ -261,8 +267,8 @@ async def fetch_tiktok_stats(url: str):
             data = await r.json()
 
     try:
-        user  = data["data"]["user"]
-        stats = data["data"]["stats"]
+        user  = data["userInfo"]["user"]
+        stats = data["userInfo"]["stats"]
     except KeyError:
         raise ValueError(f"Unexpected response from TikTok API. Raw: {str(data)[:500]}")
 
