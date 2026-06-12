@@ -238,6 +238,8 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     video_count += 1
 
             if not videos:
+                # Debug: log raw response so we can see the real structure
+                print(f"[TikTok Posts Debug] Raw response: {str(data)[:1000]}")
                 break
 
     return total_views, video_count
