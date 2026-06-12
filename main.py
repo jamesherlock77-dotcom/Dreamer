@@ -259,9 +259,23 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
                 print(f"[ScrapTik user-posts error] {e}", flush=True)
                 break
 
-            videos   = data.get("data", {}).get("videos", data.get("itemList", []))
-            has_more = data.get("data", {}).get("hasMore", data.get("hasMore", False))
-            cursor   = data.get("data", {}).get("cursor", data.get("cursor", 0))
+            videos   = (
+                data.get("aweme_list")
+                or data.get("data", {}).get("videos")
+                or data.get("itemList")
+                or []
+            )
+            has_more = bool(
+                data.get("has_more")
+                or data.get("data", {}).get("hasMore")
+                or data.get("hasMore")
+            )
+            cursor   = (
+                data.get("max_cursor")
+                or data.get("data", {}).get("cursor")
+                or data.get("cursor")
+                or 0
+            )
 
             if not videos:
                 break
@@ -270,14 +284,13 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
             if first_page and videos:
                 first_page = False
                 v = videos[0]
-                author_stats = (
-                    v.get("authorStats", {})
-                    or v.get("author", {}).get("stats", {})
-                    or {}
-                )
+                author      = v.get("author", {})
+                author_stats = v.get("authorStats", {}) or author.get("stats", {}) or {}
                 follower_count = int(
                     author_stats.get("followerCount", 0)
                     or author_stats.get("fans", 0)
+                    or author.get("follower_count", 0)
+                    or author.get("followerCount", 0)
                     or 0
                 )
 
@@ -289,6 +302,7 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
                 if has_tag:
                     play_count = (
                         video.get("stats", {}).get("playCount")
+                        or video.get("statistics", {}).get("play_count")
                         or video.get("statsV2", {}).get("playCount")
                         or 0
                     )
