@@ -208,16 +208,22 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
 
     async with aiohttp.ClientSession() as session:
         while has_more:
-            params = {"uniqueId": username, "count": "30", "cursor": str(cursor)}
+            params = {"username": username, "count": "30", "cursor": str(cursor)}
             async with session.get(
-                "https://tiktok-api23.p.rapidapi.com/api/user/posts",
-                headers=headers,
+                "https://scraptik.p.rapidapi.com/user-posts",
+                headers={
+                    "x-rapidapi-host": "scraptik.p.rapidapi.com",
+                    "x-rapidapi-key":  RAPIDAPI_KEY,
+                    "Content-Type":    "application/json",
+                },
                 params=params,
             ) as r:
+                data = await r.json()
+                print(f"[ScrapTik Posts Debug] status={r.status} raw={str(data)[:1000]}")
                 if r.status != 200:
                     break
-                data = await r.json()
 
+            print(f"[TikTok Posts Debug] status={r.status} raw={str(data)[:1000]}")
             videos   = data.get("data", {}).get("videos", data.get("itemList", []))
             has_more = data.get("data", {}).get("hasMore", data.get("hasMore", False))
             cursor   = data.get("data", {}).get("cursor", data.get("cursor", 0))
@@ -260,9 +266,13 @@ async def fetch_tiktok_stats(url: str):
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
-            "https://tiktok-api23.p.rapidapi.com/api/user/info",
-            headers=headers,
-            params={"uniqueId": username},
+            "https://scraptik.p.rapidapi.com/get-user",
+            headers={
+                "x-rapidapi-host": "scraptik.p.rapidapi.com",
+                "x-rapidapi-key":  RAPIDAPI_KEY,
+                "Content-Type":    "application/json",
+            },
+            params={"username": username},
         ) as r:
             if r.status != 200:
                 raise ValueError(f"TikTok API returned status {r.status}.")
