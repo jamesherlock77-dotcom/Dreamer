@@ -211,7 +211,7 @@ async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: d
         params=params,
     ) as r:
         raw = await r.text()
-        print(f"[ScrapTik {endpoint}] status={r.status} raw={raw[:300]}")
+        print(f"[ScrapTik {endpoint}] status={r.status} raw={raw[:300]}", flush=True)
         if r.status != 200:
             raise ValueError(f"ScrapTik API returned status {r.status}: {raw[:200]}")
         try:
@@ -234,7 +234,7 @@ async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
                     "cursor":   str(cursor),
                 })
             except ValueError as e:
-                print(f"[ScrapTik user-posts error] {e}")
+                print(f"[ScrapTik user-posts error] {e}", flush=True)
                 break
 
             videos   = data.get("data", {}).get("videos", data.get("itemList", []))
@@ -268,7 +268,13 @@ async def fetch_tiktok_stats(url: str):
     async with aiohttp.ClientSession() as session:
         data = await _scraptik_get(session, "get-user", {"username": username})
 
-    print(f"[TikTok User Debug] full response: {str(data)[:1000]}")
+    # Send raw response to bot owner via DM for debugging
+    try:
+        app_info = await bot.application_info()
+        owner = app_info.owner
+        await owner.send(f"```[TikTok Debug]\n{str(data)[:1800]}```")
+    except Exception:
+        pass
 
     try:
         if "userInfo" in data:
