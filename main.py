@@ -219,11 +219,20 @@ async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: d
         except json.JSONDecodeError as e:
             raise ValueError(f"ScrapTik returned non-JSON ({r.status}): {raw[:200]}") from e
 
+async def fetch_tiktok_user_id(session: aiohttp.ClientSession, username: str) -> str:
+    """Resolve a TikTok username to a user ID via ScrapTik."""
+    data = await _scraptik_get(session, "username-to-id", {"username": username, "compact": "0"})
+    # Response is typically {"user_id": "..."} or {"id": "..."}
+    uid = data.get("user_id") or data.get("id") or data.get("userId")
+    if not uid:
+        raise ValueError(f"Could not resolve user ID for @{username}. Raw: {str(data)[:300]}")
+    return str(uid)
+
+
 async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
     """
-    Paginates all user posts.
+    Resolves username to ID, paginates all user posts.
     Returns (dreamyvr_views, dreamyvr_count, follower_count).
-    Follower count is read from the first video's author stats if available.
     """
     total_views    = 0
     video_count    = 0
@@ -233,12 +242,18 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
     first_page     = True
 
     async with aiohttp.ClientSession() as session:
+        try:
+            user_id = await fetch_tiktok_user_id(session, username)
+        except ValueError as e:
+            print(f"[ScrapTik username-to-id error] {e}", flush=True)
+            return 0, 0, 0
+
         while has_more:
             try:
                 data = await _scraptik_get(session, "user-posts", {
-                    "username": username,
-                    "count":    "30",
-                    "cursor":   str(cursor),
+                    "user_id": user_id,
+                    "count":   "30",
+                    "cursor":  str(cursor),
                 })
             except ValueError as e:
                 print(f"[ScrapTik user-posts error] {e}", flush=True)
@@ -255,13 +270,6 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
             if first_page and videos:
                 first_page = False
                 v = videos[0]
-                # DM owner the first video keys for debugging
-                try:
-                    app_info = await bot.application_info()
-                    owner = app_info.owner
-                    await owner.send(f"```[Posts Debug] first video keys:\n{list(v.keys())}\n\nauthorStats: {v.get('authorStats')}\nauthor: {str(v.get('author', {}))[:500]}\nstats: {v.get('stats')}```")
-                except Exception:
-                    pass
                 author_stats = (
                     v.get("authorStats", {})
                     or v.get("author", {}).get("stats", {})
