@@ -198,12 +198,47 @@ async def fetch_youtube_stats(url: str):
         ch      = items[0]
         stats   = ch.get("statistics", {})
         snippet = ch.get("snippet", {})
+
+        # Fetch #dreamyvr videos via search
+        dreamyvr_views = 0
+        dreamyvr_count = 0
+        next_page_token = None
+        async with aiohttp.ClientSession() as search_session:
+            while True:
+                search_params = {
+                    "part":       "id",
+                    "channelId":  channel_id,
+                    "q":          "#dreamyvr",
+                    "type":       "video",
+                    "maxResults": 50,
+                    "key":        YOUTUBE_API_KEY,
+                }
+                if next_page_token:
+                    search_params["pageToken"] = next_page_token
+                async with search_session.get(f"{base}/search", params=search_params) as sr:
+                    sdata = await sr.json()
+                video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
+                if video_ids:
+                    stats_params = {
+                        "part": "statistics",
+                        "id":   ",".join(video_ids),
+                        "key":  YOUTUBE_API_KEY,
+                    }
+                    async with search_session.get(f"{base}/videos", params=stats_params) as vr:
+                        vdata = await vr.json()
+                    for v in vdata.get("items", []):
+                        dreamyvr_count += 1
+                        dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
+                next_page_token = sdata.get("nextPageToken")
+                if not next_page_token:
+                    break
+
         return {
-            "channel_name": snippet.get("title", "Unknown"),
-            "subscribers":  int(stats.get("subscriberCount", 0)),
-            "total_views":  int(stats.get("viewCount", 0)),
-            "video_count":  int(stats.get("videoCount", 0)),
-            "channel_url":  f"https://www.youtube.com/channel/{channel_id}",
+            "channel_name":   snippet.get("title", "Unknown"),
+            "subscribers":    int(stats.get("subscriberCount", 0)),
+            "dreamyvr_count": dreamyvr_count,
+            "dreamyvr_views": dreamyvr_views,
+            "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
         }
 
 # ── TikTok helpers (TikAPI) ──────────────────────────────────────────────────
@@ -425,22 +460,27 @@ class LinkReviewView(discord.ui.View):
 
 # ── /ccstats ──────────────────────────────────────────────────────────────────
 @tree.command(name="ccstats", description="View your linked YouTube or TikTok channel stats")
-async def ccstats(interaction: discord.Interaction):
+@app_commands.describe(platform="Which platform to show stats for")
+async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube", "TikTok"]):
     await interaction.response.send_message("Fetching your stats, please wait...")
 
-    platform, url = await get_approved_link(interaction.user.id)
-    if not platform:
+    saved_platform, url = await get_approved_link(interaction.user.id)
+    if not saved_platform:
         await interaction.edit_original_response(content="You don't have an approved channel link yet. Use `/link` to submit one.")
+        return
+
+    if saved_platform != platform:
+        await interaction.edit_original_response(content=f"Your approved link is for **{saved_platform}**, not {platform}.")
         return
 
     try:
         if platform == "YouTube":
             stats = await fetch_youtube_stats(url)
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
-            embed.add_field(name="Platform",    value="YouTube",                     inline=True)
-            embed.add_field(name="Subscribers", value=f"`{stats['subscribers']:,}`", inline=True)
-            embed.add_field(name="Total Views", value=f"`{stats['total_views']:,}`", inline=True)
-            embed.add_field(name="Videos",      value=f"`{stats['video_count']:,}`", inline=True)
+            embed.add_field(name="Platform",          value="YouTube",                          inline=True)
+            embed.add_field(name="Subscribers",       value=f"`{stats['subscribers']:,}`",      inline=True)
+            embed.add_field(name="#dreamyvr Videos",  value=f"`{stats['dreamyvr_count']:,}`",   inline=True)
+            embed.add_field(name="#dreamyvr Views",   value=f"`{stats['dreamyvr_views']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.edit_original_response(content=None, embed=embed)
 
@@ -449,8 +489,8 @@ async def ccstats(interaction: discord.Interaction):
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
             embed.add_field(name="Platform",         value="TikTok",                         inline=True)
             embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
-            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
+            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.edit_original_response(content=None, embed=embed)
 
@@ -503,8 +543,8 @@ async def contentfullstats(interaction: discord.Interaction):
                     f"**{number}.** {mention}\n"
                     f"> URL: {url}\n"
                     f"> Subscribers: {stats['subscribers']:,}\n"
-                    f"> Total views: {stats['total_views']:,}\n"
-                    f"> Videos: {stats['video_count']:,}"
+                    f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
+                    f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
                 )
             else:
                 lines.append(f"**{number}.** {mention}\n> URL: {url}\n> Platform: {platform} (unsupported)")
