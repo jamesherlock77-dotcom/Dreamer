@@ -227,18 +227,24 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
     has_more       = True
 
     async with aiohttp.ClientSession() as session:
-        # Step 1: get user info (followers + nickname)
+        # Step 1: get user info (followers + secUid)
+        sec_uid = None
         try:
             user_data      = await _tikapi_get(session, "public/check", {"username": username})
             user_info      = user_data.get("userInfo", {})
             stats          = user_info.get("stats", {})
             follower_count = int(stats.get("followerCount", 0))
+            sec_uid        = user_info.get("user", {}).get("secUid") or user_data.get("secUid")
         except ValueError as e:
             print(f"[TikAPI user error] {e}", flush=True)
 
+        if not sec_uid:
+            print(f"[TikAPI] Could not get secUid for {username}", flush=True)
+            return 0, 0, follower_count
+
         # Step 2: paginate posts
         while has_more:
-            params = {"username": username, "count": 30}
+            params = {"secUid": sec_uid, "count": 30}
             if cursor:
                 params["cursor"] = cursor
             try:
