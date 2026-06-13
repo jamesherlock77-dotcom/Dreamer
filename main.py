@@ -134,19 +134,32 @@ async def fetch_youtube_stats(url: str):
         if kind == "id":
             channel_id = value
         elif kind == "handle":
+            # Try forHandle first (newer API)
             params = {
-                "part": "snippet",
-                "q": f"@{value}",
-                "type": "channel",
-                "maxResults": 1,
+                "part": "id,snippet",
+                "forHandle": f"@{value}",
                 "key": YOUTUBE_API_KEY,
             }
-            async with session.get(f"{base}/search", params=params) as r:
+            async with session.get(f"{base}/channels", params=params) as r:
                 data = await r.json()
             items = data.get("items", [])
             if not items:
-                raise ValueError("YouTube channel not found.")
-            channel_id = items[0]["snippet"]["channelId"]
+                # Fallback to search
+                params = {
+                    "part": "snippet",
+                    "q": value,
+                    "type": "channel",
+                    "maxResults": 1,
+                    "key": YOUTUBE_API_KEY,
+                }
+                async with session.get(f"{base}/search", params=params) as r:
+                    data = await r.json()
+                items = data.get("items", [])
+                if not items:
+                    raise ValueError("YouTube channel not found.")
+                channel_id = items[0]["snippet"]["channelId"]
+            else:
+                channel_id = items[0]["id"]
         else:
             params = {
                 "part": "id,snippet",
