@@ -12,7 +12,7 @@ from typing import Literal
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
 YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg04"
-RAPIDAPI_KEY       = "198832eaf9msh232c07889d9c419p17ba5cjsne14e458f9a88"
+TIKAPI_KEY         = "lFoJPYkghHxXrc33873j9AOlf9RNV9XNw7hDek9xhH0w00q8"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -191,108 +191,68 @@ async def fetch_youtube_stats(url: str):
             "channel_url":  f"https://www.youtube.com/channel/{channel_id}",
         }
 
-# ── TikTok helpers ────────────────────────────────────────────────────────────
+# ── TikTok helpers (TikAPI) ──────────────────────────────────────────────────
 def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
-async def _scraptik_get(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
-    """
-    GET a scraptik endpoint, reading the response as raw text then parsing JSON.
-    Dropping Content-Type from request headers avoids the API returning text/plain.
-    """
+async def _tikapi_get(session: aiohttp.ClientSession, endpoint: str, params: dict = {}) -> dict:
+    """GET a TikAPI endpoint. Auth via X-API-KEY header."""
     async with session.get(
-        f"https://scraptik.p.rapidapi.com/{endpoint}",
+        f"https://api.tikapi.io/{endpoint}",
         headers={
-            "x-rapidapi-host": "scraptik.p.rapidapi.com",
-            "x-rapidapi-key":  RAPIDAPI_KEY,
-            "Content-Type":    "application/json",
+            "X-API-KEY": TIKAPI_KEY,
+            "Accept":    "application/json",
         },
         params=params,
     ) as r:
         raw = await r.text()
-        print(f"[ScrapTik {endpoint}] status={r.status} raw={raw[:300]}", flush=True)
+        print(f"[TikAPI {endpoint}] status={r.status} raw={raw[:300]}", flush=True)
         if r.status != 200:
-            raise ValueError(f"ScrapTik API returned status {r.status}: {raw[:200]}")
+            raise ValueError(f"TikAPI returned status {r.status}: {raw[:200]}")
         try:
             return json.loads(raw)
         except json.JSONDecodeError as e:
-            raise ValueError(f"ScrapTik returned non-JSON ({r.status}): {raw[:200]}") from e
-
-async def fetch_tiktok_user_id(session: aiohttp.ClientSession, username: str) -> str:
-    """Resolve a TikTok username to a user ID via ScrapTik."""
-    data = await _scraptik_get(session, "username-to-id", {"username": username, "compact": "0"})
-    # Response is typically {"user_id": "..."} or {"id": "..."}
-    uid = data.get("uid") or data.get("user_id") or data.get("id") or data.get("userId")
-    if not uid:
-        raise ValueError(f"Could not resolve user ID for @{username}. Raw: {str(data)[:300]}")
-    return str(uid)
-
+            raise ValueError(f"TikAPI returned non-JSON: {raw[:200]}") from e
 
 async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
     """
-    Resolves username to ID, paginates all user posts.
+    Fetches user info + all posts via TikAPI.
     Returns (dreamyvr_views, dreamyvr_count, follower_count).
     """
     total_views    = 0
     video_count    = 0
     follower_count = 0
-    cursor         = 0
+    cursor         = None
     has_more       = True
-    first_page     = True
 
     async with aiohttp.ClientSession() as session:
+        # Step 1: get user info (followers + nickname)
         try:
-            user_id = await fetch_tiktok_user_id(session, username)
+            user_data      = await _tikapi_get(session, "public/check", {"username": username})
+            user_info      = user_data.get("userInfo", {})
+            stats          = user_info.get("stats", {})
+            follower_count = int(stats.get("followerCount", 0))
         except ValueError as e:
-            print(f"[ScrapTik username-to-id error] {e}", flush=True)
-            return 0, 0, 0
+            print(f"[TikAPI user error] {e}", flush=True)
 
+        # Step 2: paginate posts
         while has_more:
+            params = {"username": username, "count": 30}
+            if cursor:
+                params["cursor"] = cursor
             try:
-                data = await _scraptik_get(session, "user-posts", {
-                    "user_id": user_id,
-                    "count":   "30",
-                    "cursor":  str(cursor),
-                })
+                data = await _tikapi_get(session, "public/posts", params)
             except ValueError as e:
-                print(f"[ScrapTik user-posts error] {e}", flush=True)
+                print(f"[TikAPI posts error] {e}", flush=True)
                 break
 
-            videos   = (
-                data.get("aweme_list")
-                or data.get("data", {}).get("videos")
-                or data.get("itemList")
-                or []
-            )
-            has_more = bool(
-                data.get("has_more")
-                or data.get("data", {}).get("hasMore")
-                or data.get("hasMore")
-            )
-            cursor   = (
-                data.get("max_cursor")
-                or data.get("data", {}).get("cursor")
-                or data.get("cursor")
-                or 0
-            )
+            videos   = data.get("itemList", [])
+            has_more = bool(data.get("hasMore", False))
+            cursor   = data.get("cursor", None)
 
             if not videos:
                 break
-
-            # Grab follower count from author stats on first page
-            if first_page and videos:
-                first_page = False
-                v = videos[0]
-                author      = v.get("author", {})
-                author_stats = v.get("authorStats", {}) or author.get("stats", {}) or {}
-                follower_count = int(
-                    author_stats.get("followerCount", 0)
-                    or author_stats.get("fans", 0)
-                    or author.get("follower_count", 0)
-                    or author.get("followerCount", 0)
-                    or 0
-                )
 
             for video in videos:
                 desc       = video.get("desc", "").lower()
@@ -302,7 +262,6 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
                 if has_tag:
                     play_count = (
                         video.get("stats", {}).get("playCount")
-                        or video.get("statistics", {}).get("play_count")
                         or video.get("statsV2", {}).get("playCount")
                         or 0
                     )
@@ -322,38 +281,13 @@ async def fetch_tiktok_stats(url: str):
         raise ValueError("Couldn't parse that TikTok URL.")
 
     async with aiohttp.ClientSession() as session:
-        data = await _scraptik_get(session, "get-user", {"username": username})
+        try:
+            user_data = await _tikapi_get(session, "public/check", {"username": username})
+            nickname  = user_data.get("userInfo", {}).get("user", {}).get("nickname", username)
+        except Exception:
+            nickname = username
 
-
-
-    try:
-        if "userInfo" in data:
-            # Standard TikTok nested structure
-            user  = data["userInfo"]["user"]
-            stats = data["userInfo"]["stats"]
-            followers = int(stats.get("followerCount", 0))
-        elif "user" in data:
-            user = data["user"]
-            # ScrapTik may return stats separately or inline inside user
-            if "stats" in data:
-                followers = int(data["stats"].get("followerCount", 0))
-            elif "followerCount" in user:
-                followers = int(user.get("followerCount", 0))
-            elif "stats" in user:
-                followers = int(user["stats"].get("followerCount", 0))
-            else:
-                followers = 0
-        else:
-            raise KeyError("no recognisable user key")
-    except KeyError as exc:
-        raise ValueError(f"Unexpected TikTok API response. Raw: {str(data)[:500]}") from exc
-
-    nickname = user.get("nickname", user.get("uniqueId", username))
-    dreamyvr_views, dreamyvr_count, followers_from_posts = await fetch_tiktok_posts_data(username)
-
-    # Use followers from posts if get-user didn't return it
-    if followers == 0:
-        followers = followers_from_posts
+    dreamyvr_views, dreamyvr_count, followers = await fetch_tiktok_posts_data(username)
 
     return {
         "channel_name":   nickname,
