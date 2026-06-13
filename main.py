@@ -142,6 +142,7 @@ async def fetch_youtube_stats(url: str):
             }
             async with session.get(f"{base}/channels", params=params) as r:
                 data = await r.json()
+            print(f"[YouTube forHandle] value={value} response={str(data)[:300]}", flush=True)
             items = data.get("items", [])
             if not items:
                 # Fallback to search
@@ -154,6 +155,7 @@ async def fetch_youtube_stats(url: str):
                 }
                 async with session.get(f"{base}/search", params=params) as r:
                     data = await r.json()
+                print(f"[YouTube search fallback] response={str(data)[:300]}", flush=True)
                 items = data.get("items", [])
                 if not items:
                     raise ValueError("YouTube channel not found.")
