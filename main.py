@@ -862,8 +862,7 @@ async def handle_streak(message: discord.Message):
             announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
             if announce:
                 await announce.send(
-                    f"<:Sneeze:1495243609035899023> <@{uid}>, you've acquired a chat streak!
-"
+                    f"<:Sneeze:1495243609035899023> <@{uid}>, you have acquired a chat streak!\n"
                     f"**Streak:** `{data['streak']}`"
                 )
 
@@ -884,8 +883,7 @@ async def handle_streak(message: discord.Message):
                 announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
                 if announce:
                     await announce.send(
-                        f"<:Sneeze:1495243609035899023> <@{uid}>, you've acquired a chat streak!
-"
+                        f"<:Sneeze:1495243609035899023> <@{uid}>, you have acquired a chat streak!\n"
                         f"**Streak:** `{data['streak']}`"
                     )
 
