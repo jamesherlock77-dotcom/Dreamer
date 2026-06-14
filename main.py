@@ -686,6 +686,22 @@ async def weekly_reset():
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
+# ── Member count voice channel ───────────────────────────────────────────────
+MEMBER_COUNT_CHANNEL_ID = 1512865382782865529  # replace with your actual voice channel ID
+
+async def update_member_count(guild: discord.Guild):
+    channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    if channel:
+        await channel.edit(name=f"Members: {guild.member_count}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    await update_member_count(member.guild)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    await update_member_count(member.guild)
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
