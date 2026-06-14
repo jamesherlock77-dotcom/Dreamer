@@ -98,7 +98,12 @@ async def _build_links_cache() -> dict:
             if field.name == "URL":
                 url = field.value
         if platform and url:
-            seen_users[uid] = {"user_id": uid, "platform": platform, "url": url}
+            if uid not in seen_users:
+                seen_users[uid] = []
+            # Replace existing entry for same platform, otherwise append
+            existing = [e for e in seen_users[uid] if e["platform"] != platform]
+            existing.append({"user_id": uid, "platform": platform, "url": url})
+            seen_users[uid] = existing
 
     _approved_links_cache      = seen_users
     _approved_links_cache_time = now
@@ -110,17 +115,33 @@ def _invalidate_links_cache():
     _approved_links_cache_time = 0
 
 # ── Helper: find approved link for a user ────────────────────────────────────
-async def get_approved_link(user_id: int):
+async def get_approved_link(user_id: int, platform: str = None):
     cache = await _build_links_cache()
-    entry = cache.get(str(user_id))
-    if entry:
-        return entry["platform"], entry["url"]
-    return None, None
+    entries = cache.get(str(user_id))
+    if not entries:
+        return None, None
+    # Support list of entries per user (multiple platforms)
+    if isinstance(entries, list):
+        if platform:
+            for e in entries:
+                if e["platform"] == platform:
+                    return e["platform"], e["url"]
+        return entries[0]["platform"], entries[0]["url"]
+    # Single entry (legacy)
+    if platform and entries["platform"] != platform:
+        return None, None
+    return entries["platform"], entries["url"]
 
 # ── Helper: get all approved links ───────────────────────────────────────────
 async def get_all_approved_links() -> list[dict]:
     cache = await _build_links_cache()
-    return list(cache.values())
+    result = []
+    for entries in cache.values():
+        if isinstance(entries, list):
+            result.extend(entries)
+        else:
+            result.append(entries)
+    return result
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 def extract_youtube_channel_id_from_url(url: str):
@@ -479,13 +500,9 @@ class LinkReviewView(discord.ui.View):
 async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube", "TikTok"]):
     await interaction.response.send_message("Fetching your stats, please wait...")
 
-    saved_platform, url = await get_approved_link(interaction.user.id)
+    saved_platform, url = await get_approved_link(interaction.user.id, platform)
     if not saved_platform:
-        await interaction.edit_original_response(content="You don't have an approved channel link yet. Use `/link` to submit one.")
-        return
-
-    if saved_platform != platform:
-        await interaction.edit_original_response(content=f"Your approved link is for **{saved_platform}**, not {platform}.")
+        await interaction.edit_original_response(content=f"You don't have an approved **{platform}** link yet. Use `/link` to submit one.")
         return
 
     try:
