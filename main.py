@@ -20,6 +20,11 @@ RESET_TIME         = time(23, 0)
 RESET_WEEKDAY      = 6
 TIMEZONE           = pytz.timezone("UTC")
 
+# ── Cache ────────────────────────────────────────────────────────────────────
+_approved_links_cache: dict | None = None
+_approved_links_cache_time: float  = 0
+CACHE_TTL = 300  # seconds (5 minutes)
+
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -62,28 +67,16 @@ async def tally_counts() -> dict:
                 counts[uid] = counts.get(uid, 0) + 1
     return counts
 
-# ── Helper: find approved link for a user ────────────────────────────────────
-async def get_approved_link(user_id: int):
-    log_channel = bot.get_channel(LINK_LOG_CHANNEL)
-    uid_str = str(user_id)
-    async for msg in log_channel.history(limit=None, oldest_first=False):
-        if not msg.embeds:
-            continue
-        embed = msg.embeds[0]
-        if embed.footer and embed.footer.text and uid_str in embed.footer.text:
-            platform = None
-            url      = None
-            for field in embed.fields:
-                if field.name == "Platform":
-                    platform = field.value
-                if field.name == "URL":
-                    url = field.value
-            if platform and url:
-                return platform, url
-    return None, None
+# ── Helper: build approved links cache ───────────────────────────────────────
+async def _build_links_cache() -> dict:
+    """Scan LINK_LOG_CHANNEL once and cache results. Returns {uid: {platform, url}}."""
+    import time as _time
+    global _approved_links_cache, _approved_links_cache_time
 
-# ── Helper: get all approved links ───────────────────────────────────────────
-async def get_all_approved_links() -> list[dict]:
+    now = _time.monotonic()
+    if _approved_links_cache is not None and (now - _approved_links_cache_time) < CACHE_TTL:
+        return _approved_links_cache
+
     log_channel = bot.get_channel(LINK_LOG_CHANNEL)
     seen_users  = {}
     async for msg in log_channel.history(limit=None, oldest_first=True):
@@ -106,7 +99,28 @@ async def get_all_approved_links() -> list[dict]:
                 url = field.value
         if platform and url:
             seen_users[uid] = {"user_id": uid, "platform": platform, "url": url}
-    return list(seen_users.values())
+
+    _approved_links_cache      = seen_users
+    _approved_links_cache_time = now
+    return seen_users
+
+def _invalidate_links_cache():
+    global _approved_links_cache, _approved_links_cache_time
+    _approved_links_cache      = None
+    _approved_links_cache_time = 0
+
+# ── Helper: find approved link for a user ────────────────────────────────────
+async def get_approved_link(user_id: int):
+    cache = await _build_links_cache()
+    entry = cache.get(str(user_id))
+    if entry:
+        return entry["platform"], entry["url"]
+    return None, None
+
+# ── Helper: get all approved links ───────────────────────────────────────────
+async def get_all_approved_links() -> list[dict]:
+    cache = await _build_links_cache()
+    return list(cache.values())
 
 # ── YouTube helpers ───────────────────────────────────────────────────────────
 def extract_youtube_channel_id_from_url(url: str):
@@ -431,6 +445,7 @@ class LinkReviewView(discord.ui.View):
         log_embed.add_field(name="URL", value=self.url, inline=False)
         log_embed.set_footer(text=f"Approved by {interaction.user} • User ID: {self.submitter.id}")
         await log_channel.send(embed=log_embed)
+        _invalidate_links_cache()
 
         done_embed = discord.Embed(title="🔗 Link Request — Accepted", color=0x2ECC71)
         done_embed.add_field(name="User", value=self.submitter.mention, inline=True)
