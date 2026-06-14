@@ -539,6 +539,73 @@ async def message(interaction: discord.Interaction, content: str):
     await interaction.channel.send(content)
     await interaction.response.send_message("Message sent!", ephemeral=True)
 
+# ── /adminlink ───────────────────────────────────────────────────────────────
+@tree.command(name="adminlink", description="Manually approve a link for a user")
+@app_commands.describe(user="The Discord user", platform="Platform", handle="YouTube or TikTok URL/handle")
+@app_commands.checks.has_permissions(administrator=True)
+async def adminlink(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"], handle: str):
+    # Normalise handle into a full URL
+    if platform == "YouTube":
+        if "youtube.com" not in handle and "youtu.be" not in handle:
+            handle = f"https://www.youtube.com/@{handle.lstrip('@')}"
+    elif platform == "TikTok":
+        if "tiktok.com" not in handle:
+            handle = f"https://www.tiktok.com/@{handle.lstrip('@')}"
+
+    log_channel = bot.get_channel(LINK_LOG_CHANNEL)
+    if not log_channel:
+        await interaction.response.send_message("Could not reach the log channel.", ephemeral=True)
+        return
+
+    log_embed = discord.Embed(title="✅ Approved Link", color=0x808080)
+    log_embed.add_field(name="User",     value=user.mention,  inline=True)
+    log_embed.add_field(name="Platform", value=platform,       inline=True)
+    log_embed.add_field(name="URL",      value=handle,         inline=False)
+    log_embed.set_footer(text=f"Approved by {interaction.user} • User ID: {user.id}")
+    await log_channel.send(embed=log_embed)
+    _invalidate_links_cache()
+
+    await interaction.response.send_message(
+        f"✅ Manually approved **{platform}** link for {user.mention}: {handle}", ephemeral=True)
+
+# ── /adminccstats ─────────────────────────────────────────────────────────────
+@tree.command(name="adminccstats", description="View stats for any linked user")
+@app_commands.describe(user="The Discord user to look up", platform="Which platform to show stats for")
+@app_commands.checks.has_permissions(administrator=True)
+async def adminccstats(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"]):
+    await interaction.response.send_message(f"Fetching {platform} stats for {user.mention}, please wait...")
+
+    saved_platform, url = await get_approved_link(user.id, platform)
+    if not saved_platform:
+        await interaction.edit_original_response(content=f"{user.mention} doesn't have an approved **{platform}** link.")
+        return
+
+    try:
+        if platform == "YouTube":
+            stats = await fetch_youtube_stats(url)
+            embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
+            embed.add_field(name="Platform",         value="YouTube",                        inline=True)
+            embed.add_field(name="Subscribers",      value=f"`{stats['subscribers']:,}`",    inline=True)
+            embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
+            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
+            embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
+            await interaction.edit_original_response(content=None, embed=embed)
+
+        elif platform == "TikTok":
+            stats = await fetch_tiktok_stats(url)
+            embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
+            embed.add_field(name="Platform",         value="TikTok",                         inline=True)
+            embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
+            embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
+            embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
+            embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
+            await interaction.edit_original_response(content=None, embed=embed)
+
+    except ValueError as e:
+        await interaction.edit_original_response(content=f"Error fetching stats: {e}")
+    except Exception as e:
+        await interaction.edit_original_response(content=f"Something went wrong: {e}")
+
 # ── /contentfullstats ─────────────────────────────────────────────────────────
 @tree.command(name="contentfullstats", description="Show stats for every linked creator")
 async def contentfullstats(interaction: discord.Interaction):
