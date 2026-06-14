@@ -38,7 +38,7 @@ tree = bot.tree
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898):
+    if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL):
         return
 
     db_channel = bot.get_channel(DB_CHANNEL_ID)
@@ -54,6 +54,7 @@ async def on_message(message: discord.Message):
             await message.delete()
             return
 
+    await handle_streak(message)
     await bot.process_commands(message)
 
 # ── Helper: tally message counts ─────────────────────────────────────────────
@@ -686,6 +687,214 @@ async def weekly_reset():
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
+# ── Streak config ────────────────────────────────────────────────────────────
+STREAK_DB_CHANNEL    = 1515834119727222834
+STREAK_ANNOUNCE_CHANNEL = 1423121104675016768
+STREAK_ROLES = {
+    1:   1495573627217641604,
+    3:   1495573632984813639,
+    7:   1495573635459448842,
+    14:  1495573637800136844,
+    30:  1495573640132034670,
+    60:  1495573754921877687,
+    100: 1495573763004039380,
+}
+MESSAGES_REQUIRED = 3       # messages needed to earn/continue streak
+STREAK_WINDOW_HOURS = 24    # hours after which streak window opens
+STREAK_GRACE_HOURS  = 4     # hours the window stays open
+
+# In-memory streak state — loaded from DB channel on startup
+# { user_id: { streak, messages_today, last_streak_time, window_open } }
+streak_data: dict = {}
+
+# ── Streak DB helpers ─────────────────────────────────────────────────────────
+def _streak_encode(uid: str, data: dict) -> str:
+    import json
+    return f"STREAK:{uid}:{json.dumps(data)}"
+
+async def _save_streak(uid: str):
+    import json
+    db = bot.get_channel(STREAK_DB_CHANNEL)
+    if not db:
+        return
+    payload = json.dumps(streak_data[uid])
+    await db.send(f"STREAK:{uid}:{payload}")
+
+async def _load_streaks():
+    import json
+    db = bot.get_channel(STREAK_DB_CHANNEL)
+    if not db:
+        return
+    latest = {}  # uid -> latest record
+    async for msg in db.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        content = msg.content
+        if not content.startswith("STREAK:"):
+            continue
+        parts = content.split(":", 2)
+        if len(parts) != 3:
+            continue
+        uid = parts[1]
+        try:
+            latest[uid] = json.loads(parts[2])
+        except Exception:
+            continue
+    streak_data.update(latest)
+    print(f"[Streaks] Loaded {len(streak_data)} streak records.", flush=True)
+
+def _get_streak(uid: str) -> dict:
+    return streak_data.get(uid, {
+        "streak":          0,
+        "messages_today":  0,
+        "last_streak_time": None,  # ISO timestamp of when last streak was earned
+        "pending":         False,  # True when window is open and waiting for 3 msgs
+    })
+
+async def _update_streak_roles(member: discord.Member, streak: int):
+    """Give the highest earned role, remove all lower ones."""
+    guild = member.guild
+    earned_role_id = None
+    for threshold in sorted(STREAK_ROLES.keys()):
+        if streak >= threshold:
+            earned_role_id = STREAK_ROLES[threshold]
+
+    for threshold, role_id in STREAK_ROLES.items():
+        role = guild.get_role(role_id)
+        if not role:
+            continue
+        if role_id == earned_role_id:
+            if role not in member.roles:
+                await member.add_roles(role)
+        else:
+            if role in member.roles:
+                await member.remove_roles(role)
+
+async def _remove_all_streak_roles(member: discord.Member):
+    guild = member.guild
+    for role_id in STREAK_ROLES.values():
+        role = guild.get_role(role_id)
+        if role and role in member.roles:
+            await member.remove_roles(role)
+
+# ── Streak checker loop ───────────────────────────────────────────────────────
+@tasks.loop(minutes=5)
+async def streak_checker():
+    from datetime import datetime, timezone, timedelta
+    import json
+    now = datetime.now(timezone.utc)
+    to_break = []
+
+    for uid, data in streak_data.items():
+        if not data.get("last_streak_time"):
+            continue
+        last = datetime.fromisoformat(data["last_streak_time"])
+        elapsed = (now - last).total_seconds() / 3600
+
+        # Window opens after 24h and closes after 28h
+        window_start = STREAK_WINDOW_HOURS
+        window_end   = STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
+
+        if elapsed >= window_end and data.get("streak", 0) > 0:
+            # Missed the window — break streak
+            to_break.append(uid)
+
+    for uid in to_break:
+        data = streak_data[uid]
+        old_streak = data["streak"]
+        data["streak"]         = 0
+        data["messages_today"] = 0
+        data["pending"]        = False
+        await _save_streak(uid)
+
+        # Announce
+        announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
+        if announce:
+            await announce.send(f"💔 <@{uid}>, you have lost your streak of `{old_streak}`!")
+
+        # Remove roles
+        for guild in bot.guilds:
+            member = guild.get_member(int(uid))
+            if member:
+                await _remove_all_streak_roles(member)
+
+# ── Streak message handler ────────────────────────────────────────────────────
+async def handle_streak(message: discord.Message):
+    from datetime import datetime, timezone, timedelta
+    uid  = str(message.author.id)
+    now  = datetime.now(timezone.utc)
+    data = _get_streak(uid)
+
+    last_time = None
+    if data.get("last_streak_time"):
+        last_time = datetime.fromisoformat(data["last_streak_time"])
+
+    elapsed_hours = (now - last_time).total_seconds() / 3600 if last_time else None
+
+    # Determine if we're in the continuation window (24-28h after last streak)
+    in_window = (
+        last_time is not None
+        and STREAK_WINDOW_HOURS <= elapsed_hours <= (STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS)
+    )
+
+    # If no streak yet or past the window, treat as fresh start (pending first streak)
+    if last_time is None or (elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS):
+        # Reset messages if starting fresh
+        if last_time is None or elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS:
+            data["messages_today"] = 0
+            data["pending"]        = True
+
+    # Count this message
+    data["messages_today"] = data.get("messages_today", 0) + 1
+    streak_data[uid] = data
+
+    # Check if earned
+    if data["messages_today"] >= MESSAGES_REQUIRED:
+        if in_window or last_time is None or (elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS and data["streak"] == 0):
+            # Earn/continue streak
+            data["streak"]          = data.get("streak", 0) + 1
+            data["messages_today"]  = 0
+            data["last_streak_time"] = now.isoformat()
+            data["pending"]         = False
+            streak_data[uid]        = data
+            await _save_streak(uid)
+
+            announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
+            if announce:
+                await announce.send(
+                    f"<:Sneeze:1495243609035899023> <@{uid}>, you've acquired a chat streak!
+"
+                    f"**Streak:** `{data['streak']}`"
+                )
+
+            member = message.guild.get_member(message.author.id) if message.guild else None
+            if member:
+                await _update_streak_roles(member, data["streak"])
+
+        elif last_time is None or elapsed_hours < STREAK_WINDOW_HOURS:
+            # Still in the same period, earning first streak (no previous streak)
+            if data.get("streak", 0) == 0:
+                data["streak"]           = 1
+                data["messages_today"]   = 0
+                data["last_streak_time"] = now.isoformat()
+                data["pending"]          = False
+                streak_data[uid]         = data
+                await _save_streak(uid)
+
+                announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
+                if announce:
+                    await announce.send(
+                        f"<:Sneeze:1495243609035899023> <@{uid}>, you've acquired a chat streak!
+"
+                        f"**Streak:** `{data['streak']}`"
+                    )
+
+                member = message.guild.get_member(message.author.id) if message.guild else None
+                if member:
+                    await _update_streak_roles(member, data["streak"])
+    else:
+        await _save_streak(uid)
+
 # ── Member count voice channel ───────────────────────────────────────────────
 MEMBER_COUNT_CHANNEL_ID = 1512865382782865529  # replace with your actual voice channel ID
 
@@ -707,6 +916,8 @@ async def on_member_remove(member: discord.Member):
 async def on_ready():
     await tree.sync()
     weekly_reset.start()
+    streak_checker.start()
+    await _load_streaks()
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 bot.run(TOKEN)
