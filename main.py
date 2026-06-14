@@ -20,6 +20,22 @@ RESET_TIME         = time(23, 0)
 RESET_WEEKDAY      = 6
 TIMEZONE           = pytz.timezone("UTC")
 
+# ── Streak config ────────────────────────────────────────────────────────────
+STREAK_DB_CHANNEL       = 1515834119727222834
+STREAK_ANNOUNCE_CHANNEL = 1423121104675016768
+STREAK_ROLES = {
+    1:   1495573627217641604,
+    3:   1495573632984813639,
+    7:   1495573635459448842,
+    14:  1495573637800136844,
+    30:  1495573640132034670,
+    60:  1495573754921877687,
+    100: 1495573763004039380,
+}
+MESSAGES_REQUIRED   = 3   # messages needed to earn/continue streak
+STREAK_WINDOW_HOURS = 24  # hours after which streak window opens
+STREAK_GRACE_HOURS  = 4   # hours the window stays open
+
 # ── Cache ────────────────────────────────────────────────────────────────────
 _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
@@ -687,21 +703,7 @@ async def weekly_reset():
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
-# ── Streak config ────────────────────────────────────────────────────────────
-STREAK_DB_CHANNEL    = 1515834119727222834
-STREAK_ANNOUNCE_CHANNEL = 1423121104675016768
-STREAK_ROLES = {
-    1:   1495573627217641604,
-    3:   1495573632984813639,
-    7:   1495573635459448842,
-    14:  1495573637800136844,
-    30:  1495573640132034670,
-    60:  1495573754921877687,
-    100: 1495573763004039380,
-}
-MESSAGES_REQUIRED = 3       # messages needed to earn/continue streak
-STREAK_WINDOW_HOURS = 24    # hours after which streak window opens
-STREAK_GRACE_HOURS  = 4     # hours the window stays open
+
 
 # In-memory streak state — loaded from DB channel on startup
 # { user_id: { streak, messages_today, last_streak_time, window_open } }
@@ -820,43 +822,32 @@ async def streak_checker():
 
 # ── Streak message handler ────────────────────────────────────────────────────
 async def handle_streak(message: discord.Message):
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     uid  = str(message.author.id)
     now  = datetime.now(timezone.utc)
     data = _get_streak(uid)
 
-    last_time = None
-    if data.get("last_streak_time"):
-        last_time = datetime.fromisoformat(data["last_streak_time"])
-
+    last_time     = datetime.fromisoformat(data["last_streak_time"]) if data.get("last_streak_time") else None
     elapsed_hours = (now - last_time).total_seconds() / 3600 if last_time else None
 
-    # Determine if we're in the continuation window (24-28h after last streak)
-    in_window = (
-        last_time is not None
-        and STREAK_WINDOW_HOURS <= elapsed_hours <= (STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS)
-    )
-
-    # If no streak yet or past the window, treat as fresh start (pending first streak)
-    if last_time is None or (elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS):
-        # Reset messages if starting fresh
-        if last_time is None or elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS:
-            data["messages_today"] = 0
-            data["pending"]        = True
+    # Past grace window — reset message count so they can start fresh
+    if elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS:
+        data["messages_today"] = 0
 
     # Count this message
     data["messages_today"] = data.get("messages_today", 0) + 1
     streak_data[uid] = data
+    print(f"[Streak] {message.author} msgs={data['messages_today']} streak={data.get('streak',0)} elapsed={elapsed_hours}", flush=True)
 
-    # Check if earned
     if data["messages_today"] >= MESSAGES_REQUIRED:
-        if in_window or last_time is None or (elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS and data["streak"] == 0):
-            # Earn/continue streak
-            data["streak"]          = data.get("streak", 0) + 1
-            data["messages_today"]  = 0
+        in_window    = last_time is not None and STREAK_WINDOW_HOURS <= elapsed_hours <= STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
+        no_streak_yet = last_time is None or data.get("streak", 0) == 0
+
+        if in_window or no_streak_yet:
+            data["streak"]           = data.get("streak", 0) + 1
+            data["messages_today"]   = 0
             data["last_streak_time"] = now.isoformat()
-            data["pending"]         = False
-            streak_data[uid]        = data
+            streak_data[uid]         = data
             await _save_streak(uid)
 
             announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
@@ -869,27 +860,8 @@ async def handle_streak(message: discord.Message):
             member = message.guild.get_member(message.author.id) if message.guild else None
             if member:
                 await _update_streak_roles(member, data["streak"])
-
-        elif last_time is None or elapsed_hours < STREAK_WINDOW_HOURS:
-            # Still in the same period, earning first streak (no previous streak)
-            if data.get("streak", 0) == 0:
-                data["streak"]           = 1
-                data["messages_today"]   = 0
-                data["last_streak_time"] = now.isoformat()
-                data["pending"]          = False
-                streak_data[uid]         = data
-                await _save_streak(uid)
-
-                announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
-                if announce:
-                    await announce.send(
-                        f"<:Sneeze:1495243609035899023> <@{uid}>, you have acquired a chat streak!\n"
-                        f"**Streak:** `{data['streak']}`"
-                    )
-
-                member = message.guild.get_member(message.author.id) if message.guild else None
-                if member:
-                    await _update_streak_roles(member, data["streak"])
+        else:
+            await _save_streak(uid)
     else:
         await _save_streak(uid)
 
