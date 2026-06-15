@@ -5,7 +5,7 @@ import os
 import re
 import json
 import aiohttp
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from typing import Literal
 
@@ -183,22 +183,37 @@ async def handle_mod_rewards(message: discord.Message):
         if message.id in _thanked_messages:
             return
         targets = []
-        if message.reference and message.reference.message_id:
-            try:
-                replied = await message.channel.fetch_message(message.reference.message_id)
-                replied_member = message.guild.get_member(replied.author.id)
-                if _is_mod(replied_member) and replied.author.id != message.author.id:
-                    targets.append(replied_member)
-            except (discord.NotFound, discord.Forbidden):
-                pass
+
+        # Check cooldowns for thanking staff
+        now = datetime.now(pytz.UTC)
+        # Initialize cooldown cache if not exist
+        if not hasattr(_thank_cooldowns, 'data'):
+            _thank_cooldowns.data = {}
+        cooldowns = _thank_cooldowns.data
+
         for m in message.mentions:
             mem = message.guild.get_member(m.id)
-            if _is_mod(mem) and mem.id != message.author.id and mem not in targets:
+            if _is_mod(mem) and mem.id != message.author.id:
+                # Check cooldown
+                last_thank_time = cooldowns.get(str(m.id))
+                if last_thank_time:
+                    last_time = datetime.fromisoformat(last_thank_time)
+                    if (now - last_time) < timedelta(minutes=20):
+                        continue  # still in cooldown
+                # Save new timestamp
+                cooldowns[str(m.id)] = now.isoformat()
                 targets.append(mem)
+
+        # Save cooldowns back to attribute
+        _thank_cooldowns.data = cooldowns
+
         if targets:
             _thanked_messages.add(message.id)
             for staff in targets:
                 await _award_points(staff.id, PTS_THANKS, "thanks")
+
+# ── Additional cooldown tracking for thanks ─────────────────────────────────
+_thank_cooldowns: object = type('CooldownDict', (), {})()
 
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
@@ -798,10 +813,12 @@ async def modleaderboard(interaction: discord.Interaction):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
         lines.append(f"> **{i + 1}.** {name} - `({data['total']})` mod points")
-    await interaction.followup.send(
-        "\n".join(lines),
-        allowed_mentions=discord.AllowedMentions.none(),
+    embed = discord.Embed(
+        title="__Staff Point Leaderboard__",
+        description="\n".join(lines),
+        color=0x808080,
     )
+    await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
