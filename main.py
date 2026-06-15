@@ -704,7 +704,6 @@ async def weekly_reset():
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
 
-
 # In-memory streak state — loaded from DB channel on startup
 # { user_id: { streak, messages_today, last_streak_time, window_open } }
 streak_data: dict = {}
@@ -866,7 +865,7 @@ async def handle_streak(message: discord.Message):
         await _save_streak(uid)
 
 # ── Member count voice channel ───────────────────────────────────────────────
-MEMBER_COUNT_CHANNEL_ID = 1512865382782865529  # replace with your actual voice channel ID
+MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
 
 async def update_member_count(guild: discord.Guild):
     channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
@@ -932,9 +931,13 @@ async def post_ticket_panel():
             await msg.delete()
 
     embed = discord.Embed(
-        title="🎫  How to Create a ticket",
+        title="🎫  How to Create a Ticket",
         description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
         color=0x2b2d31,
+    )
+    embed.set_author(
+        name="Dreamy VR Support System",
+        icon_url=channel.guild.icon.url if channel.guild.icon else None,
     )
     embed.add_field(
         name="📋  Ticket Rules",
@@ -947,8 +950,7 @@ async def post_ticket_panel():
         ),
         inline=False,
     )
-    embed.set_author(name="Dreamy VR", icon_url=channel.guild.icon.url if channel.guild.icon else None)
-    embed.set_image(url="https://i.imgur.com/0000000.png")  # replace with your banner URL
+    embed.set_image(url="https://cdn.discordapp.com/attachments/1495388852020445255/1495396291914629362/SUPORTTICKETS.png?ex=6a313d53&is=6a2febd3&hm=ac38999087c38cc8f5687a7c8c1e16aa5d71f8f568e3c123cef33ff2693b012c")
 
     await channel.send(embed=embed, view=TicketPanelView())
     print("[Tickets] Panel posted.", flush=True)
