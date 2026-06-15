@@ -549,7 +549,7 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
         await interaction.edit_original_response(content=f"Something went wrong: {e}")
 
 # ── /message ─────────────────────────────────────────────────────────────────
-@tree.command(name="message", description="Send a message as the bot")
+@tree.command(name="message", default_member_permissions=discord.Permissions(administrator=True), description="Send a message as the bot")
 @app_commands.describe(content="The message to send")
 @app_commands.checks.has_permissions(administrator=True)
 async def message(interaction: discord.Interaction, content: str):
@@ -557,7 +557,7 @@ async def message(interaction: discord.Interaction, content: str):
     await interaction.response.send_message("Message sent!", ephemeral=True)
 
 # ── /adminlink ───────────────────────────────────────────────────────────────
-@tree.command(name="adminlink", description="Manually approve a link for a user")
+@tree.command(name="adminlink", default_member_permissions=discord.Permissions(administrator=True), description="Manually approve a link for a user")
 @app_commands.describe(user="The Discord user", platform="Platform", handle="YouTube or TikTok URL/handle")
 @app_commands.checks.has_permissions(administrator=True)
 async def adminlink(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"], handle: str):
@@ -586,7 +586,7 @@ async def adminlink(interaction: discord.Interaction, user: discord.Member, plat
         f"✅ Manually approved **{platform}** link for {user.mention}: {handle}", ephemeral=True)
 
 # ── /adminccstats ─────────────────────────────────────────────────────────────
-@tree.command(name="adminccstats", description="View stats for any linked user")
+@tree.command(name="adminccstats", default_member_permissions=discord.Permissions(administrator=True), description="View stats for any linked user")
 @app_commands.describe(user="The Discord user to look up", platform="Which platform to show stats for")
 @app_commands.checks.has_permissions(administrator=True)
 async def adminccstats(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"]):
@@ -624,7 +624,7 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
         await interaction.edit_original_response(content=f"Something went wrong: {e}")
 
 # ── /contentfullstats ─────────────────────────────────────────────────────────
-@tree.command(name="contentfullstats", description="Show stats for every linked creator")
+@tree.command(name="contentfullstats", default_member_permissions=discord.Permissions(administrator=True), description="Show stats for every linked creator")
 async def contentfullstats(interaction: discord.Interaction):
     await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
 
@@ -881,13 +881,87 @@ async def on_member_join(member: discord.Member):
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
 
+# ── Ticket config ────────────────────────────────────────────────────────────
+TICKET_PANEL_CHANNEL = 1495162997734117386
+
+# ── Ticket panel ─────────────────────────────────────────────────────────────
+class TicketSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="Dreamy VR Discord Support",
+                emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
+                value="discord_support",
+                description="Get help with Discord-related issues",
+            ),
+            discord.SelectOption(
+                label="Dreamy VR In-Game Support",
+                emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
+                value="ingame_support",
+                description="Get help with in-game issues",
+            ),
+        ]
+        super().__init__(
+            placeholder="Click the option that best matches your issue...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="ticket_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            f"You selected **{self.values[0]}** — ticket creation coming soon!",
+            ephemeral=True,
+        )
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketSelect())
+
+async def post_ticket_panel():
+    channel = bot.get_channel(TICKET_PANEL_CHANNEL)
+    if not channel:
+        print("[Tickets] Could not find ticket panel channel.", flush=True)
+        return
+
+    # Delete old bot messages in the channel
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user:
+            await msg.delete()
+
+    embed = discord.Embed(
+        title="🎫  How to Create a ticket",
+        description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
+        color=0x2b2d31,
+    )
+    embed.add_field(
+        name="📋  Ticket Rules",
+        value=(
+            "`1.` Only open tickets for valid issues such as in-game problems or Discord-related reports.\n"
+            "`2.` Do not open tickets to ask for staff roles, free items, or currency.\n"
+            "`3.` Do not use tickets to report bugs, use the proper bug report channel instead.\n"
+            "`4.` Be respectful and provide clear, detailed information about your issue.\n"
+            "`5.` Do not spam or open multiple tickets for the same issue."
+        ),
+        inline=False,
+    )
+    embed.set_author(name="Dreamy VR", icon_url=channel.guild.icon.url if channel.guild.icon else None)
+    embed.set_image(url="https://i.imgur.com/0000000.png")  # replace with your banner URL
+
+    await channel.send(embed=embed, view=TicketPanelView())
+    print("[Tickets] Panel posted.", flush=True)
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
+    bot.add_view(TicketPanelView())
     await tree.sync()
     weekly_reset.start()
     streak_checker.start()
     await _load_streaks()
+    await post_ticket_panel()
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 bot.run(TOKEN)
