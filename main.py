@@ -101,13 +101,13 @@ async def _tally_mod_points() -> dict:
 async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
     """Look back a few messages to find the mod who triggered Dyno."""
     try:
-        async for m in channel.history(limit=10):
+        async for m in channel.history(limit=25):
             if m.author.bot:
                 continue
             content = (m.content or "").lower()
-            if not content.startswith(DYNO_PREFIXES):
+            if keyword not in content:
                 continue
-            if keyword in content:
+            if content.startswith(DYNO_PREFIXES) or content.startswith(f"/{keyword}"):
                 return m.author
     except (discord.Forbidden, discord.HTTPException):
         pass
@@ -124,19 +124,46 @@ async def handle_dyno_warn(message: discord.Message):
         for f in e.fields:
             text_blobs.append(f.name or "")
             text_blobs.append(f.value or "")
+        if e.footer and e.footer.text:
+            text_blobs.append(e.footer.text)
+        if e.author and e.author.name:
+            text_blobs.append(e.author.name)
     combined = " ".join(text_blobs).lower()
     if "warn" not in combined:
         return
-    if not any(kw in combined for kw in ("has been warned", "warned in", "warning issued", "✅")):
-        if "warned" not in combined:
-            return
-    invoker = await _find_dyno_invoker(message.channel, "warn")
-    if not invoker:
+
+    # 1) Try to find a moderator ID inside the embed itself (Dyno often
+    #    includes a "Moderator" field or footer like "Moderator: name (id)").
+    invoker_id = None
+    id_re = re.compile(r"(\d{17,20})")
+    for e in message.embeds:
+        candidates = []
+        for f in e.fields:
+            if "mod" in (f.name or "").lower():
+                candidates.append(f.value or "")
+        if e.footer and e.footer.text and "mod" in e.footer.text.lower():
+            candidates.append(e.footer.text)
+        for c in candidates:
+            m = id_re.search(c)
+            if m:
+                invoker_id = int(m.group(1))
+                break
+        if invoker_id:
+            break
+
+    # 2) Fallback: scan recent channel history for the staff member who
+    #    invoked the warn via a Dyno prefix command.
+    if not invoker_id:
+        invoker = await _find_dyno_invoker(message.channel, "warn")
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
         return
-    member = message.guild.get_member(invoker.id)
+    member = message.guild.get_member(invoker_id)
     if not _is_mod(member):
         return
-    await _award_points(invoker.id, PTS_WARN, "warn")
+    await _award_points(invoker_id, PTS_WARN, "warn")
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -736,7 +763,7 @@ async def modstats(interaction: discord.Interaction, user: discord.Member = None
     if not _is_mod(interaction.user):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     target = user or interaction.user
     tally  = await _tally_mod_points()
     entry  = tally.get(str(target.id), {"total": 0, "breakdown": {}})
@@ -752,7 +779,7 @@ async def modstats(interaction: discord.Interaction, user: discord.Member = None
     embed.add_field(name="Thanks (×2)",   value=f"`{bd.get('thanks', 0)}`",   inline=True)
     embed.add_field(name="Messages (×2/50)", value=f"`{bd.get('messages', 0)}`", inline=True)
     embed.set_footer(text=f"Requested by {interaction.user}")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed)
 
 # ── /modleaderboard ──────────────────────────────────────────────────────────
 @tree.command(name="modleaderboard", description="Top moderators by points (staff only)")
@@ -760,26 +787,21 @@ async def modleaderboard(interaction: discord.Interaction):
     if not _is_mod(interaction.user):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     tally = await _tally_mod_points()
     if not tally:
-        await interaction.followup.send("No mod points tracked yet.", ephemeral=True)
+        await interaction.followup.send("No mod points tracked yet.")
         return
     ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
-    lines = []
-    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    lines = ["**__Staff Point Leaderboard__**"]
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
-        prefix = medals.get(i, f"**{i + 1}.**")
-        lines.append(f"{prefix} {name} — `{data['total']}` pts")
-    embed = discord.Embed(
-        title="🏆 Mod Leaderboard",
-        description="\n".join(lines),
-        color=0xFFD700,
+        lines.append(f"> **{i + 1}.** {name} - `({data['total']})` mod points")
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
     )
-    embed.set_footer(text=f"Requested by {interaction.user}")
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
