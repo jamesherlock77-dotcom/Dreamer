@@ -107,7 +107,8 @@ async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
             content = (m.content or "").lower()
             if keyword not in content:
                 continue
-            return m.author
+            if content.startswith(DYNO_PREFIXES) or content.startswith(f"/{keyword}"):
+                return m.author
     except (discord.Forbidden, discord.HTTPException):
         pass
     return None
@@ -125,42 +126,44 @@ async def handle_dyno_warn(message: discord.Message):
             text_blobs.append(f.value or "")
         if e.footer and e.footer.text:
             text_blobs.append(e.footer.text)
+        if e.author and e.author.name:
+            text_blobs.append(e.author.name)
     combined = " ".join(text_blobs).lower()
     if "warn" not in combined:
         return
-    if not any(kw in combined for kw in ("has been warned", "warned in", "warning issued", "✅")):
-        if "warned" not in combined:
-            return
 
-    # Try to extract moderator ID from embed fields first
-    invoker = None
+    # 1) Try to find a moderator ID inside the embed itself (Dyno often
+    #    includes a "Moderator" field or footer like "Moderator: name (id)").
+    invoker_id = None
+    id_re = re.compile(r"(\d{17,20})")
     for e in message.embeds:
+        candidates = []
         for f in e.fields:
-            if f.name and "moderator" in f.name.lower():
-                match = re.search(r"(\d{17,20})", f.value or "")
-                if match:
-                    uid = int(match.group(1))
-                    invoker = message.guild.get_member(uid)
-                    break
-        if invoker:
+            if "mod" in (f.name or "").lower():
+                candidates.append(f.value or "")
+        if e.footer and e.footer.text and "mod" in e.footer.text.lower():
+            candidates.append(e.footer.text)
+        for c in candidates:
+            m = id_re.search(c)
+            if m:
+                invoker_id = int(m.group(1))
+                break
+        if invoker_id:
             break
-    if not invoker:
-        # Try footer
-        for e in message.embeds:
-            if e.footer and e.footer.text:
-                match = re.search(r"(\d{17,20})", e.footer.text)
-                if match:
-                    uid = int(match.group(1))
-                    invoker = message.guild.get_member(uid)
-                    break
-    if not invoker:
+
+    # 2) Fallback: scan recent channel history for the staff member who
+    #    invoked the warn via a Dyno prefix command.
+    if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
-    if not invoker:
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
         return
-    member = message.guild.get_member(invoker.id) if isinstance(invoker, discord.Member) else invoker
-    if not member or not _is_mod(member):
+    member = message.guild.get_member(invoker_id)
+    if not _is_mod(member):
         return
-    await _award_points(member.id, PTS_WARN, "warn")
+    await _award_points(invoker_id, PTS_WARN, "warn")
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -790,18 +793,15 @@ async def modleaderboard(interaction: discord.Interaction):
         await interaction.followup.send("No mod points tracked yet.")
         return
     ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
-    lines = []
+    lines = ["**__Staff Point Leaderboard__**"]
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
-        lines.append(f"> **{i + 1}.** {name} - {data['total']} mod points")
-    embed = discord.Embed(
-        title="**__Staff Point Leaderboard__**",
-        description="\n".join(lines),
-        color=0x808080,
+        lines.append(f"> **{i + 1}.** {name} - `({data['total']})` mod points")
+    await interaction.followup.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
     )
-    embed.set_footer(text=f"Requested by {interaction.user}")
-    await interaction.followup.send(embed=embed)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
