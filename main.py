@@ -32,14 +32,29 @@ STREAK_ROLES = {
     60:  1495573754921877687,
     100: 1495573763004039380,
 }
-MESSAGES_REQUIRED   = 3   # messages needed to earn/continue streak
-STREAK_WINDOW_HOURS = 24  # hours after which streak window opens
-STREAK_GRACE_HOURS  = 4   # hours the window stays open
+MESSAGES_REQUIRED   = 3
+STREAK_WINDOW_HOURS = 24
+STREAK_GRACE_HOURS  = 4
+
+# ── Mod rewards config ───────────────────────────────────────────────────────
+MOD_ROLE_ID         = 1423121100358811795
+MOD_PTS_DB_CHANNEL  = 1516176492663537875
+DYNO_BOT_ID         = 155149108183695360
+DYNO_PREFIXES       = ("?", "!", ".")  # adjust if your Dyno uses a different prefix
+PTS_BAN             = 3
+PTS_WARN            = 1
+PTS_THANKS          = 2
+PTS_PER_50_MSGS     = 2
+MSG_MILESTONE       = 50
+
+_staff_msg_counts: dict[str, int] = {}
+_thanked_messages: set[int] = set()
+THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
-CACHE_TTL = 300  # seconds (5 minutes)
+CACHE_TTL = 300
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -49,12 +64,124 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
+# ── Mod rewards helpers ──────────────────────────────────────────────────────
+def _is_mod(member) -> bool:
+    if not member or not hasattr(member, "roles"):
+        return False
+    return any(r.id == MOD_ROLE_ID for r in member.roles)
+
+async def _award_points(uid: int, points: int, reason: str):
+    db = bot.get_channel(MOD_PTS_DB_CHANNEL)
+    if db:
+        await db.send(f"MODPTS:{uid}:{points}:{reason}")
+
+async def _tally_mod_points() -> dict:
+    db = bot.get_channel(MOD_PTS_DB_CHANNEL)
+    result: dict = {}
+    if not db:
+        return result
+    async for msg in db.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        if not msg.content.startswith("MODPTS:"):
+            continue
+        parts = msg.content.split(":", 3)
+        if len(parts) < 4:
+            continue
+        _, uid, pts_str, reason = parts
+        try:
+            pts = int(pts_str)
+        except ValueError:
+            continue
+        entry = result.setdefault(uid, {"total": 0, "breakdown": {}})
+        entry["total"] += pts
+        entry["breakdown"][reason] = entry["breakdown"].get(reason, 0) + pts
+    return result
+
+async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
+    """Look back a few messages to find the mod who triggered Dyno."""
+    try:
+        async for m in channel.history(limit=10):
+            if m.author.bot:
+                continue
+            content = (m.content or "").lower()
+            if not content.startswith(DYNO_PREFIXES):
+                continue
+            if keyword in content:
+                return m.author
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return None
+
+async def handle_dyno_warn(message: discord.Message):
+    """Detect Dyno warn confirmation and award 1 point to issuing mod."""
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    text_blobs = [message.content or ""]
+    for e in message.embeds:
+        if e.title:       text_blobs.append(e.title)
+        if e.description: text_blobs.append(e.description)
+        for f in e.fields:
+            text_blobs.append(f.name or "")
+            text_blobs.append(f.value or "")
+    combined = " ".join(text_blobs).lower()
+    if "warn" not in combined:
+        return
+    if not any(kw in combined for kw in ("has been warned", "warned in", "warning issued", "✅")):
+        if "warned" not in combined:
+            return
+    invoker = await _find_dyno_invoker(message.channel, "warn")
+    if not invoker:
+        return
+    member = message.guild.get_member(invoker.id)
+    if not _is_mod(member):
+        return
+    await _award_points(invoker.id, PTS_WARN, "warn")
+
+async def handle_mod_rewards(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    author_member = message.guild.get_member(message.author.id)
+
+    # 50-message milestone for staff
+    if _is_mod(author_member):
+        uid = str(message.author.id)
+        _staff_msg_counts[uid] = _staff_msg_counts.get(uid, 0) + 1
+        if _staff_msg_counts[uid] >= MSG_MILESTONE:
+            _staff_msg_counts[uid] = 0
+            await _award_points(message.author.id, PTS_PER_50_MSGS, "messages")
+
+    # Thank-you detection (non-staff thanking staff)
+    if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
+        if message.id in _thanked_messages:
+            return
+        targets = []
+        if message.reference and message.reference.message_id:
+            try:
+                replied = await message.channel.fetch_message(message.reference.message_id)
+                replied_member = message.guild.get_member(replied.author.id)
+                if _is_mod(replied_member) and replied.author.id != message.author.id:
+                    targets.append(replied_member)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        for m in message.mentions:
+            mem = message.guild.get_member(m.id)
+            if _is_mod(mem) and mem.id != message.author.id and mem not in targets:
+                targets.append(mem)
+        if targets:
+            _thanked_messages.add(message.id)
+            for staff in targets:
+                await _award_points(staff.id, PTS_THANKS, "thanks")
+
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
+    # Dyno warn detection runs even though Dyno is a bot
+    await handle_dyno_warn(message)
+
     if message.author.bot:
         return
-    if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL):
+    if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL, MOD_PTS_DB_CHANNEL):
         return
 
     db_channel = bot.get_channel(DB_CHANNEL_ID)
@@ -71,7 +198,21 @@ async def on_message(message: discord.Message):
             return
 
     await handle_streak(message)
+    await handle_mod_rewards(message)
     await bot.process_commands(message)
+
+# ── Ban detection ────────────────────────────────────────────────────────────
+@bot.event
+async def on_member_ban(guild: discord.Guild, user):
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+            if entry.target and entry.target.id == user.id:
+                mod = entry.user
+                if mod and not mod.bot and _is_mod(guild.get_member(mod.id)):
+                    await _award_points(mod.id, PTS_BAN, "ban")
+                break
+    except discord.Forbidden:
+        pass
 
 # ── Helper: tally message counts ─────────────────────────────────────────────
 async def tally_counts() -> dict:
@@ -86,14 +227,11 @@ async def tally_counts() -> dict:
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
-    """Scan LINK_LOG_CHANNEL once and cache results. Returns {uid: {platform, url}}."""
     import time as _time
     global _approved_links_cache, _approved_links_cache_time
-
     now = _time.monotonic()
     if _approved_links_cache is not None and (now - _approved_links_cache_time) < CACHE_TTL:
         return _approved_links_cache
-
     log_channel = bot.get_channel(LINK_LOG_CHANNEL)
     seen_users  = {}
     async for msg in log_channel.history(limit=None, oldest_first=True):
@@ -117,11 +255,9 @@ async def _build_links_cache() -> dict:
         if platform and url:
             if uid not in seen_users:
                 seen_users[uid] = []
-            # Replace existing entry for same platform, otherwise append
             existing = [e for e in seen_users[uid] if e["platform"] != platform]
             existing.append({"user_id": uid, "platform": platform, "url": url})
             seen_users[uid] = existing
-
     _approved_links_cache      = seen_users
     _approved_links_cache_time = now
     return seen_users
@@ -131,26 +267,22 @@ def _invalidate_links_cache():
     _approved_links_cache      = None
     _approved_links_cache_time = 0
 
-# ── Helper: find approved link for a user ────────────────────────────────────
 async def get_approved_link(user_id: int, platform: str = None):
     cache = await _build_links_cache()
     entries = cache.get(str(user_id))
     if not entries:
         return None, None
-    # Support list of entries per user (multiple platforms)
     if isinstance(entries, list):
         if platform:
             for e in entries:
                 if e["platform"] == platform:
                     return e["platform"], e["url"]
         return entries[0]["platform"], entries[0]["url"]
-    # Single entry (legacy)
     if platform and entries["platform"] != platform:
         return None, None
     return entries["platform"], entries["url"]
 
-# ── Helper: get all approved links ───────────────────────────────────────────
-async def get_all_approved_links() -> list[dict]:
+async def get_all_approved_links() -> list:
     cache = await _build_links_cache()
     result = []
     for entries in cache.values():
@@ -178,36 +310,21 @@ async def fetch_youtube_stats(url: str):
     kind, value = extract_youtube_channel_id_from_url(url)
     if not kind:
         raise ValueError("Couldn't parse that YouTube URL.")
-
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
-
         channel_id = None
         if kind == "id":
             channel_id = value
         elif kind == "handle":
-            # Try forHandle first (newer API)
-            params = {
-                "part": "id,snippet",
-                "forHandle": f"@{value}",
-                "key": YOUTUBE_API_KEY,
-            }
+            params = {"part": "id,snippet", "forHandle": f"@{value}", "key": YOUTUBE_API_KEY}
             async with session.get(f"{base}/channels", params=params) as r:
                 data = await r.json()
-            print(f"[YouTube forHandle] value={value} response={str(data)[:300]}", flush=True)
             items = data.get("items", [])
             if not items:
-                # Fallback to search
-                params = {
-                    "part": "snippet",
-                    "q": value,
-                    "type": "channel",
-                    "maxResults": 1,
-                    "key": YOUTUBE_API_KEY,
-                }
+                params = {"part": "snippet", "q": value, "type": "channel",
+                          "maxResults": 1, "key": YOUTUBE_API_KEY}
                 async with session.get(f"{base}/search", params=params) as r:
                     data = await r.json()
-                print(f"[YouTube search fallback] response={str(data)[:300]}", flush=True)
                 items = data.get("items", [])
                 if not items:
                     raise ValueError("YouTube channel not found.")
@@ -215,11 +332,7 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
         else:
-            params = {
-                "part": "id,snippet",
-                "forUsername": value,
-                "key": YOUTUBE_API_KEY,
-            }
+            params = {"part": "id,snippet", "forUsername": value, "key": YOUTUBE_API_KEY}
             async with session.get(f"{base}/channels", params=params) as r:
                 data = await r.json()
             items = data.get("items", [])
@@ -235,35 +348,24 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        params = {
-            "part": "snippet,statistics",
-            "id": channel_id,
-            "key": YOUTUBE_API_KEY,
-        }
+        params = {"part": "snippet,statistics", "id": channel_id, "key": YOUTUBE_API_KEY}
         async with session.get(f"{base}/channels", params=params) as r:
             data = await r.json()
-
         items = data.get("items", [])
         if not items:
             raise ValueError("Could not fetch YouTube channel stats.")
-
         ch      = items[0]
         stats   = ch.get("statistics", {})
         snippet = ch.get("snippet", {})
 
-        # Fetch #dreamyvr videos via search
         dreamyvr_views = 0
         dreamyvr_count = 0
         next_page_token = None
         async with aiohttp.ClientSession() as search_session:
             while True:
                 search_params = {
-                    "part":       "id",
-                    "channelId":  channel_id,
-                    "q":          "#dreamyvr",
-                    "type":       "video",
-                    "maxResults": 50,
-                    "key":        YOUTUBE_API_KEY,
+                    "part": "id", "channelId": channel_id, "q": "#dreamyvr",
+                    "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
                 }
                 if next_page_token:
                     search_params["pageToken"] = next_page_token
@@ -271,11 +373,7 @@ async def fetch_youtube_stats(url: str):
                     sdata = await sr.json()
                 video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
                 if video_ids:
-                    stats_params = {
-                        "part": "statistics",
-                        "id":   ",".join(video_ids),
-                        "key":  YOUTUBE_API_KEY,
-                    }
+                    stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
                     async with search_session.get(f"{base}/videos", params=stats_params) as vr:
                         vdata = await vr.json()
                     for v in vdata.get("items", []):
@@ -293,23 +391,18 @@ async def fetch_youtube_stats(url: str):
             "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
         }
 
-# ── TikTok helpers (TikAPI) ──────────────────────────────────────────────────
+# ── TikTok helpers ───────────────────────────────────────────────────────────
 def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
 async def _tikapi_get(session: aiohttp.ClientSession, endpoint: str, params: dict = {}) -> dict:
-    """GET a TikAPI endpoint. Auth via X-API-KEY header."""
     async with session.get(
         f"https://api.tikapi.io/{endpoint}",
-        headers={
-            "X-API-KEY": TIKAPI_KEY,
-            "Accept":    "application/json",
-        },
+        headers={"X-API-KEY": TIKAPI_KEY, "Accept": "application/json"},
         params=params,
     ) as r:
         raw = await r.text()
-        print(f"[TikAPI {endpoint}] status={r.status} raw={raw[:300]}", flush=True)
         if r.status != 200:
             raise ValueError(f"TikAPI returned status {r.status}: {raw[:200]}")
         try:
@@ -317,19 +410,13 @@ async def _tikapi_get(session: aiohttp.ClientSession, endpoint: str, params: dic
         except json.JSONDecodeError as e:
             raise ValueError(f"TikAPI returned non-JSON: {raw[:200]}") from e
 
-async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
-    """
-    Fetches user info + all posts via TikAPI.
-    Returns (dreamyvr_views, dreamyvr_count, follower_count).
-    """
+async def fetch_tiktok_posts_data(username: str):
     total_views    = 0
     video_count    = 0
     follower_count = 0
     cursor         = None
     has_more       = True
-
     async with aiohttp.ClientSession() as session:
-        # Step 1: get user info (followers + secUid)
         sec_uid = None
         try:
             user_data      = await _tikapi_get(session, "public/check", {"username": username})
@@ -337,31 +424,23 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
             stats          = user_info.get("stats", {})
             follower_count = int(stats.get("followerCount", 0))
             sec_uid        = user_info.get("user", {}).get("secUid") or user_data.get("secUid")
-        except ValueError as e:
-            print(f"[TikAPI user error] {e}", flush=True)
-
+        except ValueError:
+            pass
         if not sec_uid:
-            print(f"[TikAPI] Could not get secUid for {username}", flush=True)
             return 0, 0, follower_count
-
-        # Step 2: paginate posts
         while has_more:
             params = {"secUid": sec_uid, "count": 30}
             if cursor:
                 params["cursor"] = cursor
             try:
                 data = await _tikapi_get(session, "public/posts", params)
-            except ValueError as e:
-                print(f"[TikAPI posts error] {e}", flush=True)
+            except ValueError:
                 break
-
             videos   = data.get("itemList", [])
             has_more = bool(data.get("hasMore", False))
             cursor   = data.get("cursor", None)
-
             if not videos:
                 break
-
             for video in videos:
                 desc       = video.get("desc", "").lower()
                 challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
@@ -375,28 +454,19 @@ async def fetch_tiktok_posts_data(username: str) -> tuple[int, int, int]:
                     )
                     total_views += int(play_count)
                     video_count += 1
-
     return total_views, video_count, follower_count
-
-
-async def fetch_tiktok_dreamyvr_views(username: str) -> tuple[int, int]:
-    views, count, _ = await fetch_tiktok_posts_data(username)
-    return views, count
 
 async def fetch_tiktok_stats(url: str):
     username = extract_tiktok_username(url)
     if not username:
         raise ValueError("Couldn't parse that TikTok URL.")
-
     async with aiohttp.ClientSession() as session:
         try:
             user_data = await _tikapi_get(session, "public/check", {"username": username})
             nickname  = user_data.get("userInfo", {}).get("user", {}).get("nickname", username)
         except Exception:
             nickname = username
-
     dreamyvr_views, dreamyvr_count, followers = await fetch_tiktok_posts_data(username)
-
     return {
         "channel_name":   nickname,
         "username":       username,
@@ -410,19 +480,16 @@ async def fetch_tiktok_stats(url: str):
 @tree.command(name="messageleaderboard", description="Show the weekly message leaderboard")
 async def messageleaderboard(interaction: discord.Interaction):
     await interaction.response.defer()
-
     counts = await tally_counts()
     if not counts:
         await interaction.followup.send("No messages tracked yet!", ephemeral=True)
         return
-
     sorted_users = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
     lines = []
     for i, (uid, count) in enumerate(sorted_users):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
         lines.append(f"**{i + 1}.** {name} — `{count}` msgs")
-
     embed = discord.Embed(
         title="Weekly Message Leaderboard",
         description="The top 10 most active members this week:\n\n" + "\n".join(lines),
@@ -439,7 +506,6 @@ async def link(interaction: discord.Interaction, platform: Literal["YouTube", "T
         await interaction.response.send_message(
             f"This command can only be used in <#{LINK_CMD_CHANNEL}>.", ephemeral=True)
         return
-
     platform_lower = platform.lower()
     if platform_lower == "youtube" and "youtube.com" not in url and "youtu.be" not in url:
         await interaction.response.send_message("That doesn't look like a valid YouTube URL.", ephemeral=True)
@@ -447,18 +513,15 @@ async def link(interaction: discord.Interaction, platform: Literal["YouTube", "T
     if platform_lower == "tiktok" and "tiktok.com" not in url:
         await interaction.response.send_message("That doesn't look like a valid TikTok URL.", ephemeral=True)
         return
-
     review_channel = bot.get_channel(LINK_LOG_CHANNEL)
     if not review_channel:
         await interaction.response.send_message("Could not reach the review channel.", ephemeral=True)
         return
-
     embed = discord.Embed(title="🔗 New Link Request", color=0xFFA500)
     embed.add_field(name="User", value=interaction.user.mention, inline=True)
     embed.add_field(name="Platform", value=platform, inline=True)
     embed.add_field(name="URL", value=url, inline=False)
     embed.set_footer(text=f"User ID: {interaction.user.id}")
-
     view = LinkReviewView(submitter=interaction.user, platform=platform, url=url, log_channel_id=LINK_LOG_CHANNEL)
     await review_channel.send(embed=embed, view=view)
     await interaction.response.send_message(
@@ -484,14 +547,12 @@ class LinkReviewView(discord.ui.View):
         log_embed.set_footer(text=f"Approved by {interaction.user} • User ID: {self.submitter.id}")
         await log_channel.send(embed=log_embed)
         _invalidate_links_cache()
-
         done_embed = discord.Embed(title="🔗 Link Request — Accepted", color=0x2ECC71)
         done_embed.add_field(name="User", value=self.submitter.mention, inline=True)
         done_embed.add_field(name="Platform", value=self.platform, inline=True)
         done_embed.add_field(name="URL", value=self.url, inline=False)
         done_embed.set_footer(text=f"Accepted by {interaction.user}")
         await interaction.response.edit_message(embed=done_embed, view=None)
-
         try:
             await self.submitter.send(f"Your {self.platform} link has been **accepted**!\n{self.url}")
         except discord.Forbidden:
@@ -505,7 +566,6 @@ class LinkReviewView(discord.ui.View):
         done_embed.add_field(name="URL", value=self.url, inline=False)
         done_embed.set_footer(text=f"Denied by {interaction.user}")
         await interaction.response.edit_message(embed=done_embed, view=None)
-
         try:
             await self.submitter.send(f"Your {self.platform} link submission was **denied**.\n{self.url}")
         except discord.Forbidden:
@@ -516,12 +576,10 @@ class LinkReviewView(discord.ui.View):
 @app_commands.describe(platform="Which platform to show stats for")
 async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube", "TikTok"]):
     await interaction.response.send_message("Fetching your stats, please wait...")
-
     saved_platform, url = await get_approved_link(interaction.user.id, platform)
     if not saved_platform:
         await interaction.edit_original_response(content=f"You don't have an approved **{platform}** link yet. Use `/link` to submit one.")
         return
-
     try:
         if platform == "YouTube":
             stats = await fetch_youtube_stats(url)
@@ -532,7 +590,6 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed.add_field(name="#dreamyvr Views",   value=f"`{stats['dreamyvr_views']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.edit_original_response(content=None, embed=embed)
-
         elif platform == "TikTok":
             stats = await fetch_tiktok_stats(url)
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
@@ -542,7 +599,6 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
             await interaction.edit_original_response(content=None, embed=embed)
-
     except ValueError as e:
         await interaction.edit_original_response(content=f"Error fetching stats: {e}")
     except Exception as e:
@@ -561,19 +617,16 @@ async def message(interaction: discord.Interaction, content: str):
 @app_commands.describe(user="The Discord user", platform="Platform", handle="YouTube or TikTok URL/handle")
 @app_commands.checks.has_permissions(administrator=True)
 async def adminlink(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"], handle: str):
-    # Normalise handle into a full URL
     if platform == "YouTube":
         if "youtube.com" not in handle and "youtu.be" not in handle:
             handle = f"https://www.youtube.com/@{handle.lstrip('@')}"
     elif platform == "TikTok":
         if "tiktok.com" not in handle:
             handle = f"https://www.tiktok.com/@{handle.lstrip('@')}"
-
     log_channel = bot.get_channel(LINK_LOG_CHANNEL)
     if not log_channel:
         await interaction.response.send_message("Could not reach the log channel.", ephemeral=True)
         return
-
     log_embed = discord.Embed(title="✅ Approved Link", color=0x808080)
     log_embed.add_field(name="User",     value=user.mention,  inline=True)
     log_embed.add_field(name="Platform", value=platform,       inline=True)
@@ -581,7 +634,6 @@ async def adminlink(interaction: discord.Interaction, user: discord.Member, plat
     log_embed.set_footer(text=f"Approved by {interaction.user} • User ID: {user.id}")
     await log_channel.send(embed=log_embed)
     _invalidate_links_cache()
-
     await interaction.response.send_message(
         f"✅ Manually approved **{platform}** link for {user.mention}: {handle}", ephemeral=True)
 
@@ -591,12 +643,10 @@ async def adminlink(interaction: discord.Interaction, user: discord.Member, plat
 @app_commands.checks.has_permissions(administrator=True)
 async def adminccstats(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"]):
     await interaction.response.send_message(f"Fetching {platform} stats for {user.mention}, please wait...")
-
     saved_platform, url = await get_approved_link(user.id, platform)
     if not saved_platform:
         await interaction.edit_original_response(content=f"{user.mention} doesn't have an approved **{platform}** link.")
         return
-
     try:
         if platform == "YouTube":
             stats = await fetch_youtube_stats(url)
@@ -607,7 +657,6 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
             await interaction.edit_original_response(content=None, embed=embed)
-
         elif platform == "TikTok":
             stats = await fetch_tiktok_stats(url)
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
@@ -617,7 +666,6 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
             await interaction.edit_original_response(content=None, embed=embed)
-
     except ValueError as e:
         await interaction.edit_original_response(content=f"Error fetching stats: {e}")
     except Exception as e:
@@ -627,22 +675,18 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
 @tree.command(name="contentfullstats", description="Show stats for every linked creator")
 async def contentfullstats(interaction: discord.Interaction):
     await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
-
     all_links = await get_all_approved_links()
     if not all_links:
         await interaction.edit_original_response(content="No approved creator links found.")
         return
-
     lines  = []
     number = 1
-
     for entry in all_links:
         uid      = entry["user_id"]
         platform = entry["platform"]
         url      = entry["url"]
         member   = interaction.guild.get_member(int(uid))
         mention  = member.mention if member else f"<@{uid}>"
-
         try:
             if platform == "TikTok":
                 stats = await fetch_tiktok_stats(url)
@@ -666,10 +710,7 @@ async def contentfullstats(interaction: discord.Interaction):
                 lines.append(f"**{number}.** {mention}\n> URL: {url}\n> Platform: {platform} (unsupported)")
         except Exception as e:
             lines.append(f"**{number}.** {mention}\n> URL: {url}\n> ⚠️ Error: {e}")
-
         number += 1
-
-    # Chunk into <=1900 char messages
     chunks  = []
     current = ""
     for line in lines:
@@ -681,14 +722,64 @@ async def contentfullstats(interaction: discord.Interaction):
             current += block
     if current.strip():
         chunks.append(current.strip())
-
     if not chunks:
         await interaction.edit_original_response(content="No data to display.")
         return
-
     await interaction.edit_original_response(content=chunks[0])
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk)
+
+# ── /modstats ────────────────────────────────────────────────────────────────
+@tree.command(name="modstats", description="View moderator points (staff only)")
+@app_commands.describe(user="Optional: view another mod's stats")
+async def modstats(interaction: discord.Interaction, user: discord.Member = None):
+    if not _is_mod(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    target = user or interaction.user
+    tally  = await _tally_mod_points()
+    entry  = tally.get(str(target.id), {"total": 0, "breakdown": {}})
+    bd     = entry["breakdown"]
+    embed = discord.Embed(
+        title=f"Mod Stats — {target.display_name}",
+        color=0x5865F2,
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Total Points", value=f"`{entry['total']}`", inline=False)
+    embed.add_field(name="Bans (×3)",     value=f"`{bd.get('ban', 0)}`",      inline=True)
+    embed.add_field(name="Warns (×1)",    value=f"`{bd.get('warn', 0)}`",     inline=True)
+    embed.add_field(name="Thanks (×2)",   value=f"`{bd.get('thanks', 0)}`",   inline=True)
+    embed.add_field(name="Messages (×2/50)", value=f"`{bd.get('messages', 0)}`", inline=True)
+    embed.set_footer(text=f"Requested by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# ── /modleaderboard ──────────────────────────────────────────────────────────
+@tree.command(name="modleaderboard", description="Top moderators by points (staff only)")
+async def modleaderboard(interaction: discord.Interaction):
+    if not _is_mod(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    tally = await _tally_mod_points()
+    if not tally:
+        await interaction.followup.send("No mod points tracked yet.", ephemeral=True)
+        return
+    ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
+    lines = []
+    medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+    for i, (uid, data) in enumerate(ranked):
+        member = interaction.guild.get_member(int(uid))
+        name   = member.mention if member else f"<@{uid}>"
+        prefix = medals.get(i, f"**{i + 1}.**")
+        lines.append(f"{prefix} {name} — `{data['total']}` pts")
+    embed = discord.Embed(
+        title="🏆 Mod Leaderboard",
+        description="\n".join(lines),
+        color=0xFFD700,
+    )
+    embed.set_footer(text=f"Requested by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
@@ -698,23 +789,15 @@ async def weekly_reset():
         return
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if not db_channel:
-        print("Could not find DB channel — reset aborted.")
         return
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
 
-# In-memory streak state — loaded from DB channel on startup
-# { user_id: { streak, messages_today, last_streak_time, window_open } }
+# ── Streaks ──────────────────────────────────────────────────────────────────
 streak_data: dict = {}
 
-# ── Streak DB helpers ─────────────────────────────────────────────────────────
-def _streak_encode(uid: str, data: dict) -> str:
-    import json
-    return f"STREAK:{uid}:{json.dumps(data)}"
-
 async def _save_streak(uid: str):
-    import json
     db = bot.get_channel(STREAK_DB_CHANNEL)
     if not db:
         return
@@ -722,11 +805,10 @@ async def _save_streak(uid: str):
     await db.send(f"STREAK:{uid}:{payload}")
 
 async def _load_streaks():
-    import json
     db = bot.get_channel(STREAK_DB_CHANNEL)
     if not db:
         return
-    latest = {}  # uid -> latest record
+    latest = {}
     async for msg in db.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
@@ -742,24 +824,21 @@ async def _load_streaks():
         except Exception:
             continue
     streak_data.update(latest)
-    print(f"[Streaks] Loaded {len(streak_data)} streak records.", flush=True)
 
 def _get_streak(uid: str) -> dict:
     return streak_data.get(uid, {
         "streak":          0,
         "messages_today":  0,
-        "last_streak_time": None,  # ISO timestamp of when last streak was earned
-        "pending":         False,  # True when window is open and waiting for 3 msgs
+        "last_streak_time": None,
+        "pending":         False,
     })
 
 async def _update_streak_roles(member: discord.Member, streak: int):
-    """Give the highest earned role, remove all lower ones."""
     guild = member.guild
     earned_role_id = None
     for threshold in sorted(STREAK_ROLES.keys()):
         if streak >= threshold:
             earned_role_id = STREAK_ROLES[threshold]
-
     for threshold, role_id in STREAK_ROLES.items():
         role = guild.get_role(role_id)
         if not role:
@@ -778,28 +857,19 @@ async def _remove_all_streak_roles(member: discord.Member):
         if role and role in member.roles:
             await member.remove_roles(role)
 
-# ── Streak checker loop ───────────────────────────────────────────────────────
 @tasks.loop(minutes=5)
 async def streak_checker():
-    from datetime import datetime, timezone, timedelta
-    import json
+    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     to_break = []
-
     for uid, data in streak_data.items():
         if not data.get("last_streak_time"):
             continue
         last = datetime.fromisoformat(data["last_streak_time"])
         elapsed = (now - last).total_seconds() / 3600
-
-        # Window opens after 24h and closes after 28h
-        window_start = STREAK_WINDOW_HOURS
-        window_end   = STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
-
+        window_end = STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
         if elapsed >= window_end and data.get("streak", 0) > 0:
-            # Missed the window — break streak
             to_break.append(uid)
-
     for uid in to_break:
         data = streak_data[uid]
         old_streak = data["streak"]
@@ -807,55 +877,40 @@ async def streak_checker():
         data["messages_today"] = 0
         data["pending"]        = False
         await _save_streak(uid)
-
-        # Announce
         announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
         if announce:
             await announce.send(f"💔 <@{uid}>, you have lost your streak of `{old_streak}`!")
-
-        # Remove roles
         for guild in bot.guilds:
             member = guild.get_member(int(uid))
             if member:
                 await _remove_all_streak_roles(member)
 
-# ── Streak message handler ────────────────────────────────────────────────────
 async def handle_streak(message: discord.Message):
     from datetime import datetime, timezone
     uid  = str(message.author.id)
     now  = datetime.now(timezone.utc)
     data = _get_streak(uid)
-
     last_time     = datetime.fromisoformat(data["last_streak_time"]) if data.get("last_streak_time") else None
     elapsed_hours = (now - last_time).total_seconds() / 3600 if last_time else None
-
-    # Past grace window — reset message count so they can start fresh
     if elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS:
         data["messages_today"] = 0
-
-    # Count this message
     data["messages_today"] = data.get("messages_today", 0) + 1
     streak_data[uid] = data
-    print(f"[Streak] {message.author} msgs={data['messages_today']} streak={data.get('streak',0)} elapsed={elapsed_hours}", flush=True)
-
     if data["messages_today"] >= MESSAGES_REQUIRED:
-        in_window    = last_time is not None and STREAK_WINDOW_HOURS <= elapsed_hours <= STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
+        in_window     = last_time is not None and STREAK_WINDOW_HOURS <= elapsed_hours <= STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
         no_streak_yet = last_time is None or data.get("streak", 0) == 0
-
         if in_window or no_streak_yet:
             data["streak"]           = data.get("streak", 0) + 1
             data["messages_today"]   = 0
             data["last_streak_time"] = now.isoformat()
             streak_data[uid]         = data
             await _save_streak(uid)
-
             announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
             if announce:
                 await announce.send(
                     f"<:Sneeze:1495243609035899023> <@{uid}>, you have acquired a chat streak!\n"
                     f"**Streak:** `{data['streak']}`"
                 )
-
             member = message.guild.get_member(message.author.id) if message.guild else None
             if member:
                 await _update_streak_roles(member, data["streak"])
@@ -880,10 +935,9 @@ async def on_member_join(member: discord.Member):
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
 
-# ── Ticket config ────────────────────────────────────────────────────────────
+# ── Ticket panel ─────────────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL = 1495162997734117386
 
-# ── Ticket panel ─────────────────────────────────────────────────────────────
 class TicketSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -902,10 +956,7 @@ class TicketSelect(discord.ui.Select):
         ]
         super().__init__(
             placeholder="Click the option that best matches your issue...",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="ticket_select",
+            min_values=1, max_values=1, options=options, custom_id="ticket_select",
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -922,14 +973,10 @@ class TicketPanelView(discord.ui.View):
 async def post_ticket_panel():
     channel = bot.get_channel(TICKET_PANEL_CHANNEL)
     if not channel:
-        print("[Tickets] Could not find ticket panel channel.", flush=True)
         return
-
-    # Delete old bot messages in the channel
     async for msg in channel.history(limit=50):
         if msg.author == bot.user:
             await msg.delete()
-
     embed = discord.Embed(
         title="🎫  How to Create a Ticket",
         description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
@@ -951,9 +998,7 @@ async def post_ticket_panel():
         inline=False,
     )
     embed.set_image(url="https://cdn.discordapp.com/attachments/1495388852020445255/1495396291914629362/SUPORTTICKETS.png?ex=6a313d53&is=6a2febd3&hm=ac38999087c38cc8f5687a7c8c1e16aa5d71f8f568e3c123cef33ff2693b012c")
-
     await channel.send(embed=embed, view=TicketPanelView())
-    print("[Tickets] Panel posted.", flush=True)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
