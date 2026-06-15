@@ -165,6 +165,12 @@ async def handle_dyno_warn(message: discord.Message):
         return
     await _award_points(invoker_id, PTS_WARN, "warn")
 
+# ── Track messages to prevent double points for "thanks" ─────────────────────
+_thanked_messages: set[int] = set()
+
+# ── (Global cooldown for thanks) ────────────────────────────────────────────
+_thank_cooldowns: dict = {}
+
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
         return
@@ -180,24 +186,24 @@ async def handle_mod_rewards(message: discord.Message):
 
     # Thank-you detection (non-staff thanking staff)
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
+        # Prevent double points for same message
         if message.id in _thanked_messages:
             return
-        targets = []
 
-        # Check cooldowns for thanking staff
+        # Initialize cooldown tracking
         now = datetime.now(pytz.UTC)
-        # Initialize cooldown cache if not exist
         if not hasattr(_thank_cooldowns, 'data'):
-            _thank_cooldowns.data = {}
-        cooldowns = _thank_cooldowns.data
+            _thank_cooldowns['data'] = {}
+        cooldowns = _thank_cooldowns['data']
+
+        targets = []
 
         for m in message.mentions:
             mem = message.guild.get_member(m.id)
             if _is_mod(mem) and mem.id != message.author.id:
-                # Check cooldown
-                last_thank_time = cooldowns.get(str(m.id))
-                if last_thank_time:
-                    last_time = datetime.fromisoformat(last_thank_time)
+                last_thank_time_str = cooldowns.get(str(m.id))
+                if last_thank_time_str:
+                    last_time = datetime.fromisoformat(last_thank_time_str)
                     if (now - last_time) < timedelta(minutes=20):
                         continue  # still in cooldown
                 # Save new timestamp
@@ -205,15 +211,18 @@ async def handle_mod_rewards(message: discord.Message):
                 targets.append(mem)
 
         # Save cooldowns back to attribute
-        _thank_cooldowns.data = cooldowns
+        _thank_cooldowns['data'] = cooldowns
 
         if targets:
             _thanked_messages.add(message.id)
             for staff in targets:
-                await _award_points(staff.id, PTS_THANKS, "thanks")
+                # Only award once per message
+                if message.id not in _warned_messages:
+                    await _award_points(staff.id, PTS_THANKS, "thanks")
+                    _warned_messages.add(message.id)
 
-# ── Additional cooldown tracking for thanks ─────────────────────────────────
-_thank_cooldowns: object = type('CooldownDict', (), {})()
+# ── Additional set to prevent dupes of thanks points
+_warned_messages: set[int] = set()
 
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
@@ -812,11 +821,13 @@ async def modleaderboard(interaction: discord.Interaction):
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
-        lines.append(f"> **{i + 1}.** {name} - `({data['total']})` mod points")
+        # Remove brackets and display only the number
+        points = data['total']
+        lines.append(f"> **{i + 1}.** {name} - {points} mod points")
     embed = discord.Embed(
         title="__Staff Point Leaderboard__",
         description="\n".join(lines),
-        color=0x808080,
+        color=0x808080,  # Grey color
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
@@ -929,20 +940,20 @@ async def handle_streak(message: discord.Message):
     uid  = str(message.author.id)
     now  = datetime.now(timezone.utc)
     data = _get_streak(uid)
-    last_time     = datetime.fromisoformat(data["last_streak_time"]) if data.get("last_streak_time") else None
+    last_time = datetime.fromisoformat(data["last_streak_time"]) if data.get("last_streak_time") else None
     elapsed_hours = (now - last_time).total_seconds() / 3600 if last_time else None
     if elapsed_hours is not None and elapsed_hours > STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS:
         data["messages_today"] = 0
     data["messages_today"] = data.get("messages_today", 0) + 1
     streak_data[uid] = data
     if data["messages_today"] >= MESSAGES_REQUIRED:
-        in_window     = last_time is not None and STREAK_WINDOW_HOURS <= elapsed_hours <= STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
+        in_window = last_time is not None and STREAK_WINDOW_HOURS <= elapsed_hours <= STREAK_WINDOW_HOURS + STREAK_GRACE_HOURS
         no_streak_yet = last_time is None or data.get("streak", 0) == 0
         if in_window or no_streak_yet:
-            data["streak"]           = data.get("streak", 0) + 1
-            data["messages_today"]   = 0
+            data["streak"] = data.get("streak", 0) + 1
+            data["messages_today"] = 0
             data["last_streak_time"] = now.isoformat()
-            streak_data[uid]         = data
+            streak_data[uid] = data
             await _save_streak(uid)
             announce = bot.get_channel(STREAK_ANNOUNCE_CHANNEL)
             if announce:
@@ -950,7 +961,7 @@ async def handle_streak(message: discord.Message):
                     f"<:Sneeze:1495243609035899023> <@{uid}>, you have acquired a chat streak!\n"
                     f"**Streak:** `{data['streak']}`"
                 )
-            member = message.guild.get_member(message.author.id) if message.guild else None
+            member = message.guild.get_member(int(message.author.id))
             if member:
                 await _update_streak_roles(member, data["streak"])
         else:
