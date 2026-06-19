@@ -71,6 +71,7 @@ LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlev
 LEVEL_ONE_TAG_ID       = 1517631235692957736
 LEVEL_TWO_TAG_ID       = 1517631552241139723
 LEVEL_THREE_TAG_ID     = 1517631604309098709
+LEVEL_FOUR_TAG_ID      = 1517631633073766462
 
 # Path to local image files used for each level's forum post.
 # Files are loose, sitting in the same directory as bot.py — named exactly as listed below.
@@ -123,6 +124,23 @@ LEVELS = {
         ),
         "images": ["level3_1.png", "level3_2.png"],
         "tag_id": LEVEL_THREE_TAG_ID,
+    },
+    4: {
+        "title": "Level 4",
+        "content": (
+            "A vast, tiled space stretches out — still, silent, and strangely endless. "
+            "Water lies still below walkways, while heavy columns rise toward glowing "
+            "overhead lights. Every corner feels familiar, yet wrong; the air holds a "
+            "quiet, heavy pressure. To leave, you must follow the path hidden within its "
+            "design.\n\n"
+            "**What to do:**\n"
+            "* ⚙️ Find and pull every lever you see — each one unlocks a new gate\n"
+            "* 🚪 Gates open into new sections, each holding more levers to activate\n"
+            "* 🔓 Pull them all, and the final barrier will slowly lift\n"
+            "* 🚶 Beyond it waits the only door — your way out, and your escape"
+        ),
+        "images": ["level4_1.png", "level4_2.png"],
+        "tag_id": LEVEL_FOUR_TAG_ID,
     },
 }
 
@@ -889,7 +907,7 @@ def _has_level_role(member: discord.Member) -> bool:
 
 @tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
 @app_commands.describe(level="Which level to post")
-async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3]):
+async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
         await interaction.response.send_message(
