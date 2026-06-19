@@ -12,8 +12,8 @@ from typing import Literal
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
-YOUTUBE_API_KEY    = os.environ["YOUTUBE_API_KEY"]
-TIKAPI_KEY         = os.environ["TIKAPI_KEY"]
+YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg0"
+TIKAPI_KEY         = "lFoJPYkghHxXrc33873j9AOlf9RNV9XNw7hDek9xhH0w00q8"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -59,8 +59,8 @@ CACHE_TTL = 300
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386   # where the dropdown panel lives, threads are created here
 SUPPORT_ROLE_ID         = 1495495210422112366   # added to every ticket thread + pinged
-TICKET_LOG_CHANNEL_ID   = 1517621119425839154                    # TODO: set this — used to persist the ticket counter across restarts
-MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                  # TODO: set this — transcripts get posted here
+TICKET_LOG_CHANNEL_ID   = 1517621119425839154 # TODO: set this — used to persist the ticket counter across restarts
+MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                    # TODO: set this — transcripts get posted here
 
 _ticket_counter = 0
 _ticket_counter_loaded = False
