@@ -65,6 +65,35 @@ MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                    # TODO: set thi
 _ticket_counter = 0
 _ticket_counter_loaded = False
 
+# ── Level forum-post config ───────────────────────────────────────────────────
+LEVEL_FORUM_CHANNEL_ID = 1512556161205928046
+LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlevel
+LEVEL_ONE_TAG_ID       = 1517631235692957736
+
+# Path to local image files used for each level's forum post.
+# Drop the screenshots for a level here, named exactly as listed below.
+LEVEL_IMAGES_DIR = "level_images"
+
+LEVELS = {
+    1: {
+        "title": "Level 1",
+        "content": (
+            "A level that looks peaceful, but a monster is hunting you. The bright walls "
+            "and decorations make the level seem harmless. Find a key to unlock a keypad. "
+            "Notes are scattered throughout the level, each having a different code. Only "
+            "one of the codes are correct. Find the right code to escape and move onto the "
+            "🏠🌈\n\n"
+            "**What to do:**\n"
+            "🔑 Find the key to unlock the keypad\n"
+            "📝 Find notes that have possible codes\n"
+            "🔍 Determine the correct code\n"
+            "🔢 Enter the correct code and escape"
+        ),
+        "images": ["level1_1.png", "level1_2.png"],
+        "tag_id": LEVEL_ONE_TAG_ID,
+    },
+}
+
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -819,6 +848,62 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+# ── /sendlevel ────────────────────────────────────────────────────────────────
+def _has_level_role(member: discord.Member) -> bool:
+    if not member or not hasattr(member, "roles"):
+        return False
+    return any(r.id == LEVEL_ROLE_ID for r in member.roles)
+
+@tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
+@app_commands.describe(level="Which level to post")
+async def sendlevel(interaction: discord.Interaction, level: Literal[1]):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _has_level_role(member):
+        await interaction.response.send_message(
+            "You don't have permission to use this command.", ephemeral=True)
+        return
+
+    level_data = LEVELS.get(level)
+    if not level_data:
+        await interaction.response.send_message("That level isn't configured yet.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    forum_channel = bot.get_channel(LEVEL_FORUM_CHANNEL_ID)
+    if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
+        await interaction.followup.send("Could not reach the forum channel.", ephemeral=True)
+        return
+
+    # Resolve the forum tag
+    applied_tags = []
+    tag_id = level_data.get("tag_id")
+    if tag_id:
+        tag = discord.utils.get(forum_channel.available_tags, id=tag_id)
+        if tag:
+            applied_tags.append(tag)
+
+    # Attach any local images configured for this level
+    files = []
+    for filename in level_data.get("images", []):
+        path = os.path.join(LEVEL_IMAGES_DIR, filename)
+        if os.path.isfile(path):
+            files.append(discord.File(path, filename=filename))
+
+    try:
+        thread_with_message = await forum_channel.create_thread(
+            name=level_data["title"],
+            content=level_data["content"],
+            applied_tags=applied_tags,
+            files=files if files else discord.utils.MISSING,
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Failed to create the forum post: {e}", ephemeral=True)
+        return
+
+    thread = thread_with_message.thread
+    await interaction.followup.send(f"Posted: {thread.mention}", ephemeral=True)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
