@@ -71,8 +71,8 @@ LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlev
 LEVEL_ONE_TAG_ID       = 1517631235692957736
 
 # Path to local image files used for each level's forum post.
-# Drop the screenshots for a level here, named exactly as listed below.
-LEVEL_IMAGES_DIR = "level_images"
+# Files are loose, sitting in the same directory as bot.py — named exactly as listed below.
+LEVEL_IMAGES_DIR = "."
 
 LEVELS = {
     1: {
@@ -84,10 +84,10 @@ LEVELS = {
             "one of the codes are correct. Find the right code to escape and move onto the "
             "🏠🌈\n\n"
             "**What to do:**\n"
-            "🔑 Find the key to unlock the keypad\n"
-            "📝 Find notes that have possible codes\n"
-            "🔍 Determine the correct code\n"
-            "🔢 Enter the correct code and escape"
+            "* 🔑 Find the key to unlock the keypad\n"
+            "* 📝 Find notes that have possible codes\n"
+            "* 🔍 Determine the correct code\n"
+            "* 🔢 Enter the correct code and escape"
         ),
         "images": ["level1_1.png", "level1_2.png"],
         "tag_id": LEVEL_ONE_TAG_ID,
