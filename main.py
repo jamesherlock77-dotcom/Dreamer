@@ -69,6 +69,7 @@ _ticket_counter_loaded = False
 LEVEL_FORUM_CHANNEL_ID = 1512556161205928046
 LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlevel
 LEVEL_ONE_TAG_ID       = 1517631235692957736
+LEVEL_TWO_TAG_ID       = 1517631552241139723
 
 # Path to local image files used for each level's forum post.
 # Files are loose, sitting in the same directory as bot.py — named exactly as listed below.
@@ -91,6 +92,20 @@ LEVELS = {
         ),
         "images": ["level1_1.png", "level1_2.png"],
         "tag_id": LEVEL_ONE_TAG_ID,
+    },
+    2: {
+        "title": "Level 2",
+        "content": (
+            "A peaceful looking level, but many fast monsters are trying to stop you from "
+            "escaping. Search the houses to find all 5 hidden keys and unlock your way out "
+            "of the level.\n\n"
+            "**What to do:**\n"
+            "* 🔑 Search the houses for 5 keys\n"
+            "* 🌻 Run away from the monsters\n"
+            "* 🌈 Enjoy the peaceful views 🥹"
+        ),
+        "images": ["level2_1.png", "level2_2.png"],
+        "tag_id": LEVEL_TWO_TAG_ID,
     },
 }
 
@@ -857,7 +872,7 @@ def _has_level_role(member: discord.Member) -> bool:
 
 @tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
 @app_commands.describe(level="Which level to post")
-async def sendlevel(interaction: discord.Interaction, level: Literal[1]):
+async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
         await interaction.response.send_message(
