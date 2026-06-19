@@ -70,6 +70,7 @@ LEVEL_FORUM_CHANNEL_ID = 1512556161205928046
 LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlevel
 LEVEL_ONE_TAG_ID       = 1517631235692957736
 LEVEL_TWO_TAG_ID       = 1517631552241139723
+LEVEL_THREE_TAG_ID     = 1517631604309098709
 
 # Path to local image files used for each level's forum post.
 # Files are loose, sitting in the same directory as bot.py — named exactly as listed below.
@@ -106,6 +107,22 @@ LEVELS = {
         ),
         "images": ["level2_1.png", "level2_2.png"],
         "tag_id": LEVEL_TWO_TAG_ID,
+    },
+    3: {
+        "title": "Level 3",
+        "content": (
+            "A calm, quiet facility... but something feels off. Rows of old computers hum "
+            "under dim lights. To escape, you'll need to figure out what they're hiding.\n\n"
+            "**What to do:**\n"
+            "* 💻 Explore the room full of computers\n"
+            "* 🔒 Some computer has 3 possible codes — only one is correct\n"
+            "* ⌨️ Type the right code to disable the computer\n"
+            "* 🚫 Disable all computers to unlock a secret door behind spawn\n"
+            "* 🔑 Grab the key from behind the door\n"
+            "* 🔢 Use the key at the exit keyhole to escape"
+        ),
+        "images": ["level3_1.png", "level3_2.png"],
+        "tag_id": LEVEL_THREE_TAG_ID,
     },
 }
 
@@ -872,7 +889,7 @@ def _has_level_role(member: discord.Member) -> bool:
 
 @tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
 @app_commands.describe(level="Which level to post")
-async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2]):
+async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
         await interaction.response.send_message(
