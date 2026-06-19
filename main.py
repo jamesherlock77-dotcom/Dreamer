@@ -1099,7 +1099,7 @@ MEMBER_COUNT_CHANNEL_ID = 1512865382782865529
 async def update_member_count(guild: discord.Guild):
     channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
     if channel:
-        await channel.edit(name=f"Members: {guild.member_count}")
+        await channel.edit(name=f"☁️・Members: {guild.member_count}")
 
 @bot.event
 async def on_member_join(member: discord.Member):
