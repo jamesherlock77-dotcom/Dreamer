@@ -4,6 +4,7 @@ from discord import app_commands
 import os
 import re
 import json
+import io
 import aiohttp
 from datetime import datetime, time, timedelta
 import pytz
@@ -11,8 +12,8 @@ from typing import Literal
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
-YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg0"
-TIKAPI_KEY         = "lFoJPYkghHxXrc33873j9AOlf9RNV9XNw7hDek9xhH0w00q8"
+YOUTUBE_API_KEY    = os.environ["YOUTUBE_API_KEY"]
+TIKAPI_KEY         = os.environ["TIKAPI_KEY"]
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -48,13 +49,21 @@ PTS_PER_50_MSGS     = 2
 MSG_MILESTONE       = 50
 
 _staff_msg_counts: dict[str, int] = {}
-_thanked_messages: set[int] = set()
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
 
 # ── Cache ────────────────────────────────────────────────────────────────────
 _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
+
+# ── Ticket system config ──────────────────────────────────────────────────────
+TICKET_PANEL_CHANNEL    = 1495162997734117386   # where the dropdown panel lives, threads are created here
+SUPPORT_ROLE_ID         = 1495495210422112366   # added to every ticket thread + pinged
+TICKET_LOG_CHANNEL_ID   = 1517621119425839154                    # TODO: set this — used to persist the ticket counter across restarts
+MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                  # TODO: set this — transcripts get posted here
+
+_ticket_counter = 0
+_ticket_counter_loaded = False
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -167,9 +176,7 @@ async def handle_dyno_warn(message: discord.Message):
 
 # ── Track messages to prevent double points for "thanks" ─────────────────────
 _thanked_messages: set[int] = set()
-
-# ── (Global cooldown for thanks) ────────────────────────────────────────────
-_thank_cooldowns: dict = {}
+_thank_cooldowns: dict[str, str] = {}
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -186,43 +193,27 @@ async def handle_mod_rewards(message: discord.Message):
 
     # Thank-you detection (non-staff thanking staff)
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
-        # Prevent double points for same message
         if message.id in _thanked_messages:
             return
 
-        # Initialize cooldown tracking
         now = datetime.now(pytz.UTC)
-        if not hasattr(_thank_cooldowns, 'data'):
-            _thank_cooldowns['data'] = {}
-        cooldowns = _thank_cooldowns['data']
-
         targets = []
 
         for m in message.mentions:
             mem = message.guild.get_member(m.id)
             if _is_mod(mem) and mem.id != message.author.id:
-                last_thank_time_str = cooldowns.get(str(m.id))
+                last_thank_time_str = _thank_cooldowns.get(str(m.id))
                 if last_thank_time_str:
                     last_time = datetime.fromisoformat(last_thank_time_str)
                     if (now - last_time) < timedelta(minutes=20):
                         continue  # still in cooldown
-                # Save new timestamp
-                cooldowns[str(m.id)] = now.isoformat()
+                _thank_cooldowns[str(m.id)] = now.isoformat()
                 targets.append(mem)
-
-        # Save cooldowns back to attribute
-        _thank_cooldowns['data'] = cooldowns
 
         if targets:
             _thanked_messages.add(message.id)
             for staff in targets:
-                # Only award once per message
-                if message.id not in _warned_messages:
-                    await _award_points(staff.id, PTS_THANKS, "thanks")
-                    _warned_messages.add(message.id)
-
-# ── Additional set to prevent dupes of thanks points
-_warned_messages: set[int] = set()
+                await _award_points(staff.id, PTS_THANKS, "thanks")
 
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
@@ -412,27 +403,26 @@ async def fetch_youtube_stats(url: str):
         dreamyvr_views = 0
         dreamyvr_count = 0
         next_page_token = None
-        async with aiohttp.ClientSession() as search_session:
-            while True:
-                search_params = {
-                    "part": "id", "channelId": channel_id, "q": "#dreamyvr",
-                    "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
-                }
-                if next_page_token:
-                    search_params["pageToken"] = next_page_token
-                async with search_session.get(f"{base}/search", params=search_params) as sr:
-                    sdata = await sr.json()
-                video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
-                if video_ids:
-                    stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
-                    async with search_session.get(f"{base}/videos", params=stats_params) as vr:
-                        vdata = await vr.json()
-                    for v in vdata.get("items", []):
-                        dreamyvr_count += 1
-                        dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
-                next_page_token = sdata.get("nextPageToken")
-                if not next_page_token:
-                    break
+        while True:
+            search_params = {
+                "part": "id", "channelId": channel_id, "q": "#dreamyvr",
+                "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
+            }
+            if next_page_token:
+                search_params["pageToken"] = next_page_token
+            async with session.get(f"{base}/search", params=search_params) as sr:
+                sdata = await sr.json()
+            video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
+            if video_ids:
+                stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
+                async with session.get(f"{base}/videos", params=stats_params) as vr:
+                    vdata = await vr.json()
+                for v in vdata.get("items", []):
+                    dreamyvr_count += 1
+                    dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
+            next_page_token = sdata.get("nextPageToken")
+            if not next_page_token:
+                break
 
         return {
             "channel_name":   snippet.get("title", "Unknown"),
@@ -821,13 +811,12 @@ async def modleaderboard(interaction: discord.Interaction):
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
-        # Remove brackets and display only the number
         points = data['total']
         lines.append(f"> **{i + 1}.** {name} - {points} mod points")
     embed = discord.Embed(
         title="__Staff Point Leaderboard__",
         description="\n".join(lines),
-        color=0x808080,  # Grey color
+        color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
@@ -985,9 +974,144 @@ async def on_member_join(member: discord.Member):
 async def on_member_remove(member: discord.Member):
     await update_member_count(member.guild)
 
-# ── Ticket panel ─────────────────────────────────────────────────────────────
-TICKET_PANEL_CHANNEL = 1495162997734117386
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Ticket system ─────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
+async def _load_ticket_counter():
+    """Persist the ticket counter across restarts by reading the last
+    TICKETNUM: message from the log channel."""
+    global _ticket_counter, _ticket_counter_loaded
+    if _ticket_counter_loaded:
+        return
+    log_channel = bot.get_channel(TICKET_LOG_CHANNEL_ID)
+    if not log_channel:
+        _ticket_counter_loaded = True
+        return
+    last_value = 0
+    async for msg in log_channel.history(limit=None, oldest_first=True):
+        if msg.author.bot and msg.content.startswith("TICKETNUM:"):
+            try:
+                last_value = int(msg.content.split(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+    _ticket_counter = last_value
+    _ticket_counter_loaded = True
+
+async def _next_ticket_number() -> int:
+    global _ticket_counter
+    await _load_ticket_counter()
+    _ticket_counter += 1
+    log_channel = bot.get_channel(TICKET_LOG_CHANNEL_ID)
+    if log_channel:
+        await log_channel.send(f"TICKETNUM:{_ticket_counter}")
+    return _ticket_counter
+
+def _format_ticket_number(n: int) -> str:
+    return str(n).zfill(4)
+
+# ── Modals ─────────────────────────────────────────────────────────────────
+class InGameSupportModal(discord.ui.Modal, title="In-game Support"):
+    about_user = discord.ui.TextInput(
+        label="Is your issue about another in-game user?",
+        required=True,
+        max_length=100,
+    )
+    needs = discord.ui.TextInput(
+        label="What do you need?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe what you need",
+        required=True,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "Is your issue about another in-game user?": str(self.about_user),
+            "What do you need?": str(self.needs),
+        }
+        await create_ticket(interaction, "In-game Support", answers)
+
+
+class DiscordSupportModal(discord.ui.Modal, title="Discord Support"):
+    about_user = discord.ui.TextInput(
+        label="Is your issue about another Discord user?",
+        required=True,
+        max_length=100,
+    )
+    needs = discord.ui.TextInput(
+        label="What do you need?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe what you need",
+        required=True,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "Is your issue about another Discord user?": str(self.about_user),
+            "What do you need?": str(self.needs),
+        }
+        await create_ticket(interaction, "Discord Support", answers)
+
+
+# ── Ticket creation ──────────────────────────────────────────────────────────
+async def create_ticket(interaction: discord.Interaction, category: str, answers: dict):
+    await interaction.response.defer(ephemeral=True)
+
+    panel_channel = bot.get_channel(TICKET_PANEL_CHANNEL)
+    if not panel_channel:
+        await interaction.followup.send("Could not reach the ticket channel.", ephemeral=True)
+        return
+
+    number = await _next_ticket_number()
+    padded = _format_ticket_number(number)
+    thread_name = f"🎫・ticket-{padded}"
+
+    try:
+        thread = await panel_channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
+        return
+
+    # Add the ticket creator
+    try:
+        await thread.add_user(interaction.user)
+    except discord.HTTPException:
+        pass
+
+    # Add everyone with the support role
+    support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
+    if support_role:
+        for member in support_role.members:
+            try:
+                await thread.add_user(member)
+            except discord.HTTPException:
+                pass
+
+    embed = discord.Embed(title=category, color=0x2b2d31)
+    for question, answer in answers.items():
+        embed.add_field(name=question, value=answer or "—", inline=False)
+    embed.set_footer(text=f"Ticket #{padded} • Opened by {interaction.user}")
+
+    ping = f"<@&{SUPPORT_ROLE_ID}>" if support_role else ""
+    content = f"## Welcome {interaction.user.mention}\n{ping}"
+
+    await thread.send(
+        content=content,
+        embed=embed,
+        view=TicketOpenView(),
+        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+    )
+
+    await interaction.followup.send(f"Your ticket has been created: {thread.mention}", ephemeral=True)
+
+
+# ── Select menu / panel ──────────────────────────────────────────────────────
 class TicketSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -1010,15 +1134,17 @@ class TicketSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            f"You selected **{self.values[0]}** — ticket creation coming soon!",
-            ephemeral=True,
-        )
+        if self.values[0] == "ingame_support":
+            await interaction.response.send_modal(InGameSupportModal())
+        else:
+            await interaction.response.send_modal(DiscordSupportModal())
+
 
 class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(TicketSelect())
+
 
 async def post_ticket_panel():
     channel = bot.get_channel(TICKET_PANEL_CHANNEL)
@@ -1050,14 +1176,160 @@ async def post_ticket_panel():
     embed.set_image(url="https://cdn.discordapp.com/attachments/1495388852020445255/1495396291914629362/SUPORTTICKETS.png?ex=6a313d53&is=6a2febd3&hm=ac38999087c38cc8f5687a7c8c1e16aa5d71f8f568e3c123cef33ff2693b012c")
     await channel.send(embed=embed, view=TicketPanelView())
 
+
+# ── Ticket controls (open ticket → close button) ─────────────────────────────
+class TicketOpenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red,
+                        emoji="🔒", custom_id="ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
+            return
+
+        if not _is_mod(interaction.guild.get_member(interaction.user.id)) and \
+           interaction.user.id not in [m.id for m in await thread.fetch_members()]:
+            pass  # let anyone in the thread close it; tighten this if you want staff-only
+
+        await interaction.response.defer()
+
+        # Build + post transcript
+        transcript_file = await _build_transcript(thread)
+        notifs_channel = bot.get_channel(MOD_NOTIFS_CHANNEL_ID)
+        transcript_link = f"<#{MOD_NOTIFS_CHANNEL_ID}>"
+        if notifs_channel and transcript_file:
+            await notifs_channel.send(
+                content=f"📄 Transcript for {thread.name} (closed by {interaction.user.mention})",
+                file=transcript_file,
+            )
+
+        await thread.send(f"Ticket Closed by {interaction.user.mention}")
+        msg = await thread.send(f"Transcript saved to {transcript_link}")
+        try:
+            await msg.edit(content=f"Transcript saved to {transcript_link}", suppress=False)
+        except discord.HTTPException:
+            pass
+
+        control_embed = discord.Embed(
+            description="Support team ticket controls",
+            color=0x2b2d31,
+        )
+        await thread.send(embed=control_embed, view=TicketClosedView())
+
+        # Lock the original opener out, rename to Closed-XXXX
+        m = re.search(r"ticket-(\d+)", thread.name)
+        number = m.group(1) if m else "0000"
+        try:
+            await thread.edit(name=f"Closed-{number}")
+        except discord.HTTPException:
+            pass
+
+        # Remove the ticket creator (first non-staff member) from the thread
+        opener_id = await _get_ticket_opener_id(thread)
+        if opener_id:
+            try:
+                opener = await interaction.guild.fetch_member(opener_id)
+                await thread.remove_user(opener)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+
+async def _get_ticket_opener_id(thread: discord.Thread):
+    """The opener is whoever the very first embed in the thread was footer-tagged for."""
+    async for msg in thread.history(limit=20, oldest_first=True):
+        if msg.embeds and msg.embeds[0].footer and msg.embeds[0].footer.text:
+            m = re.search(r"Opened by .+#\d+|Opened by .+", msg.embeds[0].footer.text)
+            if m:
+                # fall back: use mentions in the welcome message instead, more reliable
+                pass
+        if msg.mentions:
+            return msg.mentions[0].id
+    return None
+
+
+async def _build_transcript(thread: discord.Thread) -> discord.File | None:
+    lines = [f"Transcript for #{thread.name}", "=" * 40, ""]
+    async for msg in thread.history(limit=None, oldest_first=True):
+        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author = f"{msg.author} ({msg.author.id})"
+        content = msg.content or ""
+        if msg.embeds:
+            for e in msg.embeds:
+                if e.title:
+                    content += f"\n[Embed: {e.title}]"
+                for f in e.fields:
+                    content += f"\n  {f.name}: {f.value}"
+        lines.append(f"[{ts}] {author}: {content}")
+    buffer = io.BytesIO("\n".join(lines).encode("utf-8"))
+    return discord.File(buffer, filename=f"{thread.name}-transcript.txt")
+
+
+class TicketClosedView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Transcript", style=discord.ButtonStyle.secondary,
+                        emoji="📄", custom_id="ticket_transcript")
+    async def transcript(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        transcript_file = await _build_transcript(thread)
+        if transcript_file:
+            await interaction.followup.send(file=transcript_file, ephemeral=True)
+
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.secondary,
+                        emoji="🔓", custom_id="ticket_open")
+    async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
+            return
+        m = re.search(r"Closed-(\d+)", thread.name)
+        number = m.group(1) if m else "0000"
+        try:
+            await thread.edit(name=f"🎫・ticket-{number}")
+        except discord.HTTPException:
+            pass
+        opener_id = await _get_ticket_opener_id(thread)
+        if opener_id:
+            try:
+                opener = await interaction.guild.fetch_member(opener_id)
+                await thread.add_user(opener)
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        await interaction.response.send_message(f"🔓 Ticket reopened by {interaction.user.mention}")
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger,
+                        emoji="⛔", custom_id="ticket_delete")
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
+            return
+        await interaction.response.send_message("🗑️ Deleting ticket...", ephemeral=True)
+        try:
+            await thread.delete()
+        except discord.HTTPException:
+            pass
+
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     bot.add_view(TicketPanelView())
+    bot.add_view(TicketOpenView())
+    bot.add_view(TicketClosedView())
     await tree.sync()
     weekly_reset.start()
     streak_checker.start()
     await _load_streaks()
+    await _load_ticket_counter()
     await post_ticket_panel()
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
