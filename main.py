@@ -59,7 +59,7 @@ CACHE_TTL = 300
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386   # where the dropdown panel lives, threads are created here
 SUPPORT_ROLE_ID         = 1495495210422112366   # added to every ticket thread + pinged
-TICKET_LOG_CHANNEL_ID   = 1517621119425839154 # TODO: set this — used to persist the ticket counter across restarts
+TICKET_LOG_CHANNEL_ID   = 1517621119425839154                    # TODO: set this — used to persist the ticket counter across restarts
 MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                    # TODO: set this — transcripts get posted here
 
 _ticket_counter = 0
@@ -1084,18 +1084,16 @@ async def create_ticket(interaction: discord.Interaction, category: str, answers
     except discord.HTTPException:
         pass
 
-    # Add everyone with the support role
+    # NOTE: support staff are NOT individually added here. Instead, give the
+    # support role "Manage Threads" permission in this channel (Server Settings
+    # → Roles → permissions, or a channel-specific permission overwrite) — anyone
+    # with Manage Threads can already see and open every private thread in the
+    # channel without needing to be added one by one.
     support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
-    if support_role:
-        for member in support_role.members:
-            try:
-                await thread.add_user(member)
-            except discord.HTTPException:
-                pass
 
     embed = discord.Embed(title=category, color=0x2b2d31)
     for question, answer in answers.items():
-        embed.add_field(name=question, value=answer or "—", inline=False)
+        embed.add_field(name=question, value=f"`{answer}`" if answer else "—", inline=False)
     embed.set_footer(text=f"Ticket #{padded} • Opened by {interaction.user}")
 
     ping = f"<@&{SUPPORT_ROLE_ID}>" if support_role else ""
@@ -1149,10 +1147,30 @@ class TicketPanelView(discord.ui.View):
 async def post_ticket_panel():
     channel = bot.get_channel(TICKET_PANEL_CHANNEL)
     if not channel:
+        print(f"[ticket panel] ERROR: could not find channel with ID {TICKET_PANEL_CHANNEL}. "
+              f"Check the ID is correct and the bot is in that guild.")
         return
-    async for msg in channel.history(limit=50):
-        if msg.author == bot.user:
-            await msg.delete()
+
+    perms = channel.permissions_for(channel.guild.me)
+    missing = [name for name, ok in
+               [("View Channel", perms.view_channel),
+                ("Send Messages", perms.send_messages),
+                ("Embed Links", perms.embed_links),
+                ("Manage Messages", perms.manage_messages)]
+               if not ok]
+    if missing:
+        print(f"[ticket panel] ERROR: bot is missing permissions in #{channel}: {', '.join(missing)}")
+        return
+
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author == bot.user:
+                await msg.delete()
+    except discord.Forbidden:
+        print(f"[ticket panel] ERROR: missing 'Read Message History' or 'Manage Messages' in #{channel}")
+        return
+    except discord.HTTPException as e:
+        print(f"[ticket panel] ERROR while clearing old panel messages: {e}")
     embed = discord.Embed(
         title="🎫  How to Create a Ticket",
         description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
@@ -1174,7 +1192,11 @@ async def post_ticket_panel():
         inline=False,
     )
     embed.set_image(url="https://cdn.discordapp.com/attachments/1495388852020445255/1495396291914629362/SUPORTTICKETS.png?ex=6a313d53&is=6a2febd3&hm=ac38999087c38cc8f5687a7c8c1e16aa5d71f8f568e3c123cef33ff2693b012c")
-    await channel.send(embed=embed, view=TicketPanelView())
+    try:
+        await channel.send(embed=embed, view=TicketPanelView())
+        print(f"[ticket panel] Posted successfully in #{channel} ({channel.id})")
+    except discord.HTTPException as e:
+        print(f"[ticket panel] ERROR sending panel message: {e}")
 
 
 # ── Ticket controls (open ticket → close button) ─────────────────────────────
