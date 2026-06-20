@@ -359,15 +359,33 @@ async def _build_server_knowledge() -> str:
             continue
         lines = []
         try:
-            async for msg in channel.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=False):
-                text = _extract_message_text(msg)
-                if text:
-                    lines.append(text)
+            if isinstance(channel, discord.ForumChannel):
+                threads = list(channel.threads)
+                try:
+                    async for t in channel.archived_threads(limit=50):
+                        threads.append(t)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                for thread in threads:
+                    thread_lines = []
+                    try:
+                        async for msg in thread.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=True):
+                            text = _extract_message_text(msg)
+                            if text:
+                                thread_lines.append(text)
+                    except (discord.Forbidden, discord.HTTPException):
+                        continue
+                    if thread_lines:
+                        lines.append(f"[Thread: {thread.name}]\n" + "\n".join(thread_lines))
+            else:
+                async for msg in channel.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=False):
+                    text = _extract_message_text(msg)
+                    if text:
+                        lines.append(text)
+                lines.reverse()  # oldest_first=False means newest first; reverse for chronological reading
         except (discord.Forbidden, discord.HTTPException):
             continue
         if lines:
-            # oldest_first=False means newest first; reverse for chronological reading
-            lines.reverse()
             sections.append(f"--- #{channel.name} ---\n" + "\n".join(lines))
 
     combined = "\n\n".join(sections)
