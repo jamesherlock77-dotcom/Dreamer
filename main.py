@@ -27,6 +27,15 @@ LEADERBOARD_WINNERS_CHANNEL = 1495873647775322202
 LEADERBOARD_WINNER_ROLE_ID  = 1515066635667505323
 TOP_N_WINNERS                = 5
 
+# ── AI Q&A channel config ─────────────────────────────────────────────────────
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL      = "llama-3.3-70b-versatile"
+AI_CHANNEL_ID   = 1517701242934137022
+AI_SYSTEM_PROMPT = (
+    "You are a helpful assistant answering questions in a Discord server. "
+    "Keep answers clear and reasonably concise."
+)
+
 # ── Streak config ────────────────────────────────────────────────────────────
 STREAK_DB_CHANNEL       = 1515834119727222834
 STREAK_ANNOUNCE_CHANNEL = 1423121104675016768
@@ -300,6 +309,50 @@ async def handle_mod_rewards(message: discord.Message):
             for staff in targets:
                 await _award_points(staff.id, PTS_THANKS, "thanks")
 
+# ── AI Q&A helpers ─────────────────────────────────────────────────────────────
+async def ask_groq(question: str) -> str:
+    if not GROQ_API_KEY:
+        return "AI is not configured (missing GROQ_API_KEY)."
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        ) as r:
+            data = await r.json()
+            if r.status != 200:
+                err = data.get("error", {}).get("message", str(data))
+                raise ValueError(f"Groq API error: {err}")
+            return data["choices"][0]["message"]["content"]
+
+async def handle_ai_question(message: discord.Message):
+    if not message.content.strip():
+        return
+    try:
+        async with message.channel.typing():
+            answer = await ask_groq(message.content)
+    except Exception as e:
+        await message.reply(f"⚠️ Something went wrong: {e}")
+        return
+    # Discord caps messages at 2000 chars; split if needed.
+    for i in range(0, len(answer), 2000):
+        chunk = answer[i:i + 2000]
+        if i == 0:
+            await message.reply(chunk)
+        else:
+            await message.channel.send(chunk)
+
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
@@ -326,6 +379,10 @@ async def on_message(message: discord.Message):
 
     await handle_streak(message)
     await handle_mod_rewards(message)
+
+    if message.channel.id == AI_CHANNEL_ID:
+        await handle_ai_question(message)
+
     await bot.process_commands(message)
 
 # ── Ban detection ────────────────────────────────────────────────────────────
@@ -1008,13 +1065,12 @@ async def weekly_reset():
 
         announce_channel = bot.get_channel(LEADERBOARD_WINNERS_CHANNEL)
         if announce_channel and lines:
-            embed = discord.Embed(
-                title="🏆 Weekly Message Leaderboard Winners",
-                description="\n".join(lines),
-                color=0xFFD700,
+            content = (
+                "🏆 **Weekly Message Leaderboard Winners**\n\n"
+                + "\n".join(lines)
+                + "\n\nCongrats to this week's most active members!"
             )
-            embed.set_footer(text="Congrats to this week's most active members!")
-            await announce_channel.send(embed=embed)
+            await announce_channel.send(content)
 
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
