@@ -27,26 +27,13 @@ LEADERBOARD_WINNERS_CHANNEL = 1495873647775322202
 LEADERBOARD_WINNER_ROLE_ID  = 1515066635667505323
 TOP_N_WINNERS                = 5
 
-# ── AI Q&A channel config ─────────────────────────────────────────────────────
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL      = "llama-3.3-70b-versatile"
-AI_CHANNEL_ID   = 1517701242934137022
-AI_SYSTEM_PROMPT = (
-    "You are a helpful assistant answering questions in a Discord server. "
-    "Use the SERVER CONTEXT below — pulled from the server's own channels — "
-    "to answer accurately. If the answer isn't in the context, say you're not "
-    "sure rather than guessing. Keep answers clear and reasonably concise."
-)
-
-# Channels the bot reads through to build its knowledge of the server.
-# Instead of a fixed list, it dynamically discovers every text/forum channel
-# that @everyone can see (i.e. not staff-only / private channels).
-KNOWLEDGE_MSGS_PER_CHANNEL = 100   # how far back to read in each channel
-KNOWLEDGE_CACHE_TTL        = 600  # seconds before re-reading the channels
-KNOWLEDGE_MAX_CHARS        = 12000  # cap on how much context gets sent per question
-
-_knowledge_cache: str | None = None
-_knowledge_cache_time: float = 0
+# ── Video announcement config ─────────────────────────────────────────────────
+VIDEO_ANNOUNCE_CHANNEL  = 1512853017920143560
+VIDEO_ANNOUNCE_ROLE_ID  = 1512854249174863882
+VIDEO_STATE_CHANNEL_ID  = 1495388852020445255
+TIKTOK_USERNAME          = "dreamyvrofficial"
+YOUTUBE_HANDLE           = "dreamyvrofficial"
+VIDEO_CHECK_INTERVAL_MIN = 10
 
 # ── Streak config ────────────────────────────────────────────────────────────
 STREAK_DB_CHANNEL       = 1515834119727222834
@@ -321,133 +308,119 @@ async def handle_mod_rewards(message: discord.Message):
             for staff in targets:
                 await _award_points(staff.id, PTS_THANKS, "thanks")
 
-# ── AI Q&A helpers ─────────────────────────────────────────────────────────────
-def _extract_message_text(msg: discord.Message) -> str:
-    parts = []
-    if msg.content:
-        parts.append(msg.content)
-    for e in msg.embeds:
-        if e.title:
-            parts.append(e.title)
-        if e.description:
-            parts.append(e.description)
-        for f in e.fields:
-            parts.append(f"{f.name}: {f.value}")
-    return "\n".join(p for p in parts if p)
+# ── Video announcement helpers ──────────────────────────────────────────────────
+_last_video_ids: dict[str, str] = {}  # {"tiktok": id, "youtube": id}
+_video_ids_loaded = False
 
-def _get_public_knowledge_channels() -> list:
-    """Every text/forum channel where @everyone has View Channel access
-    (i.e. not staff-only or private)."""
-    channels = []
-    for guild in bot.guilds:
-        everyone = guild.default_role
-        for channel in guild.channels:
-            if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-                continue
-            perms = channel.permissions_for(everyone)
-            if perms.view_channel:
-                channels.append(channel)
-    return channels
-
-async def _build_server_knowledge() -> str:
-    import time as _time
-    global _knowledge_cache, _knowledge_cache_time
-    now = _time.monotonic()
-    if _knowledge_cache is not None and (now - _knowledge_cache_time) < KNOWLEDGE_CACHE_TTL:
-        return _knowledge_cache
-
-    sections = []
-    for channel in _get_public_knowledge_channels():
-        lines = []
-        try:
-            if isinstance(channel, discord.ForumChannel):
-                threads = list(channel.threads)
-                try:
-                    async for t in channel.archived_threads(limit=50):
-                        threads.append(t)
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
-                for thread in threads:
-                    thread_lines = []
-                    try:
-                        async for msg in thread.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=True):
-                            text = _extract_message_text(msg)
-                            if text:
-                                thread_lines.append(text)
-                    except (discord.Forbidden, discord.HTTPException):
-                        continue
-                    if thread_lines:
-                        lines.append(f"[Thread: {thread.name}]\n" + "\n".join(thread_lines))
-            else:
-                async for msg in channel.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=False):
-                    text = _extract_message_text(msg)
-                    if text:
-                        lines.append(text)
-                lines.reverse()  # oldest_first=False means newest first; reverse for chronological reading
-        except (discord.Forbidden, discord.HTTPException):
+async def _load_last_video_ids():
+    global _video_ids_loaded
+    if _video_ids_loaded:
+        return
+    state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
+    if not state_channel:
+        _video_ids_loaded = True
+        return
+    async for msg in state_channel.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
             continue
-        if lines:
-            sections.append(f"--- #{channel.name} ---\n" + "\n".join(lines))
+        if not msg.content.startswith("LASTVIDEO:"):
+            continue
+        parts = msg.content.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, platform, video_id = parts
+        _last_video_ids[platform] = video_id
+    _video_ids_loaded = True
 
-    combined = "\n\n".join(sections)
-    if len(combined) > KNOWLEDGE_MAX_CHARS:
-        combined = combined[-KNOWLEDGE_MAX_CHARS:]  # keep the most recent content
+async def _save_last_video_id(platform: str, video_id: str):
+    _last_video_ids[platform] = video_id
+    state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
+    if state_channel:
+        await state_channel.send(f"LASTVIDEO:{platform}:{video_id}")
 
-    _knowledge_cache = combined
-    _knowledge_cache_time = now
-    return combined
-
-def _invalidate_knowledge_cache():
-    global _knowledge_cache, _knowledge_cache_time
-    _knowledge_cache = None
-    _knowledge_cache_time = 0
-
-async def ask_groq(question: str) -> str:
-    if not GROQ_API_KEY:
-        return "AI is not configured (missing GROQ_API_KEY)."
-    context = await _build_server_knowledge()
-    system_content = AI_SYSTEM_PROMPT
-    if context:
-        system_content += f"\n\nSERVER CONTEXT:\n{context}"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": question},
-        ],
-    }
+async def get_latest_tiktok_video(username: str):
+    """Returns (video_id, video_url) for the most recent post, or (None, None)."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        ) as r:
-            data = await r.json()
-            if r.status != 200:
-                err = data.get("error", {}).get("message", str(data))
-                raise ValueError(f"Groq API error: {err}")
-            return data["choices"][0]["message"]["content"]
+        try:
+            user_data = await _tikapi_get(session, "public/check", {"username": username})
+            sec_uid = user_data.get("userInfo", {}).get("user", {}).get("secUid") or user_data.get("secUid")
+        except ValueError:
+            return None, None
+        if not sec_uid:
+            return None, None
+        try:
+            data = await _tikapi_get(session, "public/posts", {"secUid": sec_uid, "count": 1})
+        except ValueError:
+            return None, None
+        videos = data.get("itemList", [])
+        if not videos:
+            return None, None
+        video = videos[0]
+        video_id = video.get("id")
+        if not video_id:
+            return None, None
+        return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
 
-async def handle_ai_question(message: discord.Message):
-    if not message.content.strip():
+async def get_latest_youtube_video(handle: str):
+    """Returns (video_id, video_url) for the most recent upload, or (None, None)."""
+    base = "https://www.googleapis.com/youtube/v3"
+    async with aiohttp.ClientSession() as session:
+        params = {"part": "id", "forHandle": f"@{handle}", "key": YOUTUBE_API_KEY}
+        async with session.get(f"{base}/channels", params=params) as r:
+            data = await r.json()
+        items = data.get("items", [])
+        if not items:
+            return None, None
+        channel_id = items[0]["id"]
+
+        search_params = {
+            "part": "id", "channelId": channel_id, "type": "video",
+            "order": "date", "maxResults": 1, "key": YOUTUBE_API_KEY,
+        }
+        async with session.get(f"{base}/search", params=search_params) as r:
+            sdata = await r.json()
+        sitems = sdata.get("items", [])
+        if not sitems:
+            return None, None
+        video_id = sitems[0].get("id", {}).get("videoId")
+        if not video_id:
+            return None, None
+        return video_id, f"https://www.youtube.com/watch?v={video_id}"
+
+async def _announce_video(video_url: str):
+    channel = bot.get_channel(VIDEO_ANNOUNCE_CHANNEL)
+    if not channel:
         return
+    content = (
+        "Hey everyone, we just posted a video! Go check it out!\n"
+        f"<@&{VIDEO_ANNOUNCE_ROLE_ID}>\n"
+        f"{video_url}"
+    )
+    await channel.send(content, allowed_mentions=discord.AllowedMentions(roles=True))
+
+@tasks.loop(minutes=VIDEO_CHECK_INTERVAL_MIN)
+async def video_checker():
+    await _load_last_video_ids()
+
     try:
-        async with message.channel.typing():
-            answer = await ask_groq(message.content)
+        tiktok_id, tiktok_url = await get_latest_tiktok_video(TIKTOK_USERNAME)
+        if tiktok_id and tiktok_id != _last_video_ids.get("tiktok"):
+            is_first_check = "tiktok" not in _last_video_ids
+            await _save_last_video_id("tiktok", tiktok_id)
+            if not is_first_check:
+                await _announce_video(tiktok_url)
     except Exception as e:
-        await message.reply(f"⚠️ Something went wrong: {e}")
-        return
-    # Discord caps messages at 2000 chars; split if needed.
-    for i in range(0, len(answer), 2000):
-        chunk = answer[i:i + 2000]
-        if i == 0:
-            await message.reply(chunk)
-        else:
-            await message.channel.send(chunk)
+        print(f"[video_checker] TikTok check failed: {e}")
+
+    try:
+        yt_id, yt_url = await get_latest_youtube_video(YOUTUBE_HANDLE)
+        if yt_id and yt_id != _last_video_ids.get("youtube"):
+            is_first_check = "youtube" not in _last_video_ids
+            await _save_last_video_id("youtube", yt_id)
+            if not is_first_check:
+                await _announce_video(yt_url)
+    except Exception as e:
+        print(f"[video_checker] YouTube check failed: {e}")
 
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
@@ -475,10 +448,6 @@ async def on_message(message: discord.Message):
 
     await handle_streak(message)
     await handle_mod_rewards(message)
-
-    if message.channel.id == AI_CHANNEL_ID:
-        await handle_ai_question(message)
-
     await bot.process_commands(message)
 
 # ── Ban detection ────────────────────────────────────────────────────────────
@@ -1123,16 +1092,6 @@ async def test(interaction: discord.Interaction):
         return
     await interaction.response.send_message("✅ Test command works!")
 
-@tree.command(name="refreshknowledge", description="Force the AI to re-read its knowledge channels (restricted)")
-async def refreshknowledge(interaction: discord.Interaction):
-    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-    if not _has_level_role(member):
-        await interaction.response.send_message(
-            "You don't have permission to use this command.", ephemeral=True)
-        return
-    _invalidate_knowledge_cache()
-    await interaction.response.send_message("🔄 Knowledge cache cleared — it'll re-read on the next question.", ephemeral=True)
-
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
 async def weekly_reset():
@@ -1719,6 +1678,7 @@ async def on_ready():
     await tree.sync()
     weekly_reset.start()
     streak_checker.start()
+    video_checker.start()
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
