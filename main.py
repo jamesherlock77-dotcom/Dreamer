@@ -33,8 +33,30 @@ GROQ_MODEL      = "llama-3.3-70b-versatile"
 AI_CHANNEL_ID   = 1517701242934137022
 AI_SYSTEM_PROMPT = (
     "You are a helpful assistant answering questions in a Discord server. "
-    "Keep answers clear and reasonably concise."
+    "Use the SERVER CONTEXT below — pulled from the server's own channels — "
+    "to answer accurately. If the answer isn't in the context, say you're not "
+    "sure rather than guessing. Keep answers clear and reasonably concise."
 )
+
+# Channels the bot reads through to build its knowledge of the server
+# (rules, FAQs, announcements, panels, etc.)
+KNOWLEDGE_CHANNEL_IDS = [
+    1423121103647281273,
+    1495165085008527490,
+    1495162997734117386,
+    1495262676618580149,
+    1512556161205928046,
+    1440102935601217702,
+    1440124661592625342,
+    1495873647775322202,
+    1423121104675016766,
+]
+KNOWLEDGE_MSGS_PER_CHANNEL = 100   # how far back to read in each channel
+KNOWLEDGE_CACHE_TTL        = 600  # seconds before re-reading the channels
+KNOWLEDGE_MAX_CHARS        = 12000  # cap on how much context gets sent per question
+
+_knowledge_cache: str | None = None
+_knowledge_cache_time: float = 0
 
 # ── Streak config ────────────────────────────────────────────────────────────
 STREAK_DB_CHANNEL       = 1515834119727222834
@@ -310,9 +332,64 @@ async def handle_mod_rewards(message: discord.Message):
                 await _award_points(staff.id, PTS_THANKS, "thanks")
 
 # ── AI Q&A helpers ─────────────────────────────────────────────────────────────
+def _extract_message_text(msg: discord.Message) -> str:
+    parts = []
+    if msg.content:
+        parts.append(msg.content)
+    for e in msg.embeds:
+        if e.title:
+            parts.append(e.title)
+        if e.description:
+            parts.append(e.description)
+        for f in e.fields:
+            parts.append(f"{f.name}: {f.value}")
+    return "\n".join(p for p in parts if p)
+
+async def _build_server_knowledge() -> str:
+    import time as _time
+    global _knowledge_cache, _knowledge_cache_time
+    now = _time.monotonic()
+    if _knowledge_cache is not None and (now - _knowledge_cache_time) < KNOWLEDGE_CACHE_TTL:
+        return _knowledge_cache
+
+    sections = []
+    for channel_id in KNOWLEDGE_CHANNEL_IDS:
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+        lines = []
+        try:
+            async for msg in channel.history(limit=KNOWLEDGE_MSGS_PER_CHANNEL, oldest_first=False):
+                text = _extract_message_text(msg)
+                if text:
+                    lines.append(text)
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+        if lines:
+            # oldest_first=False means newest first; reverse for chronological reading
+            lines.reverse()
+            sections.append(f"--- #{channel.name} ---\n" + "\n".join(lines))
+
+    combined = "\n\n".join(sections)
+    if len(combined) > KNOWLEDGE_MAX_CHARS:
+        combined = combined[-KNOWLEDGE_MAX_CHARS:]  # keep the most recent content
+
+    _knowledge_cache = combined
+    _knowledge_cache_time = now
+    return combined
+
+def _invalidate_knowledge_cache():
+    global _knowledge_cache, _knowledge_cache_time
+    _knowledge_cache = None
+    _knowledge_cache_time = 0
+
 async def ask_groq(question: str) -> str:
     if not GROQ_API_KEY:
         return "AI is not configured (missing GROQ_API_KEY)."
+    context = await _build_server_knowledge()
+    system_content = AI_SYSTEM_PROMPT
+    if context:
+        system_content += f"\n\nSERVER CONTEXT:\n{context}"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -320,7 +397,7 @@ async def ask_groq(question: str) -> str:
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": question},
         ],
     }
@@ -1026,6 +1103,16 @@ async def test(interaction: discord.Interaction):
             "You don't have permission to use this command.", ephemeral=True)
         return
     await interaction.response.send_message("✅ Test command works!")
+
+@tree.command(name="refreshknowledge", description="Force the AI to re-read its knowledge channels (restricted)")
+async def refreshknowledge(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _has_level_role(member):
+        await interaction.response.send_message(
+            "You don't have permission to use this command.", ephemeral=True)
+        return
+    _invalidate_knowledge_cache()
+    await interaction.response.send_message("🔄 Knowledge cache cleared — it'll re-read on the next question.", ephemeral=True)
 
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
