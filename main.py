@@ -21,6 +21,11 @@ RESET_TIME         = time(23, 0)
 RESET_WEEKDAY      = 6
 TIMEZONE           = pytz.timezone("UTC")
 
+# ── Weekly leaderboard winners config ─────────────────────────────────────────
+LEADERBOARD_WINNERS_CHANNEL = 1495873647775322202
+LEADERBOARD_WINNER_ROLE_ID  = 1515066635667505323
+TOP_N_WINNERS                = 5
+
 # ── Streak config ────────────────────────────────────────────────────────────
 STREAK_DB_CHANNEL       = 1515834119727222834
 STREAK_ANNOUNCE_CHANNEL = 1423121104675016768
@@ -955,6 +960,15 @@ async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4]
     thread = thread_with_message.thread
     await interaction.followup.send(f"Posted: {thread.mention}", ephemeral=True)
 
+@tree.command(name="test", description="Test command (restricted)")
+async def test(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _has_level_role(member):
+        await interaction.response.send_message(
+            "You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.send_message("✅ Test command works!", ephemeral=True)
+
 # ── Weekly reset ──────────────────────────────────────────────────────────────
 @tasks.loop(time=RESET_TIME)
 async def weekly_reset():
@@ -964,6 +978,43 @@ async def weekly_reset():
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if not db_channel:
         return
+
+    # Tally counts and announce the top winners before wiping the log.
+    counts = await tally_counts()
+    guild = db_channel.guild
+    if counts and guild:
+        sorted_users = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:TOP_N_WINNERS]
+        lines = []
+        winner_role = guild.get_role(LEADERBOARD_WINNER_ROLE_ID)
+
+        # Clear the role from anyone who currently has it
+        if winner_role:
+            for member in list(winner_role.members):
+                try:
+                    await member.remove_roles(winner_role)
+                except discord.HTTPException:
+                    pass
+
+        for i, (uid, count) in enumerate(sorted_users):
+            member = guild.get_member(int(uid))
+            name   = member.mention if member else f"<@{uid}>"
+            lines.append(f"**{i + 1}.** {name} — `{count}` msgs")
+            if member and winner_role:
+                try:
+                    await member.add_roles(winner_role)
+                except discord.HTTPException:
+                    pass
+
+        announce_channel = bot.get_channel(LEADERBOARD_WINNERS_CHANNEL)
+        if announce_channel and lines:
+            embed = discord.Embed(
+                title="🏆 Weekly Message Leaderboard Winners",
+                description="\n".join(lines),
+                color=0xFFD700,
+            )
+            embed.set_footer(text="Congrats to this week's most active members!")
+            await announce_channel.send(embed=embed)
+
     deleted = await db_channel.purge(limit=None)
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
