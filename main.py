@@ -38,19 +38,9 @@ AI_SYSTEM_PROMPT = (
     "sure rather than guessing. Keep answers clear and reasonably concise."
 )
 
-# Channels the bot reads through to build its knowledge of the server
-# (rules, FAQs, announcements, panels, etc.)
-KNOWLEDGE_CHANNEL_IDS = [
-    1423121103647281273,
-    1495165085008527490,
-    1495162997734117386,
-    1495262676618580149,
-    1512556161205928046,
-    1440102935601217702,
-    1440124661592625342,
-    1495873647775322202,
-    1423121104675016766,
-]
+# Channels the bot reads through to build its knowledge of the server.
+# Instead of a fixed list, it dynamically discovers every text/forum channel
+# that @everyone can see (i.e. not staff-only / private channels).
 KNOWLEDGE_MSGS_PER_CHANNEL = 100   # how far back to read in each channel
 KNOWLEDGE_CACHE_TTL        = 600  # seconds before re-reading the channels
 KNOWLEDGE_MAX_CHARS        = 12000  # cap on how much context gets sent per question
@@ -345,6 +335,20 @@ def _extract_message_text(msg: discord.Message) -> str:
             parts.append(f"{f.name}: {f.value}")
     return "\n".join(p for p in parts if p)
 
+def _get_public_knowledge_channels() -> list:
+    """Every text/forum channel where @everyone has View Channel access
+    (i.e. not staff-only or private)."""
+    channels = []
+    for guild in bot.guilds:
+        everyone = guild.default_role
+        for channel in guild.channels:
+            if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                continue
+            perms = channel.permissions_for(everyone)
+            if perms.view_channel:
+                channels.append(channel)
+    return channels
+
 async def _build_server_knowledge() -> str:
     import time as _time
     global _knowledge_cache, _knowledge_cache_time
@@ -353,10 +357,7 @@ async def _build_server_knowledge() -> str:
         return _knowledge_cache
 
     sections = []
-    for channel_id in KNOWLEDGE_CHANNEL_IDS:
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            continue
+    for channel in _get_public_knowledge_channels():
         lines = []
         try:
             if isinstance(channel, discord.ForumChannel):
