@@ -14,7 +14,8 @@ from typing import Literal
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
 YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg0"
-TIKAPI_KEY         = "lFoJPYkghHxXrc33873j9AOlf9RNV9XNw7hDek9xhH0w00q8"
+KEYAPI_TOKEN       = "46d0ce4df7bc41c0a9a62675f0e4231d"   # EchoTik / KeyAPI bearer token
+KEYAPI_BASE        = "https://api.keyapi.ai"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -55,7 +56,7 @@ STREAK_GRACE_HOURS  = 4
 MOD_ROLE_ID         = 1423121100358811795
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
-DYNO_PREFIXES       = ("?", "!", ".")  # adjust if your Dyno uses a different prefix
+DYNO_PREFIXES       = ("?", "!", ".")
 PTS_BAN             = 3
 PTS_WARN            = 1
 PTS_THANKS          = 2
@@ -71,24 +72,22 @@ _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
 # ── Ticket system config ──────────────────────────────────────────────────────
-TICKET_PANEL_CHANNEL    = 1495162997734117386   # where the dropdown panel lives, threads are created here
-SUPPORT_ROLE_ID         = 1495495210422112366   # added to every ticket thread + pinged
-TICKET_LOG_CHANNEL_ID   = 1517621119425839154                    # TODO: set this — used to persist the ticket counter across restarts
-MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239                    # TODO: set this — transcripts get posted here
+TICKET_PANEL_CHANNEL    = 1495162997734117386
+SUPPORT_ROLE_ID         = 1495495210422112366
+TICKET_LOG_CHANNEL_ID   = 1517621119425839154
+MOD_NOTIFS_CHANNEL_ID   = 1423121107057246239
 
 _ticket_counter = 0
 _ticket_counter_loaded = False
 
 # ── Level forum-post config ───────────────────────────────────────────────────
 LEVEL_FORUM_CHANNEL_ID = 1512556161205928046
-LEVEL_ROLE_ID          = 1423121100421861438   # only this role can run /sendlevel
+LEVEL_ROLE_ID          = 1423121100421861438
 LEVEL_ONE_TAG_ID       = 1517631235692957736
 LEVEL_TWO_TAG_ID       = 1517631552241139723
 LEVEL_THREE_TAG_ID     = 1517631604309098709
 LEVEL_FOUR_TAG_ID      = 1517631633073766462
 
-# Path to local image files used for each level's forum post.
-# Files are loose, sitting in the same directory as bot.py — named exactly as listed below.
 LEVEL_IMAGES_DIR = "."
 
 LEVELS = {
@@ -201,7 +200,6 @@ async def _tally_mod_points() -> dict:
     return result
 
 async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
-    """Look back a few messages to find the mod who triggered Dyno."""
     try:
         async for m in channel.history(limit=25):
             if m.author.bot:
@@ -216,7 +214,6 @@ async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
     return None
 
 async def handle_dyno_warn(message: discord.Message):
-    """Detect Dyno warn confirmation and award 1 point to issuing mod."""
     if message.author.id != DYNO_BOT_ID or not message.guild:
         return
     text_blobs = [message.content or ""]
@@ -234,8 +231,6 @@ async def handle_dyno_warn(message: discord.Message):
     if "warn" not in combined:
         return
 
-    # 1) Try to find a moderator ID inside the embed itself (Dyno often
-    #    includes a "Moderator" field or footer like "Moderator: name (id)").
     invoker_id = None
     id_re = re.compile(r"(\d{17,20})")
     for e in message.embeds:
@@ -253,8 +248,6 @@ async def handle_dyno_warn(message: discord.Message):
         if invoker_id:
             break
 
-    # 2) Fallback: scan recent channel history for the staff member who
-    #    invoked the warn via a Dyno prefix command.
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
         if invoker:
@@ -276,7 +269,6 @@ async def handle_mod_rewards(message: discord.Message):
         return
     author_member = message.guild.get_member(message.author.id)
 
-    # 50-message milestone for staff
     if _is_mod(author_member):
         uid = str(message.author.id)
         _staff_msg_counts[uid] = _staff_msg_counts.get(uid, 0) + 1
@@ -284,7 +276,6 @@ async def handle_mod_rewards(message: discord.Message):
             _staff_msg_counts[uid] = 0
             await _award_points(message.author.id, PTS_PER_50_MSGS, "messages")
 
-    # Thank-you detection (non-staff thanking staff)
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
         if message.id in _thanked_messages:
             return
@@ -299,7 +290,7 @@ async def handle_mod_rewards(message: discord.Message):
                 if last_thank_time_str:
                     last_time = datetime.fromisoformat(last_thank_time_str)
                     if (now - last_time) < timedelta(minutes=20):
-                        continue  # still in cooldown
+                        continue
                 _thank_cooldowns[str(m.id)] = now.isoformat()
                 targets.append(mem)
 
@@ -308,8 +299,23 @@ async def handle_mod_rewards(message: discord.Message):
             for staff in targets:
                 await _award_points(staff.id, PTS_THANKS, "thanks")
 
-# ── Video announcement helpers ──────────────────────────────────────────────────
-_last_video_ids: dict[str, str] = {}  # {"tiktok": id, "youtube": id}
+# ── KeyAPI / EchoTik helpers ──────────────────────────────────────────────────
+async def _keyapi_get(session: aiohttp.ClientSession, path: str, params: dict = {}) -> dict:
+    async with session.get(
+        f"{KEYAPI_BASE}/{path.lstrip('/')}",
+        headers={"Authorization": f"Bearer {KEYAPI_TOKEN}", "Accept": "application/json"},
+        params=params,
+    ) as r:
+        raw = await r.text()
+        if r.status != 200:
+            raise ValueError(f"KeyAPI returned status {r.status}: {raw[:200]}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"KeyAPI returned non-JSON: {raw[:200]}") from e
+
+# ── Video announcement helpers ────────────────────────────────────────────────
+_last_video_ids: dict[str, str] = {}
 _video_ids_loaded = False
 
 async def _load_last_video_ids():
@@ -342,21 +348,15 @@ async def get_latest_tiktok_video(username: str):
     """Returns (video_id, video_url) for the most recent post, or (None, None)."""
     async with aiohttp.ClientSession() as session:
         try:
-            user_data = await _tikapi_get(session, "public/check", {"username": username})
-            sec_uid = user_data.get("userInfo", {}).get("user", {}).get("secUid") or user_data.get("secUid")
+            data = await _keyapi_get(session, "tiktok/influencer/videos", {"username": username, "count": 1})
         except ValueError:
             return None, None
-        if not sec_uid:
-            return None, None
-        try:
-            data = await _tikapi_get(session, "public/posts", {"secUid": sec_uid, "count": 1})
-        except ValueError:
-            return None, None
-        videos = data.get("itemList", [])
+        result = data.get("data", {})
+        videos = result.get("videos") if isinstance(result, dict) else result
         if not videos:
             return None, None
-        video = videos[0]
-        video_id = video.get("id")
+        video    = videos[0]
+        video_id = str(video.get("id") or video.get("video_id") or "")
         if not video_id:
             return None, None
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
@@ -425,7 +425,6 @@ async def video_checker():
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
-    # Dyno warn detection runs even though Dyno is a bot
     await handle_dyno_warn(message)
 
     if message.author.bot:
@@ -639,69 +638,65 @@ async def fetch_youtube_stats(url: str):
             "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
         }
 
-# ── TikTok helpers ───────────────────────────────────────────────────────────
+# ── TikTok helpers (KeyAPI / EchoTik) ────────────────────────────────────────
 def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
-async def _tikapi_get(session: aiohttp.ClientSession, endpoint: str, params: dict = {}) -> dict:
-    async with session.get(
-        f"https://api.tikapi.io/{endpoint}",
-        headers={"X-API-KEY": TIKAPI_KEY, "Accept": "application/json"},
-        params=params,
-    ) as r:
-        raw = await r.text()
-        if r.status != 200:
-            raise ValueError(f"TikAPI returned status {r.status}: {raw[:200]}")
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"TikAPI returned non-JSON: {raw[:200]}") from e
-
 async def fetch_tiktok_posts_data(username: str):
+    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count)."""
     total_views    = 0
     video_count    = 0
     follower_count = 0
-    cursor         = None
-    has_more       = True
+
     async with aiohttp.ClientSession() as session:
-        sec_uid = None
+        # Fetch follower count from profile
         try:
-            user_data      = await _tikapi_get(session, "public/check", {"username": username})
-            user_info      = user_data.get("userInfo", {})
-            stats          = user_info.get("stats", {})
-            follower_count = int(stats.get("followerCount", 0))
-            sec_uid        = user_info.get("user", {}).get("secUid") or user_data.get("secUid")
+            profile_data   = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
+            follower_count = int(profile_data.get("data", {}).get("followers", 0))
         except ValueError:
             pass
-        if not sec_uid:
-            return 0, 0, follower_count
+
+        # Paginate through all videos, filter for #dreamyvr
+        cursor   = None
+        has_more = True
         while has_more:
-            params = {"secUid": sec_uid, "count": 30}
+            params = {"username": username, "count": 30}
             if cursor:
                 params["cursor"] = cursor
             try:
-                data = await _tikapi_get(session, "public/posts", params)
+                data = await _keyapi_get(session, "tiktok/influencer/videos", params)
             except ValueError:
                 break
-            videos   = data.get("itemList", [])
-            has_more = bool(data.get("hasMore", False))
-            cursor   = data.get("cursor", None)
+
+            result   = data.get("data", {})
+            videos   = result.get("videos") if isinstance(result, dict) else (result if isinstance(result, list) else [])
+            has_more = bool(result.get("has_more", False)) if isinstance(result, dict) else False
+            cursor   = result.get("cursor") if isinstance(result, dict) else None
+
             if not videos:
                 break
+
             for video in videos:
-                desc       = video.get("desc", "").lower()
+                desc       = (video.get("desc") or video.get("title") or video.get("description") or "").lower()
+                # Also check hashtag lists if the API returns them
                 challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
                 text_extra = [t.get("hashtagName", "").lower() for t in video.get("textExtra", [])]
                 has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges or "dreamyvr" in text_extra
                 if has_tag:
-                    play_count = (
-                        video.get("stats", {}).get("playCount")
-                        or video.get("statsV2", {}).get("playCount")
+                    play_count  = (
+                        video.get("play_count")
+                        or video.get("views")
+                        or video.get("playCount")
+                        or video.get("stats", {}).get("playCount")
                         or 0
                     )
                     total_views += int(play_count)
                     video_count += 1
+
+            if not has_more or not cursor:
+                break
+
     return total_views, video_count, follower_count
 
 async def fetch_tiktok_stats(url: str):
@@ -710,8 +705,8 @@ async def fetch_tiktok_stats(url: str):
         raise ValueError("Couldn't parse that TikTok URL.")
     async with aiohttp.ClientSession() as session:
         try:
-            user_data = await _tikapi_get(session, "public/check", {"username": username})
-            nickname  = user_data.get("userInfo", {}).get("user", {}).get("nickname", username)
+            profile_data = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
+            nickname     = profile_data.get("data", {}).get("nickname", username)
         except Exception:
             nickname = username
     dreamyvr_views, dreamyvr_count, followers = await fetch_tiktok_posts_data(username)
@@ -1054,7 +1049,6 @@ async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4]
         await interaction.followup.send("Could not reach the forum channel.", ephemeral=True)
         return
 
-    # Resolve the forum tag
     applied_tags = []
     tag_id = level_data.get("tag_id")
     if tag_id:
@@ -1062,7 +1056,6 @@ async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4]
         if tag:
             applied_tags.append(tag)
 
-    # Attach any local images configured for this level
     files = []
     for filename in level_data.get("images", []):
         path = os.path.join(LEVEL_IMAGES_DIR, filename)
@@ -1102,7 +1095,6 @@ async def weekly_reset():
     if not db_channel:
         return
 
-    # Tally counts and announce the top winners before wiping the log.
     counts = await tally_counts()
     guild = db_channel.guild
     if counts and guild:
@@ -1110,7 +1102,6 @@ async def weekly_reset():
         lines = []
         winner_role = guild.get_role(LEADERBOARD_WINNER_ROLE_ID)
 
-        # Clear the role from anyone who currently has it
         if winner_role:
             for member in list(winner_role.members):
                 try:
@@ -1245,9 +1236,6 @@ async def streak_checker():
 
 async def handle_streak(message: discord.Message):
     from datetime import datetime, timezone
-    # Don't touch streak_data until it's been restored from the DB channel,
-    # otherwise a message arriving right after a restart sees an empty
-    # streak_data and incorrectly grants a brand-new streak.
     await _streaks_ready.wait()
 
     uid = str(message.author.id)
@@ -1261,10 +1249,7 @@ async def handle_streak(message: discord.Message):
         data["messages_today"] = data.get("messages_today", 0) + 1
         streak_data[uid] = data
         if data["messages_today"] >= MESSAGES_REQUIRED:
-            # Allow extending any time after the window opens (24h) — the
-            # streak_checker loop is what actually breaks a streak once the
-            # grace period (28h) passes, so we don't need an upper bound here.
-            in_window = last_time is not None and elapsed_hours >= STREAK_WINDOW_HOURS
+            in_window   = last_time is not None and elapsed_hours >= STREAK_WINDOW_HOURS
             no_streak_yet = last_time is None or data.get("streak", 0) == 0
             if in_window or no_streak_yet:
                 data["streak"] = data.get("streak", 0) + 1
@@ -1307,8 +1292,6 @@ async def on_member_remove(member: discord.Member):
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def _load_ticket_counter():
-    """Persist the ticket counter across restarts by reading the last
-    TICKETNUM: message from the log channel."""
     global _ticket_counter, _ticket_counter_loaded
     if _ticket_counter_loaded:
         return
@@ -1406,17 +1389,11 @@ async def create_ticket(interaction: discord.Interaction, category: str, answers
         await interaction.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
         return
 
-    # Add the ticket creator
     try:
         await thread.add_user(interaction.user)
     except discord.HTTPException:
         pass
 
-    # NOTE: support staff are NOT individually added here. Instead, give the
-    # support role "Manage Threads" permission in this channel (Server Settings
-    # → Roles → permissions, or a channel-specific permission overwrite) — anyone
-    # with Manage Threads can already see and open every private thread in the
-    # channel without needing to be added one by one.
     support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
 
     embed = discord.Embed(title=category, color=0x2b2d31)
@@ -1475,8 +1452,7 @@ class TicketPanelView(discord.ui.View):
 async def post_ticket_panel():
     channel = bot.get_channel(TICKET_PANEL_CHANNEL)
     if not channel:
-        print(f"[ticket panel] ERROR: could not find channel with ID {TICKET_PANEL_CHANNEL}. "
-              f"Check the ID is correct and the bot is in that guild.")
+        print(f"[ticket panel] ERROR: could not find channel with ID {TICKET_PANEL_CHANNEL}.")
         return
 
     perms = channel.permissions_for(channel.guild.me)
@@ -1499,6 +1475,7 @@ async def post_ticket_panel():
         return
     except discord.HTTPException as e:
         print(f"[ticket panel] ERROR while clearing old panel messages: {e}")
+
     embed = discord.Embed(
         title="🎫  How to Create a Ticket",
         description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
@@ -1527,7 +1504,7 @@ async def post_ticket_panel():
         print(f"[ticket panel] ERROR sending panel message: {e}")
 
 
-# ── Ticket controls (open ticket → close button) ─────────────────────────────
+# ── Ticket controls ───────────────────────────────────────────────────────────
 class TicketOpenView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1540,13 +1517,8 @@ class TicketOpenView(discord.ui.View):
             await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
             return
 
-        if not _is_mod(interaction.guild.get_member(interaction.user.id)) and \
-           interaction.user.id not in [m.id for m in await thread.fetch_members()]:
-            pass  # let anyone in the thread close it; tighten this if you want staff-only
-
         await interaction.response.defer()
 
-        # Build + post transcript
         transcript_file = await _build_transcript(thread)
         notifs_channel = bot.get_channel(MOD_NOTIFS_CHANNEL_ID)
         transcript_link = f"<#{MOD_NOTIFS_CHANNEL_ID}>"
@@ -1569,7 +1541,6 @@ class TicketOpenView(discord.ui.View):
         )
         await thread.send(embed=control_embed, view=TicketClosedView())
 
-        # Lock the original opener out, rename to Closed-XXXX
         m = re.search(r"ticket-(\d+)", thread.name)
         number = m.group(1) if m else "0000"
         try:
@@ -1577,7 +1548,6 @@ class TicketOpenView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-        # Remove the ticket creator (first non-staff member) from the thread
         opener_id = await _get_ticket_opener_id(thread)
         if opener_id:
             try:
@@ -1588,13 +1558,7 @@ class TicketOpenView(discord.ui.View):
 
 
 async def _get_ticket_opener_id(thread: discord.Thread):
-    """The opener is whoever the very first embed in the thread was footer-tagged for."""
     async for msg in thread.history(limit=20, oldest_first=True):
-        if msg.embeds and msg.embeds[0].footer and msg.embeds[0].footer.text:
-            m = re.search(r"Opened by .+#\d+|Opened by .+", msg.embeds[0].footer.text)
-            if m:
-                # fall back: use mentions in the welcome message instead, more reliable
-                pass
         if msg.mentions:
             return msg.mentions[0].id
     return None
