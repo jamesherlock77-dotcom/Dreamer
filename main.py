@@ -1633,6 +1633,25 @@ class TicketClosedView(discord.ui.View):
             pass
 
 
+# ── /debugtiktok ─────────────────────────────────────────────────────────────
+@tree.command(name="debugtiktok", description="Debug TikTok API response (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def debugtiktok(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True)
+    async with aiohttp.ClientSession() as session:
+        try:
+            profile = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
+            videos  = await _keyapi_get(session, "tiktok/influencer/videos", {"username": username, "count": 3})
+        except ValueError as e:
+            await interaction.followup.send(f"API error: {e}", ephemeral=True)
+            return
+
+    profile_str = json.dumps(profile, indent=2)[:1800]
+    videos_str  = json.dumps(videos,  indent=2)[:1800]
+
+    await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
+    await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
