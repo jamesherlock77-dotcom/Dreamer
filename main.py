@@ -15,7 +15,7 @@ from typing import Literal
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
 YOUTUBE_API_KEY    = "AIzaSyAe5hyEAwxTCdBbZRQQsGfuQC6xlQWUBg0"
 KEYAPI_TOKEN       = "46d0ce4df7bc41c0a9a62675f0e4231d"   # EchoTik / KeyAPI bearer token
-KEYAPI_BASE        = "https://api.keyapi.ai"
+KEYAPI_BASE        = "https://api.keyapi.ai/v1"
 DB_CHANNEL_ID      = 1515064641246466113
 LINK_CMD_CHANNEL   = 1513272619439226980
 LINK_LOG_CHANNEL   = 1512899799077093546
@@ -348,15 +348,20 @@ async def get_latest_tiktok_video(username: str):
     """Returns (video_id, video_url) for the most recent post, or (None, None)."""
     async with aiohttp.ClientSession() as session:
         try:
-            data = await _keyapi_get(session, "tiktok/influencer/videos", {"username": username, "count": 1})
+            data = await _keyapi_get(session, "tiktok/influencer/videos", {"unique_id": username, "count": 1})
         except ValueError:
             return None, None
         result = data.get("data", {})
-        videos = result.get("videos") if isinstance(result, dict) else result
+        # KeyAPI returns aweme_list at the top level of data
+        videos = (
+            result.get("aweme_list")
+            or result.get("videos")
+            or (result if isinstance(result, list) else [])
+        )
         if not videos:
             return None, None
         video    = videos[0]
-        video_id = str(video.get("id") or video.get("video_id") or "")
+        video_id = str(video.get("aweme_id") or video.get("id") or video.get("video_id") or "")
         if not video_id:
             return None, None
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
@@ -650,10 +655,12 @@ async def fetch_tiktok_posts_data(username: str):
     follower_count = 0
 
     async with aiohttp.ClientSession() as session:
-        # Fetch follower count from profile
+        # Fetch follower count — profile endpoint uses unique_id param
+        # and returns data.user_info.follower_count
         try:
-            profile_data   = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
-            follower_count = int(profile_data.get("data", {}).get("followers", 0))
+            profile_data   = await _keyapi_get(session, "tiktok/influencer/detail", {"unique_id": username})
+            user_info      = profile_data.get("data", {}).get("user_info", {})
+            follower_count = int(user_info.get("follower_count", 0))
         except ValueError:
             pass
 
@@ -661,7 +668,7 @@ async def fetch_tiktok_posts_data(username: str):
         cursor   = None
         has_more = True
         while has_more:
-            params = {"username": username, "count": 30}
+            params = {"unique_id": username, "count": 30}
             if cursor:
                 params["cursor"] = cursor
             try:
@@ -669,26 +676,27 @@ async def fetch_tiktok_posts_data(username: str):
             except ValueError:
                 break
 
-            result   = data.get("data", {})
-            videos   = result.get("videos") if isinstance(result, dict) else (result if isinstance(result, list) else [])
-            has_more = bool(result.get("has_more", False)) if isinstance(result, dict) else False
-            cursor   = result.get("cursor") if isinstance(result, dict) else None
+            result = data.get("data", {})
+            # Videos are in aweme_list
+            videos   = result.get("aweme_list") or result.get("videos") or []
+            has_more = bool(result.get("has_more", False))
+            cursor   = result.get("cursor") if result.get("has_more") else None
 
             if not videos:
                 break
 
             for video in videos:
-                desc       = (video.get("desc") or video.get("title") or video.get("description") or "").lower()
-                # Also check hashtag lists if the API returns them
-                challenges = [c.get("title", "").lower() for c in video.get("challenges", [])]
-                text_extra = [t.get("hashtagName", "").lower() for t in video.get("textExtra", [])]
+                desc       = (video.get("desc") or video.get("title") or "").lower()
+                challenges = [c.get("title", "").lower() for c in (video.get("challenges") or [])]
+                text_extra = [t.get("hashtagName", "").lower() for t in (video.get("text_extra") or [])]
                 has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges or "dreamyvr" in text_extra
                 if has_tag:
-                    play_count  = (
-                        video.get("play_count")
-                        or video.get("views")
+                    stats      = video.get("statistics") or video.get("stats") or {}
+                    play_count = (
+                        stats.get("play_count")
+                        or stats.get("playCount")
+                        or video.get("play_count")
                         or video.get("playCount")
-                        or video.get("stats", {}).get("playCount")
                         or 0
                     )
                     total_views += int(play_count)
@@ -705,8 +713,8 @@ async def fetch_tiktok_stats(url: str):
         raise ValueError("Couldn't parse that TikTok URL.")
     async with aiohttp.ClientSession() as session:
         try:
-            profile_data = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
-            nickname     = profile_data.get("data", {}).get("nickname", username)
+            profile_data = await _keyapi_get(session, "tiktok/influencer/detail", {"unique_id": username})
+            nickname     = profile_data.get("data", {}).get("user_info", {}).get("nickname", username)
         except Exception:
             nickname = username
     dreamyvr_views, dreamyvr_count, followers = await fetch_tiktok_posts_data(username)
@@ -1640,8 +1648,8 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
         try:
-            profile = await _keyapi_get(session, "tiktok/influencer/detail", {"username": username})
-            videos  = await _keyapi_get(session, "tiktok/influencer/videos", {"username": username, "count": 3})
+            profile = await _keyapi_get(session, "tiktok/influencer/detail", {"unique_id": username})
+            videos  = await _keyapi_get(session, "tiktok/influencer/videos", {"unique_id": username, "count": 3})
         except ValueError as e:
             await interaction.followup.send(f"API error: {e}", ephemeral=True)
             return
