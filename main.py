@@ -9,6 +9,7 @@ import asyncio
 import aiohttp
 from datetime import datetime, time, timedelta
 import pytz
+import time as _time
 from typing import Literal
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -70,6 +71,11 @@ THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORE
 _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
+
+# ── Counts cache ─────────────────────────────────────────────────────────────
+_counts_cache: dict | None = None
+_counts_cache_time: float  = 0
+COUNTS_CACHE_TTL = 300  # 5 minutes
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -352,7 +358,6 @@ async def get_latest_tiktok_video(username: str):
         except ValueError:
             return None, None
         result = data.get("data", {})
-        # KeyAPI returns aweme_list at the top level of data
         videos = (
             result.get("aweme_list")
             or result.get("videos")
@@ -467,8 +472,12 @@ async def on_member_ban(guild: discord.Guild, user):
     except discord.Forbidden:
         pass
 
-# ── Helper: tally message counts ─────────────────────────────────────────────
+# ── Helper: tally message counts (with 5-minute cache) ───────────────────────
 async def tally_counts() -> dict:
+    global _counts_cache, _counts_cache_time
+    now = _time.monotonic()
+    if _counts_cache is not None and (now - _counts_cache_time) < COUNTS_CACHE_TTL:
+        return _counts_cache
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     counts = {}
     async for msg in db_channel.history(limit=None, oldest_first=True):
@@ -476,11 +485,29 @@ async def tally_counts() -> dict:
             uid = msg.content.strip()
             if uid.isdigit():
                 counts[uid] = counts.get(uid, 0) + 1
+    _counts_cache = counts
+    _counts_cache_time = now
     return counts
+
+# ── Background task: refresh counts cache every 5 minutes ────────────────────
+@tasks.loop(minutes=5)
+async def counts_refresher():
+    global _counts_cache, _counts_cache_time
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        return
+    counts = {}
+    async for msg in db_channel.history(limit=None, oldest_first=True):
+        if msg.author.bot:
+            uid = msg.content.strip()
+            if uid.isdigit():
+                counts[uid] = counts.get(uid, 0) + 1
+    _counts_cache = counts
+    _counts_cache_time = _time.monotonic()
+    print(f"[counts_refresher] Cache refreshed — {len(counts)} users tracked.")
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
-    import time as _time
     global _approved_links_cache, _approved_links_cache_time
     now = _time.monotonic()
     if _approved_links_cache is not None and (now - _approved_links_cache_time) < CACHE_TTL:
@@ -655,8 +682,6 @@ async def fetch_tiktok_posts_data(username: str):
     follower_count = 0
 
     async with aiohttp.ClientSession() as session:
-        # Fetch follower count — profile endpoint uses unique_id param
-        # and returns data.user_info.follower_count
         try:
             profile_data   = await _keyapi_get(session, "tiktok/influencer/detail", {"unique_id": username})
             user_info      = profile_data.get("data", {}).get("user_info", {})
@@ -664,7 +689,6 @@ async def fetch_tiktok_posts_data(username: str):
         except ValueError:
             pass
 
-        # Paginate through all videos, filter for #dreamyvr
         cursor   = None
         has_more = True
         while has_more:
@@ -677,7 +701,6 @@ async def fetch_tiktok_posts_data(username: str):
                 break
 
             result = data.get("data", {})
-            # Videos are in aweme_list
             videos   = result.get("aweme_list") or result.get("videos") or []
             has_more = bool(result.get("has_more", False))
             cursor   = result.get("cursor") if result.get("has_more") else None
@@ -1137,6 +1160,12 @@ async def weekly_reset():
             await announce_channel.send(content)
 
     deleted = await db_channel.purge(limit=None)
+
+    # Invalidate counts cache after purge so stale data isn't served
+    global _counts_cache, _counts_cache_time
+    _counts_cache      = None
+    _counts_cache_time = 0
+
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
 
@@ -1670,6 +1699,7 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
+    counts_refresher.start()
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
