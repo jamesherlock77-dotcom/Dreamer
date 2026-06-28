@@ -11,6 +11,7 @@ from datetime import datetime, time, timedelta
 import pytz
 import time as _time
 from typing import Literal
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
@@ -1080,6 +1081,144 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+# ── Rank card helpers ─────────────────────────────────────────────────────────
+async def _get_all_levels() -> dict[str, int]:
+    """Read LEVEL:uid:level entries from the DB channel, keep highest per user."""
+    db = bot.get_channel(LEVEL_DB_CHANNEL_ID)
+    if not db:
+        return {}
+    levels: dict[str, int] = {}
+    async for msg in db.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        if not msg.content.startswith("LEVEL:"):
+            continue
+        parts = msg.content.split(":", 2)
+        if len(parts) != 3:
+            continue
+        uid, lvl_str = parts[1], parts[2]
+        try:
+            lvl = int(lvl_str)
+        except ValueError:
+            continue
+        if lvl > levels.get(uid, 0):
+            levels[uid] = lvl
+    return levels
+
+async def _fetch_avatar_bytes(user: discord.User) -> bytes | None:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(str(user.display_avatar.url)) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception:
+        pass
+    return None
+
+def _generate_rank_card(
+    username: str,
+    avatar_bytes: bytes | None,
+    level: int,
+    rank: int,
+) -> io.BytesIO:
+    W, H = 934, 282
+    BG        = (30, 30, 35)
+    GRAY      = (60, 60, 65)
+    WHITE     = (255, 255, 255)
+    LIGHTGRAY = (180, 180, 180)
+    ACCENT    = (100, 100, 110)
+
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Avatar
+    avatar_size = 200
+    avatar_x, avatar_y = 40, 41
+    if avatar_bytes:
+        try:
+            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
+            mask = Image.new("L", (avatar_size, avatar_size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+            av_rgb = Image.new("RGB", (avatar_size, avatar_size), BG)
+            av_rgb.paste(av, mask=av.split()[3] if av.mode == "RGBA" else None)
+            img.paste(av_rgb, (avatar_x, avatar_y), mask)
+        except Exception:
+            draw.ellipse((avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size), fill=GRAY)
+    else:
+        draw.ellipse((avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size), fill=GRAY)
+
+    # Fonts — fall back to default if not available
+    try:
+        font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
+        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
+        font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+    except Exception:
+        font_big = font_med = font_small = font_label = ImageFont.load_default()
+
+    text_x = avatar_x + avatar_size + 40
+
+    # Username
+    draw.text((text_x, 50), username, font=font_med, fill=WHITE)
+
+    # RANK and LEVEL on the right
+    rank_text  = f"RANK #{rank}"
+    level_text = f"LEVEL {level}"
+    draw.text((W - 420, 30), rank_text,  font=font_small, fill=LIGHTGRAY)
+    draw.text((W - 280, 18), level_text, font=font_big,   fill=WHITE)
+
+    # XP text
+    draw.text((text_x, 110), "0 XP", font=font_small, fill=LIGHTGRAY)
+    draw.text((W - 200, 110), "0 XP left", font=font_label, fill=LIGHTGRAY)
+
+    # Progress bar
+    bar_x, bar_y = text_x, 170
+    bar_w, bar_h = W - text_x - 40, 28
+    radius = bar_h // 2
+    # Background bar
+    draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=radius, fill=GRAY)
+    # Empty fill (0 XP so just show empty)
+    draw.rounded_rectangle((bar_x, bar_y, bar_x + int(bar_w * 0.01), bar_y + bar_h), radius=radius, fill=ACCENT)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+# ── /rank ─────────────────────────────────────────────────────────────────────
+RANK_ALLOWED_ROLE_ID = 1423121100421861438
+
+@tree.command(name="rank", description="View your rank card")
+@app_commands.describe(user="User to check (defaults to yourself)")
+async def rank(interaction: discord.Interaction, user: discord.Member = None):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not member or not any(r.id == RANK_ALLOWED_ROLE_ID for r in member.roles):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    target = user or interaction.user
+    await interaction.response.defer()
+
+    levels = await _get_all_levels()
+    uid    = str(target.id)
+
+    if uid not in levels:
+        await interaction.followup.send(f"{target.mention} hasn't reached any level yet.", ephemeral=True)
+        return
+
+    # Sort all users by level descending to determine rank
+    sorted_levels = sorted(levels.items(), key=lambda x: x[1], reverse=True)
+    rank_pos = next((i + 1 for i, (u, _) in enumerate(sorted_levels) if u == uid), 0)
+
+    avatar_bytes = await _fetch_avatar_bytes(target)
+    buf = _generate_rank_card(
+        username=target.display_name,
+        avatar_bytes=avatar_bytes,
+        level=levels[uid],
+        rank=rank_pos,
+    )
+    await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
 
 # ── /sendlevel ────────────────────────────────────────────────────────────────
 def _has_level_role(member: discord.Member) -> bool:
