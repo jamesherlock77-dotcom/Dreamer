@@ -77,7 +77,7 @@ CACHE_TTL = 300
 # ── Counts cache ─────────────────────────────────────────────────────────────
 _counts_cache: dict | None = None
 _counts_cache_time: float  = 0
-COUNTS_CACHE_TTL = 300  # 5 minutes
+COUNTS_CACHE_TTL = 45  # seconds, matches counts_refresher interval
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -540,7 +540,7 @@ async def tally_counts() -> dict:
     return counts
 
 # ── Background task: refresh counts cache every 5 minutes ────────────────────
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=45)
 async def counts_refresher():
     global _counts_cache, _counts_cache_time
     db_channel = bot.get_channel(DB_CHANNEL_ID)
