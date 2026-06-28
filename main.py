@@ -11,7 +11,6 @@ from datetime import datetime, time, timedelta
 import pytz
 import time as _time
 from typing import Literal
-from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ── Config ───────────────────────────────────────────────────────────────────
 TOKEN              = os.environ["DISCORD_BOT_TOKEN"]
@@ -77,11 +76,6 @@ CACHE_TTL = 300
 _counts_cache: dict | None = None
 _counts_cache_time: float  = 0
 COUNTS_CACHE_TTL = 300  # 5 minutes
-
-# ── Level database config ─────────────────────────────────────────────────────
-LURKR_LEVELUP_CHANNEL = 1423121104675016768
-LEVEL_DB_CHANNEL_ID   = 1520832815539687445
-LURKR_LEVELUP_RE      = re.compile(r"<@!?(\d+)> has reached level \*\*(\d+)\*\*")
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -438,26 +432,10 @@ async def video_checker():
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
-async def handle_lurkr_levelup(message: discord.Message):
-    if message.channel.id != LURKR_LEVELUP_CHANNEL:
-        return
-    if not message.author.bot:
-        return
-    content = message.content or ""
-    m = LURKR_LEVELUP_RE.search(content)
-    if not m:
-        return
-    uid   = m.group(1)
-    level = m.group(2)
-    db = bot.get_channel(LEVEL_DB_CHANNEL_ID)
-    if db:
-        await db.send(f"LEVEL:{uid}:{level}")
-
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
-    await handle_lurkr_levelup(message)
 
     if message.author.bot:
         return
@@ -1081,160 +1059,6 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-
-# ── Rank card helpers ─────────────────────────────────────────────────────────
-async def _get_all_levels() -> dict[str, int]:
-    """Read LEVEL:uid:level entries from the DB channel, keep highest per user."""
-    db = bot.get_channel(LEVEL_DB_CHANNEL_ID)
-    if not db:
-        return {}
-    levels: dict[str, int] = {}
-    async for msg in db.history(limit=None, oldest_first=True):
-        if not msg.author.bot:
-            continue
-        if not msg.content.startswith("LEVEL:"):
-            continue
-        parts = msg.content.split(":", 2)
-        if len(parts) != 3:
-            continue
-        uid, lvl_str = parts[1], parts[2]
-        try:
-            lvl = int(lvl_str)
-        except ValueError:
-            continue
-        if lvl > levels.get(uid, 0):
-            levels[uid] = lvl
-    return levels
-
-async def _fetch_avatar_bytes(user: discord.User) -> bytes | None:
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(str(user.display_avatar.url)) as r:
-                if r.status == 200:
-                    return await r.read()
-    except Exception:
-        pass
-    return None
-
-def _generate_rank_card(
-    username: str,
-    avatar_bytes: bytes | None,
-    level: int,
-    rank: int,
-) -> io.BytesIO:
-    W, H = 934, 282
-    BG        = (43, 45, 49)
-    GRAY_BAR  = (90, 93, 99)
-    WHITE     = (255, 255, 255)
-    LIGHTGRAY = (160, 163, 172)
-
-    img  = Image.new("RGB", (W, H), BG)
-    draw = ImageDraw.Draw(img)
-
-    # ── Avatar (rounded rectangle, not circle) ────────────────────────────────
-    av_size = 220
-    av_x, av_y = 24, 24
-    corner_r = 18
-    if avatar_bytes:
-        try:
-            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((av_size, av_size))
-            mask = Image.new("L", (av_size, av_size), 0)
-            ImageDraw.Draw(mask).rounded_rectangle((0, 0, av_size, av_size), radius=corner_r, fill=255)
-            av_rgb = Image.new("RGB", (av_size, av_size), BG)
-            av_rgb.paste(av.convert("RGB"), (0, 0))
-            img.paste(av_rgb, (av_x, av_y), mask)
-        except Exception:
-            draw.rounded_rectangle((av_x, av_y, av_x + av_size, av_y + av_size), radius=corner_r, fill=GRAY_BAR)
-    else:
-        draw.rounded_rectangle((av_x, av_y, av_x + av_size, av_y + av_size), radius=corner_r, fill=GRAY_BAR)
-
-    # ── Fonts ─────────────────────────────────────────────────────────────────
-    font_path_bold   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font_path_normal = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    try:
-        font_level    = ImageFont.truetype(font_path_bold,   72)  # LEVEL 17
-        font_rank     = ImageFont.truetype(font_path_normal, 36)  # RANK #34
-        font_username = ImageFont.truetype(font_path_bold,   54)  # Jaxsparrow
-        font_xp_big   = ImageFont.truetype(font_path_bold,   42)  # 13,241 XP
-        font_xp_small = ImageFont.truetype(font_path_normal, 28)  # 1,309 XP left
-    except Exception:
-        font_level = font_rank = font_username = font_xp_big = font_xp_small = ImageFont.load_default()
-
-    text_x = av_x + av_size + 36
-
-    # ── Top-right: RANK #N  LEVEL N ──────────────────────────────────────────
-    rank_text  = f"RANK #{rank}"
-    level_text = f"LEVEL {level}"
-
-    # Measure to right-align
-    level_w  = draw.textlength(level_text, font=font_level)
-    rank_w   = draw.textlength(rank_text,  font=font_rank)
-
-    level_x = W - 30 - int(level_w)
-    rank_x  = level_x - int(rank_w) - 24
-
-    draw.text((rank_x,  28), rank_text,  font=font_rank,  fill=LIGHTGRAY)
-    draw.text((level_x, 14), level_text, font=font_level, fill=WHITE)
-
-    # ── Right side XP info ────────────────────────────────────────────────────
-    xp_left_text = "0 XP left"
-    xp_text      = "0 XP"
-
-    xp_left_w = draw.textlength(xp_left_text, font=font_xp_small)
-    xp_w      = draw.textlength(xp_text,      font=font_xp_big)
-
-    draw.text((W - 30 - int(xp_left_w), 118), xp_left_text, font=font_xp_small, fill=LIGHTGRAY)
-    draw.text((W - 30 - int(xp_w),      150), xp_text,      font=font_xp_big,   fill=WHITE)
-
-    # ── Username ──────────────────────────────────────────────────────────────
-    draw.text((text_x, 148), username, font=font_username, fill=WHITE)
-
-    # ── Progress bar ──────────────────────────────────────────────────────────
-    bar_x  = text_x
-    bar_y  = 222
-    bar_w  = 260   # short bar like in the screenshot
-    bar_h  = 22
-    bar_r  = bar_h // 2
-    draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=bar_r, fill=GRAY_BAR)
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-# ── /rank ─────────────────────────────────────────────────────────────────────
-RANK_ALLOWED_ROLE_ID = 1423121100421861438
-
-@tree.command(name="rank", description="View your rank card")
-@app_commands.describe(user="User to check (defaults to yourself)")
-async def rank(interaction: discord.Interaction, user: discord.Member = None):
-    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-    if not member or not any(r.id == RANK_ALLOWED_ROLE_ID for r in member.roles):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    target = user or interaction.user
-    await interaction.response.defer()
-
-    levels = await _get_all_levels()
-    uid    = str(target.id)
-
-    if uid not in levels:
-        await interaction.followup.send(f"{target.mention} hasn't reached any level yet.", ephemeral=True)
-        return
-
-    # Sort all users by level descending to determine rank
-    sorted_levels = sorted(levels.items(), key=lambda x: x[1], reverse=True)
-    rank_pos = next((i + 1 for i, (u, _) in enumerate(sorted_levels) if u == uid), 0)
-
-    avatar_bytes = await _fetch_avatar_bytes(target)
-    buf = _generate_rank_card(
-        username=target.display_name,
-        avatar_bytes=avatar_bytes,
-        level=levels[uid],
-        rank=rank_pos,
-    )
-    await interaction.followup.send(file=discord.File(buf, filename="rank.png"))
 
 # ── /sendlevel ────────────────────────────────────────────────────────────────
 def _has_level_role(member: discord.Member) -> bool:
@@ -1873,48 +1697,6 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
-async def _backfill_levels():
-    """Scan the Lurkr level-up channel and log the highest level per user to the DB channel."""
-    levelup_channel = bot.get_channel(LURKR_LEVELUP_CHANNEL)
-    db_channel      = bot.get_channel(LEVEL_DB_CHANNEL_ID)
-    if not levelup_channel or not db_channel:
-        print("[backfill_levels] Could not find level-up or DB channel.")
-        return
-
-    # Find highest level seen per user from Lurkr announcements
-    highest: dict[str, int] = {}
-    async for msg in levelup_channel.history(limit=None, oldest_first=True):
-        if not msg.author.bot:
-            continue
-        m = LURKR_LEVELUP_RE.search(msg.content or "")
-        if not m:
-            continue
-        uid   = m.group(1)
-        level = int(m.group(2))
-        if level > highest.get(uid, 0):
-            highest[uid] = level
-
-    if not highest:
-        print("[backfill_levels] No level-up messages found.")
-        return
-
-    # Check which users are already logged in the DB channel so we don't duplicate
-    already_logged: set[str] = set()
-    async for msg in db_channel.history(limit=None, oldest_first=True):
-        if msg.author.bot and msg.content.startswith("LEVEL:"):
-            parts = msg.content.split(":", 2)
-            if len(parts) == 3:
-                already_logged.add(parts[1])
-
-    # Log anyone not already in the DB
-    logged = 0
-    for uid, level in highest.items():
-        if uid not in already_logged:
-            await db_channel.send(f"LEVEL:{uid}:{level}")
-            logged += 1
-
-    print(f"[backfill_levels] Done — logged {logged} users ({len(highest) - logged} already existed).")
-
 @bot.event
 async def on_ready():
     bot.add_view(TicketPanelView())
@@ -1925,16 +1707,15 @@ async def on_ready():
     streak_checker.start()
     video_checker.start()
     counts_refresher.start()
+    asyncio.create_task(_delayed_counts_warmup())
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
     await post_ticket_panel()
-    asyncio.create_task(_backfill_levels())
-    asyncio.create_task(_delayed_counts_warmup())
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 async def _delayed_counts_warmup():
-    await asyncio.sleep(60)  # wait 60s after startup before scanning DB channel
+    await asyncio.sleep(60)
     await tally_counts()
     print("[counts] Cache warmed up.")
 
