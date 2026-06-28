@@ -96,6 +96,7 @@ LEVEL_TWO_TAG_ID       = 1517631552241139723
 LEVEL_THREE_TAG_ID     = 1517631604309098709
 LEVEL_FOUR_TAG_ID      = 1517631633073766462
 LEVEL_FIVE_TAG_ID      = 1520851613873602661
+LEVEL_SIX_TAG_ID       = 1520853956086206725
 
 LEVEL_IMAGES_DIR = "."
 
@@ -181,6 +182,24 @@ LEVELS = {
         ),
         "images": ["level5_1.png", "level5_2.png"],
         "tag_id": LEVEL_FIVE_TAG_ID,
+    },
+    6: {
+        "title": "Level 6",
+        "content": (
+            "A quiet neighborhood stretches out beneath a sky of heavy gray clouds. Identical "
+            "houses line empty streets, disappearing into the thick fog. There are no signs of "
+            "life—only an eerie silence that makes every step feel watched. Somewhere inside one "
+            "of these homes lies the key you need, but it won't open the house it was found in. "
+            "Your escape waits elsewhere.\n\n"
+            "**What to do:**\n"
+            "* 🔑 Search the houses until you find the hidden key\n"
+            "* 🏠 Look for the house marked with a label—the key belongs there\n"
+            "* 🚪 Unlock the labeled house to continue your journey\n"
+            "* 👁️ Explore carefully, as not every house holds what you're looking for\n"
+            "* 🚶 Find the correct door and move forward to escape the neighborhood"
+        ),
+        "images": ["level6_1.png", "level6_2.png"],
+        "tag_id": LEVEL_SIX_TAG_ID,
     },
 }
 
@@ -1117,7 +1136,7 @@ def _has_level_role(member: discord.Member) -> bool:
 
 @tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
 @app_commands.describe(level="Which level to post")
-async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4, 5]):
+async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4, 5, 6]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
         await interaction.response.send_message(
