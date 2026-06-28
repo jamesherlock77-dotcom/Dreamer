@@ -504,6 +504,8 @@ async def counts_refresher():
                 counts[uid] = counts.get(uid, 0) + 1
     _counts_cache = counts
     _counts_cache_time = _time.monotonic()
+    now_str = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    await db_channel.send(f"SCAN:{now_str}:{len(counts)}")
     print(f"[counts_refresher] Cache refreshed — {len(counts)} users tracked.")
 
 # ── Helper: build approved links cache ───────────────────────────────────────
@@ -1705,6 +1707,7 @@ async def on_ready():
     streak_checker.start()
     video_checker.start()
     counts_refresher.start()
+    asyncio.create_task(counts_refresher())  # warm cache immediately, don't wait 5 min
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
