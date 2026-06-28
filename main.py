@@ -95,6 +95,7 @@ LEVEL_ONE_TAG_ID       = 1517631235692957736
 LEVEL_TWO_TAG_ID       = 1517631552241139723
 LEVEL_THREE_TAG_ID     = 1517631604309098709
 LEVEL_FOUR_TAG_ID      = 1517631633073766462
+LEVEL_FIVE_TAG_ID      = 1520851613873602661
 
 LEVEL_IMAGES_DIR = "."
 
@@ -162,6 +163,24 @@ LEVELS = {
         ),
         "images": ["level4_1.png", "level4_2.png"],
         "tag_id": LEVEL_FOUR_TAG_ID,
+    },
+    5: {
+        "title": "Level 5",
+        "content": (
+            "A narrow hallway stretches endlessly into the darkness — quiet, empty, and "
+            "suffocatingly still. Flickering fluorescent lights hum overhead as cold concrete "
+            "walls close in on either side. The silence never lasts for long. Somewhere in the "
+            "distance, heavy footsteps begin to echo, growing louder with every second. There "
+            "is no fighting back. Only hiding... or running.\n\n"
+            "**What to do:**\n"
+            "* 🏃  Make your way to the opposite end of the hallway\n"
+            "* 👁️  Watch and listen for the monster as it charges through the corridor\n"
+            "* 🛡️  Hide in the safe spots along the walls whenever danger approaches\n"
+            "* ⏳  Wait until the hallway is clear before continuing your journey\n"
+            "* 🚪  Reach the exit at the far end to survive and escape"
+        ),
+        "images": ["level5_1.png", "level5_2.png"],
+        "tag_id": LEVEL_FIVE_TAG_ID,
     },
 }
 
@@ -1098,7 +1117,7 @@ def _has_level_role(member: discord.Member) -> bool:
 
 @tree.command(name="sendlevel", description="Post a level guide to the forum (restricted)")
 @app_commands.describe(level="Which level to post")
-async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4]):
+async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4, 5]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
         await interaction.response.send_message(
