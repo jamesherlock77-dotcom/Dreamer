@@ -1031,7 +1031,7 @@ async def modstats(interaction: discord.Interaction, user: discord.Member = None
     embed.add_field(name="Bans (×3)",     value=f"`{bd.get('ban', 0)}`",      inline=True)
     embed.add_field(name="Warns (×1)",    value=f"`{bd.get('warn', 0)}`",     inline=True)
     embed.add_field(name="Thanks (×2)",   value=f"`{bd.get('thanks', 0)}`",   inline=True)
-    embed.add_field(name="Messages (×2/50)", value=f"`{bd.get('messages', 0)}`", inline=True)
+    embed.add_field(name=f"Messages (×2/{MSG_MILESTONE})", value=f"`{bd.get('messages', 0)}`", inline=True)
     embed.set_footer(text=f"Requested by {interaction.user}")
     await interaction.followup.send(embed=embed)
 
