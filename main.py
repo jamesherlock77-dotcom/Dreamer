@@ -62,7 +62,7 @@ PTS_BAN             = 3
 PTS_WARN            = 1
 PTS_THANKS          = 2
 PTS_PER_50_MSGS     = 2
-MSG_MILESTONE       = 50
+MSG_MILESTONE       = 150
 
 _staff_msg_counts: dict[str, int] = {}
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
@@ -1047,7 +1047,7 @@ async def modleaderboard(interaction: discord.Interaction):
         await interaction.followup.send("No mod points tracked yet.")
         return
     ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
-    lines = ["**__Staff Point Leaderboard__**"]
+    lines = []
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
         name   = member.mention if member else f"<@{uid}>"
