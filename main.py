@@ -63,8 +63,8 @@ DYNO_PREFIXES       = ("?", "!", ".")
 PTS_BAN             = 3
 PTS_WARN            = 1
 PTS_THANKS          = 2
-PTS_PER_50_MSGS     = 2
-MSG_MILESTONE       = 150
+PTS_PER_50_MSGS     = 1
+MSG_MILESTONE       = 50
 
 _staff_msg_counts: dict[str, int] = {}
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
@@ -78,6 +78,9 @@ CACHE_TTL = 300
 _counts_cache: dict | None = None
 _counts_cache_time: float  = 0
 COUNTS_CACHE_TTL = 90  # seconds, matches counts_refresher interval
+
+# ── DB write queue (batches message log writes to avoid rate limits) ──────────
+_db_write_queue: list[str] = []
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -494,7 +497,7 @@ async def on_message(message: discord.Message):
 
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if db_channel:
-        await db_channel.send(f"{message.author.id}")
+        _db_write_queue.append(str(message.author.id))
 
     if message.channel.id == 1440105578839146517:
         has_image = any(
@@ -532,14 +535,29 @@ async def tally_counts() -> dict:
     counts = {}
     async for msg in db_channel.history(limit=None, oldest_first=True):
         if msg.author.bot:
-            uid = msg.content.strip()
-            if uid.isdigit():
-                counts[uid] = counts.get(uid, 0) + 1
+            for uid in msg.content.strip().splitlines():
+                uid = uid.strip()
+                if uid.isdigit():
+                    counts[uid] = counts.get(uid, 0) + 1
     _counts_cache = counts
     _counts_cache_time = now
     return counts
 
-# ── Background task: refresh counts cache every 5 minutes ────────────────────
+# ── Background task: flush queued DB writes every 5 seconds ──────────────────
+@tasks.loop(seconds=5)
+async def db_flusher():
+    if not _db_write_queue:
+        return
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        return
+    batch = _db_write_queue.copy()
+    _db_write_queue.clear()
+    content = "\n".join(batch)
+    for i in range(0, len(content), 1900):
+        await db_channel.send(content[i:i+1900])
+
+# ── Background task: refresh counts cache every 90 seconds ───────────────────
 @tasks.loop(seconds=90)
 async def counts_refresher():
     global _counts_cache, _counts_cache_time
@@ -549,9 +567,10 @@ async def counts_refresher():
     counts = {}
     async for msg in db_channel.history(limit=None, oldest_first=True):
         if msg.author.bot:
-            uid = msg.content.strip()
-            if uid.isdigit():
-                counts[uid] = counts.get(uid, 0) + 1
+            for uid in msg.content.strip().splitlines():
+                uid = uid.strip()
+                if uid.isdigit():
+                    counts[uid] = counts.get(uid, 0) + 1
     _counts_cache = counts
     _counts_cache_time = _time.monotonic()
     now_str = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1099,7 +1118,7 @@ async def modstats(interaction: discord.Interaction, user: discord.Member = None
     embed.add_field(name="Bans (×3)",     value=f"`{bd.get('ban', 0)}`",      inline=True)
     embed.add_field(name="Warns (×1)",    value=f"`{bd.get('warn', 0)}`",     inline=True)
     embed.add_field(name="Thanks (×2)",   value=f"`{bd.get('thanks', 0)}`",   inline=True)
-    embed.add_field(name=f"Messages (×2/{MSG_MILESTONE})", value=f"`{bd.get('messages', 0)}`", inline=True)
+    embed.add_field(name=f"Messages (×1/{MSG_MILESTONE})", value=f"`{bd.get('messages', 0)}`", inline=True)
     embed.set_footer(text=f"Requested by {interaction.user}")
     await interaction.followup.send(embed=embed)
 
@@ -1778,6 +1797,7 @@ async def on_ready():
     streak_checker.start()
     video_checker.start()
     counts_refresher.start()
+    db_flusher.start()
     asyncio.create_task(_delayed_counts_warmup())
     await _load_streaks()
     _streaks_ready.set()
