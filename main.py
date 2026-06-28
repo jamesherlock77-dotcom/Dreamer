@@ -1770,12 +1770,17 @@ async def on_ready():
     streak_checker.start()
     video_checker.start()
     counts_refresher.start()
-    asyncio.create_task(counts_refresher())  # warm cache immediately, don't wait 5 min
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
     await post_ticket_panel()
     asyncio.create_task(_backfill_levels())
+    asyncio.create_task(_delayed_counts_warmup())
     print(f"Logged in as {bot.user} ({bot.user.id})")
+
+async def _delayed_counts_warmup():
+    await asyncio.sleep(60)  # wait 60s after startup before scanning DB channel
+    await tally_counts()
+    print("[counts] Cache warmed up.")
 
 bot.run(TOKEN)
