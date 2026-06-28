@@ -879,10 +879,15 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
         await interaction.edit_original_response(content=f"Something went wrong: {e}")
 
 # ── /message ─────────────────────────────────────────────────────────────────
+MESSAGE_ALLOWED_ROLE_ID = 1520597775581052928
+
 @tree.command(name="message", description="Send a message as the bot")
 @app_commands.describe(content="The message to send")
-@app_commands.checks.has_permissions(administrator=True)
 async def message(interaction: discord.Interaction, content: str):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not member or not any(r.id == MESSAGE_ALLOWED_ROLE_ID for r in member.roles):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     await interaction.channel.send(content)
     await interaction.response.send_message("Message sent!", ephemeral=True)
 
