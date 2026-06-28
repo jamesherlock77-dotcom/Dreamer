@@ -1123,63 +1123,79 @@ def _generate_rank_card(
     rank: int,
 ) -> io.BytesIO:
     W, H = 934, 282
-    BG        = (30, 30, 35)
-    GRAY      = (60, 60, 65)
+    BG        = (43, 45, 49)
+    GRAY_BAR  = (90, 93, 99)
     WHITE     = (255, 255, 255)
-    LIGHTGRAY = (180, 180, 180)
-    ACCENT    = (100, 100, 110)
+    LIGHTGRAY = (160, 163, 172)
 
     img  = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    # Avatar
-    avatar_size = 200
-    avatar_x, avatar_y = 40, 41
+    # ── Avatar (rounded rectangle, not circle) ────────────────────────────────
+    av_size = 220
+    av_x, av_y = 24, 24
+    corner_r = 18
     if avatar_bytes:
         try:
-            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((avatar_size, avatar_size))
-            mask = Image.new("L", (avatar_size, avatar_size), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
-            av_rgb = Image.new("RGB", (avatar_size, avatar_size), BG)
-            av_rgb.paste(av, mask=av.split()[3] if av.mode == "RGBA" else None)
-            img.paste(av_rgb, (avatar_x, avatar_y), mask)
+            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((av_size, av_size))
+            mask = Image.new("L", (av_size, av_size), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, av_size, av_size), radius=corner_r, fill=255)
+            av_rgb = Image.new("RGB", (av_size, av_size), BG)
+            av_rgb.paste(av.convert("RGB"), (0, 0))
+            img.paste(av_rgb, (av_x, av_y), mask)
         except Exception:
-            draw.ellipse((avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size), fill=GRAY)
+            draw.rounded_rectangle((av_x, av_y, av_x + av_size, av_y + av_size), radius=corner_r, fill=GRAY_BAR)
     else:
-        draw.ellipse((avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size), fill=GRAY)
+        draw.rounded_rectangle((av_x, av_y, av_x + av_size, av_y + av_size), radius=corner_r, fill=GRAY_BAR)
 
-    # Fonts — fall back to default if not available
+    # ── Fonts ─────────────────────────────────────────────────────────────────
+    font_path_bold   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font_path_normal = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     try:
-        font_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
-        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
-        font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        font_level    = ImageFont.truetype(font_path_bold,   72)  # LEVEL 17
+        font_rank     = ImageFont.truetype(font_path_normal, 36)  # RANK #34
+        font_username = ImageFont.truetype(font_path_bold,   54)  # Jaxsparrow
+        font_xp_big   = ImageFont.truetype(font_path_bold,   42)  # 13,241 XP
+        font_xp_small = ImageFont.truetype(font_path_normal, 28)  # 1,309 XP left
     except Exception:
-        font_big = font_med = font_small = font_label = ImageFont.load_default()
+        font_level = font_rank = font_username = font_xp_big = font_xp_small = ImageFont.load_default()
 
-    text_x = avatar_x + avatar_size + 40
+    text_x = av_x + av_size + 36
 
-    # Username
-    draw.text((text_x, 50), username, font=font_med, fill=WHITE)
-
-    # RANK and LEVEL on the right
+    # ── Top-right: RANK #N  LEVEL N ──────────────────────────────────────────
     rank_text  = f"RANK #{rank}"
     level_text = f"LEVEL {level}"
-    draw.text((W - 420, 30), rank_text,  font=font_small, fill=LIGHTGRAY)
-    draw.text((W - 280, 18), level_text, font=font_big,   fill=WHITE)
 
-    # XP text
-    draw.text((text_x, 110), "0 XP", font=font_small, fill=LIGHTGRAY)
-    draw.text((W - 200, 110), "0 XP left", font=font_label, fill=LIGHTGRAY)
+    # Measure to right-align
+    level_w  = draw.textlength(level_text, font=font_level)
+    rank_w   = draw.textlength(rank_text,  font=font_rank)
 
-    # Progress bar
-    bar_x, bar_y = text_x, 170
-    bar_w, bar_h = W - text_x - 40, 28
-    radius = bar_h // 2
-    # Background bar
-    draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=radius, fill=GRAY)
-    # Empty fill (0 XP so just show empty)
-    draw.rounded_rectangle((bar_x, bar_y, bar_x + int(bar_w * 0.01), bar_y + bar_h), radius=radius, fill=ACCENT)
+    level_x = W - 30 - int(level_w)
+    rank_x  = level_x - int(rank_w) - 24
+
+    draw.text((rank_x,  28), rank_text,  font=font_rank,  fill=LIGHTGRAY)
+    draw.text((level_x, 14), level_text, font=font_level, fill=WHITE)
+
+    # ── Right side XP info ────────────────────────────────────────────────────
+    xp_left_text = "0 XP left"
+    xp_text      = "0 XP"
+
+    xp_left_w = draw.textlength(xp_left_text, font=font_xp_small)
+    xp_w      = draw.textlength(xp_text,      font=font_xp_big)
+
+    draw.text((W - 30 - int(xp_left_w), 118), xp_left_text, font=font_xp_small, fill=LIGHTGRAY)
+    draw.text((W - 30 - int(xp_w),      150), xp_text,      font=font_xp_big,   fill=WHITE)
+
+    # ── Username ──────────────────────────────────────────────────────────────
+    draw.text((text_x, 148), username, font=font_username, fill=WHITE)
+
+    # ── Progress bar ──────────────────────────────────────────────────────────
+    bar_x  = text_x
+    bar_y  = 222
+    bar_w  = 260   # short bar like in the screenshot
+    bar_h  = 22
+    bar_r  = bar_h // 2
+    draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), radius=bar_r, fill=GRAY_BAR)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
