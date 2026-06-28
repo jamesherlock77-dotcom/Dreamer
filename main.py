@@ -55,6 +55,8 @@ STREAK_GRACE_HOURS  = 4
 
 # ── Mod rewards config ───────────────────────────────────────────────────────
 MOD_ROLE_ID         = 1423121100358811795
+ADMIN_ROLE_ID       = 1423121100421861438
+CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
@@ -176,6 +178,16 @@ def _is_mod(member) -> bool:
     if not member or not hasattr(member, "roles"):
         return False
     return any(r.id == MOD_ROLE_ID for r in member.roles)
+
+def _is_admin(member) -> bool:
+    if not member or not hasattr(member, "roles"):
+        return False
+    return any(r.id == ADMIN_ROLE_ID for r in member.roles)
+
+def _is_cc(member) -> bool:
+    if not member or not hasattr(member, "roles"):
+        return False
+    return any(r.id == CC_ROLE_ID for r in member.roles)
 
 async def _award_points(uid: int, points: int, reason: str):
     db = bot.get_channel(MOD_PTS_DB_CHANNEL)
@@ -778,6 +790,10 @@ async def messageleaderboard(interaction: discord.Interaction):
 @tree.command(name="link", description="Submit your YouTube or TikTok channel link for verification")
 @app_commands.describe(platform="Your platform", url="Your YouTube or TikTok channel URL")
 async def link(interaction: discord.Interaction, platform: Literal["YouTube", "TikTok"], url: str):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_cc(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     if interaction.channel_id != LINK_CMD_CHANNEL:
         await interaction.response.send_message(
             f"This command can only be used in <#{LINK_CMD_CHANNEL}>.", ephemeral=True)
@@ -851,6 +867,10 @@ class LinkReviewView(discord.ui.View):
 @tree.command(name="ccstats", description="View your linked YouTube or TikTok channel stats")
 @app_commands.describe(platform="Which platform to show stats for")
 async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube", "TikTok"]):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_cc(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     await interaction.response.send_message("Fetching your stats, please wait...")
     saved_platform, url = await get_approved_link(interaction.user.id, platform)
     if not saved_platform:
@@ -896,8 +916,11 @@ async def message(interaction: discord.Interaction, content: str):
 # ── /adminlink ───────────────────────────────────────────────────────────────
 @tree.command(name="adminlink", description="Manually approve a link for a user")
 @app_commands.describe(user="The Discord user", platform="Platform", handle="YouTube or TikTok URL/handle")
-@app_commands.checks.has_permissions(administrator=True)
 async def adminlink(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"], handle: str):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     if platform == "YouTube":
         if "youtube.com" not in handle and "youtu.be" not in handle:
             handle = f"https://www.youtube.com/@{handle.lstrip('@')}"
@@ -921,8 +944,11 @@ async def adminlink(interaction: discord.Interaction, user: discord.Member, plat
 # ── /adminccstats ─────────────────────────────────────────────────────────────
 @tree.command(name="adminccstats", description="View stats for any linked user")
 @app_commands.describe(user="The Discord user to look up", platform="Which platform to show stats for")
-@app_commands.checks.has_permissions(administrator=True)
 async def adminccstats(interaction: discord.Interaction, user: discord.Member, platform: Literal["YouTube", "TikTok"]):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     await interaction.response.send_message(f"Fetching {platform} stats for {user.mention}, please wait...")
     saved_platform, url = await get_approved_link(user.id, platform)
     if not saved_platform:
@@ -955,6 +981,10 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
 # ── /contentfullstats ─────────────────────────────────────────────────────────
 @tree.command(name="contentfullstats", description="Show stats for every linked creator")
 async def contentfullstats(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     await interaction.response.send_message("⏳ Fetching stats for all linked creators, this may take a moment...")
     all_links = await get_all_approved_links()
     if not all_links:
@@ -1679,8 +1709,11 @@ class TicketClosedView(discord.ui.View):
 
 # ── /debugtiktok ─────────────────────────────────────────────────────────────
 @tree.command(name="debugtiktok", description="Debug TikTok API response (admin only)")
-@app_commands.checks.has_permissions(administrator=True)
 async def debugtiktok(interaction: discord.Interaction, username: str):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
     async with aiohttp.ClientSession() as session:
         try:
