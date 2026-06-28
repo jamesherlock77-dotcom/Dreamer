@@ -77,6 +77,11 @@ _counts_cache: dict | None = None
 _counts_cache_time: float  = 0
 COUNTS_CACHE_TTL = 300  # 5 minutes
 
+# ── Level database config ─────────────────────────────────────────────────────
+LURKR_LEVELUP_CHANNEL = 1423121104675016768
+LEVEL_DB_CHANNEL_ID   = 1520832815539687445
+LURKR_LEVELUP_RE      = re.compile(r"<@!?(\d+)> has reached level \*\*(\d+)\*\*")
+
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
 SUPPORT_ROLE_ID         = 1495495210422112366
@@ -432,10 +437,26 @@ async def video_checker():
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
+async def handle_lurkr_levelup(message: discord.Message):
+    if message.channel.id != LURKR_LEVELUP_CHANNEL:
+        return
+    if not message.author.bot:
+        return
+    content = message.content or ""
+    m = LURKR_LEVELUP_RE.search(content)
+    if not m:
+        return
+    uid   = m.group(1)
+    level = m.group(2)
+    db = bot.get_channel(LEVEL_DB_CHANNEL_ID)
+    if db:
+        await db.send(f"LEVEL:{uid}:{level}")
+
 # ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
+    await handle_lurkr_levelup(message)
 
     if message.author.bot:
         return
@@ -1697,6 +1718,48 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
+async def _backfill_levels():
+    """Scan the Lurkr level-up channel and log the highest level per user to the DB channel."""
+    levelup_channel = bot.get_channel(LURKR_LEVELUP_CHANNEL)
+    db_channel      = bot.get_channel(LEVEL_DB_CHANNEL_ID)
+    if not levelup_channel or not db_channel:
+        print("[backfill_levels] Could not find level-up or DB channel.")
+        return
+
+    # Find highest level seen per user from Lurkr announcements
+    highest: dict[str, int] = {}
+    async for msg in levelup_channel.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        m = LURKR_LEVELUP_RE.search(msg.content or "")
+        if not m:
+            continue
+        uid   = m.group(1)
+        level = int(m.group(2))
+        if level > highest.get(uid, 0):
+            highest[uid] = level
+
+    if not highest:
+        print("[backfill_levels] No level-up messages found.")
+        return
+
+    # Check which users are already logged in the DB channel so we don't duplicate
+    already_logged: set[str] = set()
+    async for msg in db_channel.history(limit=None, oldest_first=True):
+        if msg.author.bot and msg.content.startswith("LEVEL:"):
+            parts = msg.content.split(":", 2)
+            if len(parts) == 3:
+                already_logged.add(parts[1])
+
+    # Log anyone not already in the DB
+    logged = 0
+    for uid, level in highest.items():
+        if uid not in already_logged:
+            await db_channel.send(f"LEVEL:{uid}:{level}")
+            logged += 1
+
+    print(f"[backfill_levels] Done — logged {logged} users ({len(highest) - logged} already existed).")
+
 @bot.event
 async def on_ready():
     bot.add_view(TicketPanelView())
@@ -1712,6 +1775,7 @@ async def on_ready():
     _streaks_ready.set()
     await _load_ticket_counter()
     await post_ticket_panel()
+    asyncio.create_task(_backfill_levels())
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 bot.run(TOKEN)
