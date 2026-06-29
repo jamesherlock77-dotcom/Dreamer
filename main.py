@@ -742,16 +742,20 @@ def extract_tiktok_username(url: str):
     return m.group(1) if m else None
 
 async def fetch_tiktok_posts_data(username: str):
-    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count)."""
+    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count).
+
+    Uses the hashtag search endpoint to find all #dreamyvr videos, then filters
+    by username so we only count videos from this specific creator.
+    """
     total_views    = 0
     video_count    = 0
     follower_count = 0
+    seen_ids: set[str] = set()
 
     async with aiohttp.ClientSession() as session:
         # Fetch follower count from profile endpoint
         try:
             profile_data   = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
-            # ScrapeCreators nests stats under a "stats" key
             follower_count = int(
                 profile_data.get("stats", {}).get("followerCount", 0)
                 or profile_data.get("followerCount", 0)
@@ -760,41 +764,61 @@ async def fetch_tiktok_posts_data(username: str):
         except ValueError:
             pass
 
-        # Paginate through all videos looking for #dreamyvr
+        # Search #dreamyvr hashtag and filter results by this creator's username
         cursor   = None
         has_more = True
         while has_more:
-            params = {"handle": username}
+            params = {"hashtag": "dreamyvr"}
             if cursor:
                 params["cursor"] = cursor
             try:
-                data = await _sc_get(session, "v3/tiktok/profile/videos", params)
+                data = await _sc_get(session, "v1/tiktok/search/hashtag", params)
             except ValueError:
                 break
 
-            videos   = data.get("videos") or []
-            has_more = bool(data.get("hasMore", False))
+            videos   = data.get("videos") or data.get("aweme_list") or []
+            has_more = bool(data.get("hasMore", data.get("has_more", False)))
             cursor   = data.get("cursor") if has_more else None
 
             if not videos:
                 break
 
             for video in videos:
-                desc       = (video.get("desc") or video.get("title") or "").lower()
-                challenges = [c.get("title", "").lower() for c in (video.get("challenges") or [])]
-                text_extra = [t.get("hashtagName", "").lower() for t in (video.get("textExtra") or [])]
-                has_tag    = "dreamyvr" in desc or "dreamyvr" in challenges or "dreamyvr" in text_extra
-                if has_tag:
-                    stats      = video.get("stats") or video.get("statistics") or {}
-                    play_count = (
-                        stats.get("playCount")
-                        or stats.get("play_count")
-                        or video.get("playCount")
-                        or video.get("play_count")
-                        or 0
-                    )
-                    total_views += int(play_count)
-                    video_count += 1
+                # Get the author's unique_id to match against our username
+                author = video.get("author") or {}
+                vid_username = (
+                    author.get("uniqueId")
+                    or author.get("unique_id")
+                    or video.get("authorUniqueId")
+                    or video.get("author_unique_id")
+                    or ""
+                ).lower()
+
+                if vid_username != username.lower():
+                    continue
+
+                # Deduplicate (TikTok hashtag search can return duplicates)
+                vid_id = str(
+                    video.get("id")
+                    or video.get("aweme_id")
+                    or video.get("video_id")
+                    or ""
+                )
+                if vid_id and vid_id in seen_ids:
+                    continue
+                if vid_id:
+                    seen_ids.add(vid_id)
+
+                stats      = video.get("stats") or video.get("statistics") or {}
+                play_count = (
+                    stats.get("playCount")
+                    or stats.get("play_count")
+                    or video.get("playCount")
+                    or video.get("play_count")
+                    or 0
+                )
+                total_views += int(play_count)
+                video_count += 1
 
             if not has_more or not cursor:
                 break
