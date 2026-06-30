@@ -60,6 +60,7 @@ CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
+DYNO_BAN_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban logs
 PTS_BAN             = 3
 PTS_WARN            = 1
 PTS_THANKS          = 2
@@ -272,9 +273,7 @@ async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
         pass
     return None
 
-async def handle_dyno_warn(message: discord.Message):
-    if message.author.id != DYNO_BOT_ID or not message.guild:
-        return
+def _extract_dyno_text_blobs(message: discord.Message) -> list[str]:
     text_blobs = [message.content or ""]
     for e in message.embeds:
         if e.title:       text_blobs.append(e.title)
@@ -286,11 +285,9 @@ async def handle_dyno_warn(message: discord.Message):
             text_blobs.append(e.footer.text)
         if e.author and e.author.name:
             text_blobs.append(e.author.name)
-    combined = " ".join(text_blobs).lower()
-    if "warn" not in combined:
-        return
+    return text_blobs
 
-    invoker_id = None
+def _extract_dyno_invoker_id(message: discord.Message) -> int | None:
     id_re = re.compile(r"(\d{17,20})")
     for e in message.embeds:
         candidates = []
@@ -302,10 +299,17 @@ async def handle_dyno_warn(message: discord.Message):
         for c in candidates:
             m = id_re.search(c)
             if m:
-                invoker_id = int(m.group(1))
-                break
-        if invoker_id:
-            break
+                return int(m.group(1))
+    return None
+
+async def handle_dyno_warn(message: discord.Message):
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "warn" not in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
 
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
@@ -318,6 +322,33 @@ async def handle_dyno_warn(message: discord.Message):
     if not _is_mod(member):
         return
     await _award_points(invoker_id, PTS_WARN, "warn")
+
+async def handle_dyno_ban(message: discord.Message):
+    """Detects bans carried out via Dyno by watching its ban log channel,
+    since Dyno-issued bans show up in the audit log as executed by Dyno
+    itself rather than by the moderator who ran the command."""
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    if message.channel.id != DYNO_BAN_LOG_CHANNEL_ID:
+        return
+
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "ban" not in combined or "unban" in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
+
+    if not invoker_id:
+        invoker = await _find_dyno_invoker(message.channel, "ban")
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
+        return
+    member = message.guild.get_member(invoker_id)
+    if not _is_mod(member):
+        return
+    await _award_points(invoker_id, PTS_BAN, "ban")
 
 # ── Track messages to prevent double points for "thanks" ─────────────────────
 _thanked_messages: set[int] = set()
@@ -484,6 +515,7 @@ async def video_checker():
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
+    await handle_dyno_ban(message)
 
     if message.author.bot:
         return
@@ -507,7 +539,7 @@ async def on_message(message: discord.Message):
     await handle_mod_rewards(message)
     await bot.process_commands(message)
 
-# ── Ban detection ────────────────────────────────────────────────────────────
+# ── Ban detection (fallback for native Discord bans, e.g. right-click → Ban) ─
 @bot.event
 async def on_member_ban(guild: discord.Guild, user):
     try:
@@ -1814,6 +1846,39 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
 
     await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
+
+# ── /debugdyno ───────────────────────────────────────────────────────────────
+@tree.command(name="debugdyno", description="Dump the raw content/embeds of recent Dyno ban-log messages (admin only)")
+async def debugdyno(interaction: discord.Interaction, limit: int = 5):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel = bot.get_channel(DYNO_BAN_LOG_CHANNEL_ID)
+    if not channel:
+        await interaction.followup.send("Could not reach the Dyno ban log channel.", ephemeral=True)
+        return
+    out_lines = []
+    async for msg in channel.history(limit=limit):
+        if msg.author.id != DYNO_BOT_ID:
+            continue
+        out_lines.append(f"--- message {msg.id} ---")
+        out_lines.append(f"content: {msg.content!r}")
+        for e in msg.embeds:
+            out_lines.append(f"embed.title: {e.title!r}")
+            out_lines.append(f"embed.description: {e.description!r}")
+            for f in e.fields:
+                out_lines.append(f"  field: {f.name!r} = {f.value!r}")
+            if e.footer:
+                out_lines.append(f"embed.footer: {e.footer.text!r}")
+            if e.author:
+                out_lines.append(f"embed.author: {e.author.name!r}")
+    if not out_lines:
+        await interaction.followup.send("No Dyno messages found in that channel.", ephemeral=True)
+        return
+    text = "\n".join(out_lines)[:1900]
+    await interaction.followup.send(f"```\n{text}\n```", ephemeral=True)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
