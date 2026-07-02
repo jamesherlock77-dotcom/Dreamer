@@ -102,8 +102,8 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Live message counts (incremented in real time, persisted as compact
-#    periodic snapshots rather than a growing per-message log) ───────────────
+# ── Live message counts (incremented in real time; every message increments
+#    the running total AND is queued for the next periodic batched log write) ─
 _live_counts: dict[str, int] = {}
 _counts_ready = asyncio.Event()
 
@@ -694,97 +694,92 @@ async def on_member_ban(guild: discord.Guild, user):
     except discord.Forbidden:
         pass
 
-# ── Helper: bump a user's live message count ──────────────────────────────────
+# ── Message logging: increment the live count immediately, and queue the
+#    event so it gets written to Discord in the next periodic batch flush
+#    (rather than sending an API call per message, which would be slow and
+#    rack up rate limits) ───────────────────────────────────────────────────
+MESSAGE_LOG_PREFIX = "MSGLOG:"
+MESSAGE_LOG_FLUSH_SECONDS = 90
+
+_pending_message_log: dict[str, int] = {}
+_pending_log_lock = asyncio.Lock()
+
 async def _bump_live_count(user_id: int):
     # Wait for the one-time startup rebuild so we don't clobber recovered state
     # with an incomplete count if a message arrives before it finishes.
     await _counts_ready.wait()
     uid = str(user_id)
     _live_counts[uid] = _live_counts.get(uid, 0) + 1
+    async with _pending_log_lock:
+        _pending_message_log[uid] = _pending_message_log.get(uid, 0) + 1
 
-# ── Counts persistence: compact, bounded snapshots instead of one log line
-#    per message. Previously every single message appended a line to
-#    DB_CHANNEL_ID forever, so on an active server that channel would balloon
-#    to thousands of messages within days, and a bot restart had to page
-#    through *all* of them to rebuild state — that's what was making
-#    /messageleaderboard slow again as messages piled up. Now we periodically
-#    persist the whole _live_counts dict as a handful of JSON messages and
-#    EDIT them in place, so both the write volume and the startup rebuild
-#    cost scale with the number of unique active users, not total messages.
-COUNTS_SNAPSHOT_PREFIX = "COUNTSNAP:"
-_snapshot_message_ids: list[int] = []
+# ── Message log persistence: every message is logged (nothing is ever
+#    overwritten/edited), but individual messages are batched into one
+#    compact write every MESSAGE_LOG_FLUSH_SECONDS so we're not hammering
+#    the Discord API with a send() per chat message. Each flush message
+#    holds a {user_id: count} JSON blob for everyone who sent a message
+#    during that window.
+async def _flush_message_log():
+    async with _pending_log_lock:
+        if not _pending_message_log:
+            return
+        batch = _pending_message_log.copy()
+        _pending_message_log.clear()
 
-async def _persist_counts_snapshot():
-    global _snapshot_message_ids
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if not db_channel:
+        # Put it back so we don't lose the counts if the channel is briefly unavailable
+        async with _pending_log_lock:
+            for uid, count in batch.items():
+                _pending_message_log[uid] = _pending_message_log.get(uid, 0) + count
         return
 
-    # Pack users into as few ~1900-char JSON chunks as possible
+    # Split into multiple messages if a single flush would exceed Discord's
+    # message length limit (only relevant on extremely busy servers)
     chunks: list[dict] = []
     current: dict = {}
-    for uid, count in _live_counts.items():
+    for uid, count in batch.items():
         current[uid] = count
-        encoded = COUNTS_SNAPSHOT_PREFIX + json.dumps(current, separators=(",", ":"))
+        encoded = MESSAGE_LOG_PREFIX + json.dumps(current, separators=(",", ":"))
         if len(encoded) > 1900:
             current.pop(uid)
-            chunks.append(current)
+            if current:
+                chunks.append(current)
             current = {uid: count}
-    chunks.append(current)  # always at least one chunk, even if empty
+    if current:
+        chunks.append(current)
 
-    for i, chunk in enumerate(chunks):
-        content = COUNTS_SNAPSHOT_PREFIX + json.dumps(chunk, separators=(",", ":"))
-        if i < len(_snapshot_message_ids):
-            try:
-                msg = await db_channel.fetch_message(_snapshot_message_ids[i])
-                await msg.edit(content=content)
-            except (discord.NotFound, discord.HTTPException):
-                msg = await db_channel.send(content)
-                _snapshot_message_ids[i] = msg.id
-        else:
-            msg = await db_channel.send(content)
-            _snapshot_message_ids.append(msg.id)
+    for chunk in chunks:
+        content = MESSAGE_LOG_PREFIX + json.dumps(chunk, separators=(",", ":"))
+        await db_channel.send(content)
 
-    # Clean up leftover snapshot messages if the user count shrank (e.g. after
-    # a purge mid-week) so we don't keep stale chunks around
-    while len(_snapshot_message_ids) > len(chunks):
-        old_id = _snapshot_message_ids.pop()
-        try:
-            old_msg = await db_channel.fetch_message(old_id)
-            await old_msg.delete()
-        except (discord.NotFound, discord.HTTPException):
-            pass
-
-@tasks.loop(seconds=60)
-async def counts_snapshotter():
+@tasks.loop(seconds=MESSAGE_LOG_FLUSH_SECONDS)
+async def message_log_flusher():
     if not _counts_ready.is_set():
         return
     try:
-        await _persist_counts_snapshot()
+        await _flush_message_log()
     except discord.HTTPException as e:
-        print(f"[counts_snapshotter] Failed to persist snapshot: {e}")
+        print(f"[message_log_flusher] Failed to flush message log: {e}")
 
-# ── Helper: rebuild live counts from the persisted snapshot (startup only) ───
-# Any leftover messages from the old per-message logging format are simply
-# ignored (they don't match COUNTS_SNAPSHOT_PREFIX), so this stays fast even
-# if old-format backlog is still sitting in the channel from before this
-# change — it'll be cleared out at the next weekly reset.
+# ── Helper: rebuild live counts from the persisted message log (startup only)
+# Reads every logged batch and sums the per-user counts back into
+# _live_counts. Any leftover messages from the old snapshot/per-message
+# formats are simply ignored (they don't match MESSAGE_LOG_PREFIX).
 async def _rebuild_live_counts():
-    global _live_counts, _snapshot_message_ids
+    global _live_counts
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if not db_channel:
         _counts_ready.set()
         return
     counts: dict[str, int] = {}
-    snapshot_ids: list[int] = []
     async for msg in db_channel.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
-        if not msg.content.startswith(COUNTS_SNAPSHOT_PREFIX):
+        if not msg.content.startswith(MESSAGE_LOG_PREFIX):
             continue
-        snapshot_ids.append(msg.id)
         try:
-            chunk = json.loads(msg.content[len(COUNTS_SNAPSHOT_PREFIX):])
+            chunk = json.loads(msg.content[len(MESSAGE_LOG_PREFIX):])
         except (json.JSONDecodeError, TypeError):
             continue
         for uid, count in chunk.items():
@@ -793,9 +788,8 @@ async def _rebuild_live_counts():
             except (TypeError, ValueError):
                 continue
     _live_counts = counts
-    _snapshot_message_ids = snapshot_ids
     _counts_ready.set()
-    print(f"[counts] Rebuilt live counts from snapshot — {len(counts)} users tracked.")
+    print(f"[counts] Rebuilt live counts from message log — {len(counts)} users tracked.")
 
 # ── Helper: tally message counts (now just reads live in-memory state) ───────
 async def tally_counts() -> dict:
@@ -1555,13 +1549,21 @@ async def weekly_reset():
             )
             await announce_channel.send(content)
 
+    # Flush any pending (not-yet-written) counts before wiping the channel so
+    # nothing from the last ~90 seconds of the week is lost from the record
+    try:
+        await _flush_message_log()
+    except discord.HTTPException:
+        pass
+
     deleted = await db_channel.purge(limit=None)
 
-    # Clear live counts (and forget the now-deleted snapshot messages) after
-    # purge so the new week starts from zero
-    global _live_counts, _snapshot_message_ids
+    # Clear live counts and any pending unflushed log entries after purge so
+    # the new week starts from zero
+    global _live_counts
     _live_counts = {}
-    _snapshot_message_ids = []
+    async with _pending_log_lock:
+        _pending_message_log.clear()
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -2132,7 +2134,7 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    counts_snapshotter.start()
+    message_log_flusher.start()
     monthly_mod_status.start()
     asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
