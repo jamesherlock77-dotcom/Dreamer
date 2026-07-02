@@ -60,12 +60,15 @@ CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
-DYNO_BAN_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban logs
-PTS_BAN             = 3
-PTS_WARN            = 1
-PTS_THANKS          = 2
-PTS_PER_50_MSGS     = 1
-MSG_MILESTONE       = 50
+DYNO_MOD_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban/kick logs
+EVENTS_ROLE_ID      = 1423121100228923483      # "Events" role — pinging it earns mod points
+PTS_BAN             = 2
+PTS_WARN            = 2
+PTS_KICK            = 2
+PTS_THANKS          = 1
+PTS_EVENTS_PING     = 2
+PTS_PER_MSG_MILESTONE = 1
+MSG_MILESTONE       = 75
 
 # Only these specific moderators are shown on the leaderboard / counted toward
 # the monthly requirement check, regardless of who else holds the mod role.
@@ -99,13 +102,10 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Live message counts (incremented in real time, avoids re-scanning the
-#    entire log channel on a timer, which doesn't scale as messages pile up) ──
+# ── Live message counts (incremented in real time, persisted as compact
+#    periodic snapshots rather than a growing per-message log) ───────────────
 _live_counts: dict[str, int] = {}
 _counts_ready = asyncio.Event()
-
-# ── DB write queue (batches message log writes to avoid rate limits) ──────────
-_db_write_queue: list[str] = []
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -403,12 +403,12 @@ async def handle_dyno_warn(message: discord.Message):
     await _award_points(invoker_id, PTS_WARN, "warn")
 
 async def handle_dyno_ban(message: discord.Message):
-    """Detects bans carried out via Dyno by watching its ban log channel,
+    """Detects bans carried out via Dyno by watching its mod log channel,
     since Dyno-issued bans show up in the audit log as executed by Dyno
     itself rather than by the moderator who ran the command."""
     if message.author.id != DYNO_BOT_ID or not message.guild:
         return
-    if message.channel.id != DYNO_BAN_LOG_CHANNEL_ID:
+    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
         return
 
     combined = " ".join(_extract_dyno_text_blobs(message)).lower()
@@ -429,9 +429,36 @@ async def handle_dyno_ban(message: discord.Message):
         return
     await _award_points(invoker_id, PTS_BAN, "ban")
 
+async def handle_dyno_kick(message: discord.Message):
+    """Detects kicks carried out via Dyno, the same way handle_dyno_ban does
+    for bans — Dyno's kick log shows Dyno itself as the actor, not the mod."""
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
+        return
+
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "kick" not in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
+
+    if not invoker_id:
+        invoker = await _find_dyno_invoker(message.channel, "kick")
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
+        return
+    member = message.guild.get_member(invoker_id)
+    if not _is_mod(member):
+        return
+    await _award_points(invoker_id, PTS_KICK, "kick")
+
 # ── Track messages to prevent double points for "thanks" ─────────────────────
 _thanked_messages: set[int] = set()
 _thank_cooldowns: dict[str, str] = {}
+_events_ping_cooldowns: dict[str, str] = {}
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -443,7 +470,21 @@ async def handle_mod_rewards(message: discord.Message):
         _staff_msg_counts[uid] = _staff_msg_counts.get(uid, 0) + 1
         if _staff_msg_counts[uid] >= MSG_MILESTONE:
             _staff_msg_counts[uid] = 0
-            await _award_points(message.author.id, PTS_PER_50_MSGS, "messages")
+            await _award_points(message.author.id, PTS_PER_MSG_MILESTONE, "messages")
+
+        # Pinging the Events role earns points too, capped by a cooldown so it
+        # can't be farmed by repeatedly pinging the same role for points.
+        if any(r.id == EVENTS_ROLE_ID for r in message.role_mentions):
+            now = datetime.now(pytz.UTC)
+            uid = str(message.author.id)
+            last_ping_str = _events_ping_cooldowns.get(uid)
+            on_cooldown = False
+            if last_ping_str:
+                last_ping = datetime.fromisoformat(last_ping_str)
+                on_cooldown = (now - last_ping) < timedelta(minutes=20)
+            if not on_cooldown:
+                _events_ping_cooldowns[uid] = now.isoformat()
+                await _award_points(message.author.id, PTS_EVENTS_PING, "events_ping")
 
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
         if message.id in _thanked_messages:
@@ -613,21 +654,19 @@ async def video_checker():
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
-# ── Log every message into the DB channel ────────────────────────────────────
+# ── Log message activity for the weekly leaderboard ───────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
     await handle_dyno_ban(message)
+    await handle_dyno_kick(message)
 
     if message.author.bot:
         return
     if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL, MOD_PTS_DB_CHANNEL):
         return
 
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if db_channel:
-        _db_write_queue.append(str(message.author.id))
-        await _bump_live_count(message.author.id)
+    await _bump_live_count(message.author.id)
 
     if message.channel.id == 1440105578839146517:
         has_image = any(
@@ -663,45 +702,105 @@ async def _bump_live_count(user_id: int):
     uid = str(user_id)
     _live_counts[uid] = _live_counts.get(uid, 0) + 1
 
-# ── Helper: rebuild live counts from history (run once, at startup only) ─────
-# This is the only place we ever do a full history scan of the log channel.
-# Everything else reads/writes the in-memory _live_counts dict directly, so
-# performance no longer degrades as the log channel fills up over the week.
+# ── Counts persistence: compact, bounded snapshots instead of one log line
+#    per message. Previously every single message appended a line to
+#    DB_CHANNEL_ID forever, so on an active server that channel would balloon
+#    to thousands of messages within days, and a bot restart had to page
+#    through *all* of them to rebuild state — that's what was making
+#    /messageleaderboard slow again as messages piled up. Now we periodically
+#    persist the whole _live_counts dict as a handful of JSON messages and
+#    EDIT them in place, so both the write volume and the startup rebuild
+#    cost scale with the number of unique active users, not total messages.
+COUNTS_SNAPSHOT_PREFIX = "COUNTSNAP:"
+_snapshot_message_ids: list[int] = []
+
+async def _persist_counts_snapshot():
+    global _snapshot_message_ids
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        return
+
+    # Pack users into as few ~1900-char JSON chunks as possible
+    chunks: list[dict] = []
+    current: dict = {}
+    for uid, count in _live_counts.items():
+        current[uid] = count
+        encoded = COUNTS_SNAPSHOT_PREFIX + json.dumps(current, separators=(",", ":"))
+        if len(encoded) > 1900:
+            current.pop(uid)
+            chunks.append(current)
+            current = {uid: count}
+    chunks.append(current)  # always at least one chunk, even if empty
+
+    for i, chunk in enumerate(chunks):
+        content = COUNTS_SNAPSHOT_PREFIX + json.dumps(chunk, separators=(",", ":"))
+        if i < len(_snapshot_message_ids):
+            try:
+                msg = await db_channel.fetch_message(_snapshot_message_ids[i])
+                await msg.edit(content=content)
+            except (discord.NotFound, discord.HTTPException):
+                msg = await db_channel.send(content)
+                _snapshot_message_ids[i] = msg.id
+        else:
+            msg = await db_channel.send(content)
+            _snapshot_message_ids.append(msg.id)
+
+    # Clean up leftover snapshot messages if the user count shrank (e.g. after
+    # a purge mid-week) so we don't keep stale chunks around
+    while len(_snapshot_message_ids) > len(chunks):
+        old_id = _snapshot_message_ids.pop()
+        try:
+            old_msg = await db_channel.fetch_message(old_id)
+            await old_msg.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+@tasks.loop(seconds=60)
+async def counts_snapshotter():
+    if not _counts_ready.is_set():
+        return
+    try:
+        await _persist_counts_snapshot()
+    except discord.HTTPException as e:
+        print(f"[counts_snapshotter] Failed to persist snapshot: {e}")
+
+# ── Helper: rebuild live counts from the persisted snapshot (startup only) ───
+# Any leftover messages from the old per-message logging format are simply
+# ignored (they don't match COUNTS_SNAPSHOT_PREFIX), so this stays fast even
+# if old-format backlog is still sitting in the channel from before this
+# change — it'll be cleared out at the next weekly reset.
 async def _rebuild_live_counts():
-    global _live_counts
+    global _live_counts, _snapshot_message_ids
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if not db_channel:
         _counts_ready.set()
         return
     counts: dict[str, int] = {}
+    snapshot_ids: list[int] = []
     async for msg in db_channel.history(limit=None, oldest_first=True):
-        if msg.author.bot:
-            for uid in msg.content.strip().splitlines():
-                uid = uid.strip()
-                if uid.isdigit():
-                    counts[uid] = counts.get(uid, 0) + 1
+        if not msg.author.bot:
+            continue
+        if not msg.content.startswith(COUNTS_SNAPSHOT_PREFIX):
+            continue
+        snapshot_ids.append(msg.id)
+        try:
+            chunk = json.loads(msg.content[len(COUNTS_SNAPSHOT_PREFIX):])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for uid, count in chunk.items():
+            try:
+                counts[uid] = counts.get(uid, 0) + int(count)
+            except (TypeError, ValueError):
+                continue
     _live_counts = counts
+    _snapshot_message_ids = snapshot_ids
     _counts_ready.set()
-    print(f"[counts] Rebuilt live counts from history — {len(counts)} users tracked.")
+    print(f"[counts] Rebuilt live counts from snapshot — {len(counts)} users tracked.")
 
 # ── Helper: tally message counts (now just reads live in-memory state) ───────
 async def tally_counts() -> dict:
     await _counts_ready.wait()
     return dict(_live_counts)
-
-# ── Background task: flush queued DB writes every 5 seconds ──────────────────
-@tasks.loop(seconds=5)
-async def db_flusher():
-    if not _db_write_queue:
-        return
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        return
-    batch = _db_write_queue.copy()
-    _db_write_queue.clear()
-    content = "\n".join(batch)
-    for i in range(0, len(content), 1900):
-        await db_channel.send(content[i:i+1900])
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
@@ -1456,9 +1555,11 @@ async def weekly_reset():
 
     deleted = await db_channel.purge(limit=None)
 
-    # Clear live counts after purge so the new week starts from zero
-    global _live_counts
+    # Clear live counts (and forget the now-deleted snapshot messages) after
+    # purge so the new week starts from zero
+    global _live_counts, _snapshot_message_ids
     _live_counts = {}
+    _snapshot_message_ids = []
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -1987,16 +2088,16 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
 # ── /debugdyno ───────────────────────────────────────────────────────────────
-@tree.command(name="debugdyno", description="Dump the raw content/embeds of recent Dyno ban-log messages (admin only)")
+@tree.command(name="debugdyno", description="Dump the raw content/embeds of recent Dyno mod-log messages (admin only)")
 async def debugdyno(interaction: discord.Interaction, limit: int = 5):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _is_admin(member):
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    channel = bot.get_channel(DYNO_BAN_LOG_CHANNEL_ID)
+    channel = bot.get_channel(DYNO_MOD_LOG_CHANNEL_ID)
     if not channel:
-        await interaction.followup.send("Could not reach the Dyno ban log channel.", ephemeral=True)
+        await interaction.followup.send("Could not reach the Dyno mod log channel.", ephemeral=True)
         return
     out_lines = []
     async for msg in channel.history(limit=limit):
@@ -2029,7 +2130,7 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    db_flusher.start()
+    counts_snapshotter.start()
     monthly_mod_status.start()
     asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
