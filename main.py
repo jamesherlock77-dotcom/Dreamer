@@ -1815,6 +1815,268 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# ── Moderation commands (/ban, /kick, /warn, /warnings) ──────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
+MOD_ACTION_ROLE_ID  = ADMIN_ROLE_ID          # only admins can use /ban /kick /warn /warnings
+WARNINGS_DB_CHANNEL = 1516176492663537875    # reuse mod pts channel — or set a dedicated one
+
+# ── Warnings storage helpers ─────────────────────────────────────────────────
+WARN_DB_CHANNEL_ID = 1516176492663537875     # channel used to persist warning records
+
+async def _save_warning(guild_id: int, target: discord.Member, moderator: discord.Member, reason: str) -> dict:
+    """Appends a warning record to the DB channel and returns the record."""
+    record = {
+        "guild_id":   guild_id,
+        "user_id":    target.id,
+        "user_name":  str(target),
+        "mod_id":     moderator.id,
+        "mod_name":   moderator.display_name,
+        "reason":     reason,
+        "timestamp":  datetime.now(pytz.UTC).isoformat(),
+    }
+    db = bot.get_channel(WARN_DB_CHANNEL_ID)
+    if db:
+        await db.send(f"WARNING:{json.dumps(record)}")
+    return record
+
+async def _get_warnings(guild_id: int, user_id: int) -> list[dict]:
+    """Returns all active warnings for a user in a guild."""
+    db = bot.get_channel(WARN_DB_CHANNEL_ID)
+    if not db:
+        return []
+    warnings = []
+    async for msg in db.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        content = msg.content
+        if content.startswith("WARNING:"):
+            try:
+                record = json.loads(content[len("WARNING:"):])
+                if record.get("guild_id") == guild_id and record.get("user_id") == user_id:
+                    record["_msg_id"] = msg.id
+                    warnings.append(record)
+            except Exception:
+                continue
+        elif content.startswith("DELWARN:"):
+            try:
+                del_info = json.loads(content[len("DELWARN:"):])
+                # Remove the warning whose message id matches
+                warnings = [w for w in warnings if w.get("_msg_id") != del_info.get("msg_id")]
+            except Exception:
+                continue
+    return warnings
+
+async def _delete_warning_by_index(guild_id: int, user_id: int, index: int) -> bool:
+    """Marks warning at 0-based index as deleted. Returns True on success."""
+    warnings = await _get_warnings(guild_id, user_id)
+    if index < 0 or index >= len(warnings):
+        return False
+    target_msg_id = warnings[index].get("_msg_id")
+    if not target_msg_id:
+        return False
+    db = bot.get_channel(WARN_DB_CHANNEL_ID)
+    if db:
+        await db.send(f"DELWARN:{json.dumps({'guild_id': guild_id, 'user_id': user_id, 'msg_id': target_msg_id})}")
+    return True
+
+def _time_ago(iso_str: str) -> str:
+    """Returns a human-readable 'X ago' string from an ISO timestamp."""
+    try:
+        dt  = datetime.fromisoformat(iso_str)
+        now = datetime.now(pytz.UTC)
+        diff = now - dt
+        seconds = int(diff.total_seconds())
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            m = seconds // 60
+            return f"{m} minute{'s' if m != 1 else ''} ago"
+        elif seconds < 86400:
+            h = seconds // 3600
+            return f"{h} hour{'s' if h != 1 else ''} ago"
+        elif seconds < 86400 * 30:
+            d = seconds // 86400
+            return f"{d} day{'s' if d != 1 else ''} ago"
+        elif seconds < 86400 * 365:
+            mo = seconds // (86400 * 30)
+            return f"{mo} month{'s' if mo != 1 else ''} ago"
+        else:
+            y = seconds // (86400 * 365)
+            return f"{y} year{'s' if y != 1 else ''} ago"
+    except Exception:
+        return "unknown"
+
+def _can_moderate(member) -> bool:
+    if not member or not hasattr(member, "roles"):
+        return False
+    return any(r.id == MOD_ACTION_ROLE_ID for r in member.roles)
+
+# ── Delete Warning button view ────────────────────────────────────────────────
+class DeleteWarningView(discord.ui.View):
+    def __init__(self, target_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.target_id = target_id
+        self.guild_id  = guild_id
+
+    @discord.ui.button(label="Delete a warning", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_warning(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _can_moderate(interaction.user):
+            await interaction.response.send_message("You don't have permission to delete warnings.", ephemeral=True)
+            return
+
+        warnings = await _get_warnings(self.guild_id, self.target_id)
+        if not warnings:
+            await interaction.response.send_message("This user has no warnings to delete.", ephemeral=True)
+            return
+
+        # Build a select with each warning as an option
+        options = []
+        for i, w in enumerate(warnings):
+            label   = f"#{i+1} — {w.get('reason', 'No reason')}"[:100]
+            options.append(discord.SelectOption(label=label, value=str(i)))
+
+        class WarningSelectView(discord.ui.View):
+            def __init__(self_inner):
+                super().__init__(timeout=60)
+
+            @discord.ui.select(placeholder="Select a warning to delete...", options=options)
+            async def select_cb(self_inner, select_interaction: discord.Interaction, select: discord.ui.Select):
+                idx = int(select.values[0])
+                success = await _delete_warning_by_index(self.guild_id, self.target_id, idx)
+                if success:
+                    await select_interaction.response.send_message(f"✅ Warning #{idx+1} deleted.", ephemeral=True)
+                else:
+                    await select_interaction.response.send_message("Failed to delete that warning.", ephemeral=True)
+
+        await interaction.response.send_message("Select the warning to remove:", view=WarningSelectView(), ephemeral=True)
+
+# ── /ban ──────────────────────────────────────────────────────────────────────
+@tree.command(name="ban", description="Ban a member from the server")
+@app_commands.describe(user="The member to ban", reason="Reason for the ban")
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str):
+    invoker = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _can_moderate(invoker):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        # DM the user before banning
+        try:
+            await user.send(f"You have been **banned** from **{interaction.guild.name}**.\n**Reason:** {reason}")
+        except discord.Forbidden:
+            pass
+
+        await user.ban(reason=f"{reason} (banned by {interaction.user})")
+
+        # Green embed matching Dyno style
+        embed = discord.Embed(
+            description=f"✅ **{user}** was banned.",
+            color=0x2ECC71,
+        )
+        await interaction.followup.send(embed=embed)
+
+    except discord.Forbidden:
+        await interaction.followup.send("I don't have permission to ban that user.", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Ban failed: {e}", ephemeral=True)
+
+# ── /kick ─────────────────────────────────────────────────────────────────────
+@tree.command(name="kick", description="Kick a member from the server")
+@app_commands.describe(user="The member to kick", reason="Reason for the kick")
+async def kick(interaction: discord.Interaction, user: discord.Member, reason: str):
+    invoker = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _can_moderate(invoker):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        try:
+            await user.send(f"You have been **kicked** from **{interaction.guild.name}**.\n**Reason:** {reason}")
+        except discord.Forbidden:
+            pass
+
+        await user.kick(reason=f"{reason} (kicked by {interaction.user})")
+
+        embed = discord.Embed(
+            description=f"✅ **{user}** was kicked.",
+            color=0x2ECC71,
+        )
+        await interaction.followup.send(embed=embed)
+
+    except discord.Forbidden:
+        await interaction.followup.send("I don't have permission to kick that user.", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Kick failed: {e}", ephemeral=True)
+
+# ── /warn ─────────────────────────────────────────────────────────────────────
+@tree.command(name="warn", description="Warn a member")
+@app_commands.describe(user="The member to warn", reason="Reason for the warning")
+async def warn(interaction: discord.Interaction, user: discord.Member, reason: str):
+    invoker = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _can_moderate(invoker):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    await _save_warning(interaction.guild_id, user, interaction.user, reason)
+
+    try:
+        await user.send(f"You have been **warned** in **{interaction.guild.name}**.\n**Reason:** {reason}")
+    except discord.Forbidden:
+        pass
+
+    # Green embed matching Dyno style: "username has been warned. || reason"
+    embed = discord.Embed(
+        description=f"✅ **{user}** has been warned. || {reason}",
+        color=0x2ECC71,
+    )
+    await interaction.followup.send(embed=embed)
+
+# ── /warnings ────────────────────────────────────────────────────────────────
+@tree.command(name="warnings", description="View warnings for a member")
+@app_commands.describe(user="The member to check")
+async def warnings(interaction: discord.Interaction, user: discord.Member):
+    invoker = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _can_moderate(invoker):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    warns = await _get_warnings(interaction.guild_id, user.id)
+
+    count = len(warns)
+    embed = discord.Embed(
+        title=f"{count} Warning{'s' if count != 1 else ''} for {user.display_name} ({user.id})",
+        color=0x2b2d31,
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    if not warns:
+        embed.description = "This user has no warnings."
+        await interaction.followup.send(embed=embed)
+        return
+
+    for w in warns:
+        mod_name  = w.get("mod_name", "Unknown")
+        reason    = w.get("reason", "No reason provided")
+        time_str  = _time_ago(w.get("timestamp", ""))
+        embed.add_field(
+            name=f"Moderator: {mod_name}",
+            value=f"{reason} — {time_str}",
+            inline=False,
+        )
+
+    view = DeleteWarningView(target_id=user.id, guild_id=interaction.guild_id)
+    await interaction.followup.send(embed=embed, view=view)
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
