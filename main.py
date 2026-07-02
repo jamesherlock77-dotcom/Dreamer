@@ -746,7 +746,13 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        params = {"part": "snippet,statistics", "id": channel_id, "key": YOUTUBE_API_KEY}
+        # Fetch channel stats + the "uploads" playlist ID in one call. We use the
+        # uploads playlist (not search.list) to find #dreamyvr videos, because
+        # YouTube's search.list endpoint uses a separate, often-incomplete search
+        # index that unreliably misses videos — especially on smaller channels —
+        # even when the hashtag is clearly present. Scanning the uploads playlist
+        # ourselves is both reliable and far cheaper on API quota.
+        params = {"part": "snippet,statistics,contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
         async with session.get(f"{base}/channels", params=params) as r:
             data = await r.json()
         items = data.get("items", [])
@@ -755,30 +761,45 @@ async def fetch_youtube_stats(url: str):
         ch      = items[0]
         stats   = ch.get("statistics", {})
         snippet = ch.get("snippet", {})
+        uploads_playlist_id = (
+            ch.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        )
 
         dreamyvr_views = 0
         dreamyvr_count = 0
-        next_page_token = None
-        while True:
-            search_params = {
-                "part": "id", "channelId": channel_id, "q": "#dreamyvr",
-                "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
-            }
-            if next_page_token:
-                search_params["pageToken"] = next_page_token
-            async with session.get(f"{base}/search", params=search_params) as sr:
-                sdata = await sr.json()
-            video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
-            if video_ids:
-                stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
+
+        if uploads_playlist_id:
+            hashtag_video_ids = []
+            next_page_token = None
+            while True:
+                pl_params = {
+                    "part": "snippet", "playlistId": uploads_playlist_id,
+                    "maxResults": 50, "key": YOUTUBE_API_KEY,
+                }
+                if next_page_token:
+                    pl_params["pageToken"] = next_page_token
+                async with session.get(f"{base}/playlistItems", params=pl_params) as pr:
+                    pdata = await pr.json()
+                for item in pdata.get("items", []):
+                    sn   = item.get("snippet", {})
+                    text = f"{sn.get('title', '')} {sn.get('description', '')}".lower()
+                    if "#dreamyvr" in text:
+                        vid = sn.get("resourceId", {}).get("videoId")
+                        if vid:
+                            hashtag_video_ids.append(vid)
+                next_page_token = pdata.get("nextPageToken")
+                if not next_page_token:
+                    break
+
+            # Batch-fetch view counts for the matched videos, 50 at a time
+            for i in range(0, len(hashtag_video_ids), 50):
+                chunk = hashtag_video_ids[i:i + 50]
+                stats_params = {"part": "statistics", "id": ",".join(chunk), "key": YOUTUBE_API_KEY}
                 async with session.get(f"{base}/videos", params=stats_params) as vr:
                     vdata = await vr.json()
                 for v in vdata.get("items", []):
                     dreamyvr_count += 1
                     dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
-            next_page_token = sdata.get("nextPageToken")
-            if not next_page_token:
-                break
 
         return {
             "channel_name":   snippet.get("title", "Unknown"),
