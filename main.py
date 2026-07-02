@@ -102,10 +102,13 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Live message counts (incremented in real time; every message increments
-#    the running total AND is queued for the next periodic batched log write) ─
-_live_counts: dict[str, int] = {}
-_counts_ready = asyncio.Event()
+# ── Message leaderboard state ────────────────────────────────────────────────
+# Every message logs the sender's user ID into DB_CHANNEL_ID (one message = one
+# entry). A background task scans the whole channel every 2 minutes and caches
+# a {user_id: count} tally so /messageleaderboard is instant.
+LEADERBOARD_SCAN_INTERVAL_MIN = 2
+_leaderboard_cache: dict[str, int] = {}
+_leaderboard_ready = asyncio.Event()
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -635,9 +638,6 @@ async def video_checker():
     try:
         yt_id, yt_url, yt_channel_id = await get_latest_youtube_video(YOUTUBE_HANDLE)
         if yt_id and yt_channel_id:
-            # If the resolved channel differs from the last one we tracked
-            # (e.g. the handle/channel changed), treat this as a fresh
-            # baseline rather than announcing whatever's currently latest.
             channel_changed = (
                 _last_youtube_channel_id is not None
                 and yt_channel_id != _last_youtube_channel_id
@@ -654,6 +654,50 @@ async def video_checker():
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
+# ── Message leaderboard: log + periodic scan ─────────────────────────────────
+async def _log_message(user_id: int):
+    """Log a single message by sending the sender's user ID to the DB channel."""
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if db_channel:
+        try:
+            await db_channel.send(str(user_id))
+        except discord.HTTPException:
+            pass
+
+async def _scan_message_log() -> dict:
+    """Scan the entire DB channel and tally how many times each user ID appears."""
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    counts: dict[str, int] = {}
+    if not db_channel:
+        return counts
+    async for msg in db_channel.history(limit=None, oldest_first=True):
+        if not msg.author.bot:
+            continue
+        content = (msg.content or "").strip()
+        if not content.isdigit():
+            continue
+        counts[content] = counts.get(content, 0) + 1
+    return counts
+
+@tasks.loop(minutes=LEADERBOARD_SCAN_INTERVAL_MIN)
+async def leaderboard_scanner():
+    global _leaderboard_cache
+    try:
+        _leaderboard_cache = await _scan_message_log()
+        _leaderboard_ready.set()
+        print(f"[leaderboard] Rebuilt cache — {len(_leaderboard_cache)} users tracked.")
+    except discord.HTTPException as e:
+        print(f"[leaderboard_scanner] Scan failed: {e}")
+
+# ── Helper: tally message counts (reads the cached scan) ─────────────────────
+async def tally_counts() -> dict:
+    # If the first scan hasn't finished yet, build it once on demand.
+    if not _leaderboard_ready.is_set():
+        global _leaderboard_cache
+        _leaderboard_cache = await _scan_message_log()
+        _leaderboard_ready.set()
+    return dict(_leaderboard_cache)
+
 # ── Log message activity for the weekly leaderboard ───────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
@@ -666,7 +710,7 @@ async def on_message(message: discord.Message):
     if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL, MOD_PTS_DB_CHANNEL):
         return
 
-    await _bump_live_count(message.author.id)
+    await _log_message(message.author.id)
 
     if message.channel.id == 1440105578839146517:
         has_image = any(
@@ -693,108 +737,6 @@ async def on_member_ban(guild: discord.Guild, user):
                 break
     except discord.Forbidden:
         pass
-
-# ── Message logging: increment the live count immediately, and queue the
-#    event so it gets written to Discord in the next periodic batch flush
-#    (rather than sending an API call per message, which would be slow and
-#    rack up rate limits) ───────────────────────────────────────────────────
-MESSAGE_LOG_PREFIX = "MSGLOG:"
-MESSAGE_LOG_FLUSH_SECONDS = 90
-
-_pending_message_log: dict[str, int] = {}
-_pending_log_lock = asyncio.Lock()
-
-async def _bump_live_count(user_id: int):
-    # Wait for the one-time startup rebuild so we don't clobber recovered state
-    # with an incomplete count if a message arrives before it finishes.
-    await _counts_ready.wait()
-    uid = str(user_id)
-    _live_counts[uid] = _live_counts.get(uid, 0) + 1
-    async with _pending_log_lock:
-        _pending_message_log[uid] = _pending_message_log.get(uid, 0) + 1
-
-# ── Message log persistence: every message is logged (nothing is ever
-#    overwritten/edited), but individual messages are batched into one
-#    compact write every MESSAGE_LOG_FLUSH_SECONDS so we're not hammering
-#    the Discord API with a send() per chat message. Each flush message
-#    holds a {user_id: count} JSON blob for everyone who sent a message
-#    during that window.
-async def _flush_message_log():
-    async with _pending_log_lock:
-        if not _pending_message_log:
-            return
-        batch = _pending_message_log.copy()
-        _pending_message_log.clear()
-
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        # Put it back so we don't lose the counts if the channel is briefly unavailable
-        async with _pending_log_lock:
-            for uid, count in batch.items():
-                _pending_message_log[uid] = _pending_message_log.get(uid, 0) + count
-        return
-
-    # Split into multiple messages if a single flush would exceed Discord's
-    # message length limit (only relevant on extremely busy servers)
-    chunks: list[dict] = []
-    current: dict = {}
-    for uid, count in batch.items():
-        current[uid] = count
-        encoded = MESSAGE_LOG_PREFIX + json.dumps(current, separators=(",", ":"))
-        if len(encoded) > 1900:
-            current.pop(uid)
-            if current:
-                chunks.append(current)
-            current = {uid: count}
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        content = MESSAGE_LOG_PREFIX + json.dumps(chunk, separators=(",", ":"))
-        await db_channel.send(content)
-
-@tasks.loop(seconds=MESSAGE_LOG_FLUSH_SECONDS)
-async def message_log_flusher():
-    if not _counts_ready.is_set():
-        return
-    try:
-        await _flush_message_log()
-    except discord.HTTPException as e:
-        print(f"[message_log_flusher] Failed to flush message log: {e}")
-
-# ── Helper: rebuild live counts from the persisted message log (startup only)
-# Reads every logged batch and sums the per-user counts back into
-# _live_counts. Any leftover messages from the old snapshot/per-message
-# formats are simply ignored (they don't match MESSAGE_LOG_PREFIX).
-async def _rebuild_live_counts():
-    global _live_counts
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        _counts_ready.set()
-        return
-    counts: dict[str, int] = {}
-    async for msg in db_channel.history(limit=None, oldest_first=True):
-        if not msg.author.bot:
-            continue
-        if not msg.content.startswith(MESSAGE_LOG_PREFIX):
-            continue
-        try:
-            chunk = json.loads(msg.content[len(MESSAGE_LOG_PREFIX):])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for uid, count in chunk.items():
-            try:
-                counts[uid] = counts.get(uid, 0) + int(count)
-            except (TypeError, ValueError):
-                continue
-    _live_counts = counts
-    _counts_ready.set()
-    print(f"[counts] Rebuilt live counts from message log — {len(counts)} users tracked.")
-
-# ── Helper: tally message counts (now just reads live in-memory state) ───────
-async def tally_counts() -> dict:
-    await _counts_ready.wait()
-    return dict(_live_counts)
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
@@ -918,12 +860,6 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        # Fetch channel stats + the "uploads" playlist ID in one call. We use the
-        # uploads playlist (not search.list) to find #dreamyvr videos, because
-        # YouTube's search.list endpoint uses a separate, often-incomplete search
-        # index that unreliably misses videos — especially on smaller channels —
-        # even when the hashtag is clearly present. Scanning the uploads playlist
-        # ourselves is both reliable and far cheaper on API quota.
         params = {"part": "snippet,statistics,contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
         async with session.get(f"{base}/channels", params=params) as r:
             data = await r.json()
@@ -963,7 +899,6 @@ async def fetch_youtube_stats(url: str):
                 if not next_page_token:
                     break
 
-            # Batch-fetch view counts for the matched videos, 50 at a time
             for i in range(0, len(hashtag_video_ids), 50):
                 chunk = hashtag_video_ids[i:i + 50]
                 stats_params = {"part": "statistics", "id": ",".join(chunk), "key": YOUTUBE_API_KEY}
@@ -989,18 +924,13 @@ def extract_tiktok_username(url: str):
     return m.group(1) if m else None
 
 async def fetch_tiktok_posts_data(username: str):
-    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count).
-
-    Uses the hashtag search endpoint to find all #dreamyvr videos, then filters
-    by username so we only count videos from this specific creator.
-    """
+    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count)."""
     total_views    = 0
     video_count    = 0
     follower_count = 0
     seen_ids: set[str] = set()
 
     async with aiohttp.ClientSession() as session:
-        # Fetch follower count from profile endpoint
         try:
             profile_data   = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
             follower_count = int(
@@ -1011,7 +941,6 @@ async def fetch_tiktok_posts_data(username: str):
         except ValueError:
             pass
 
-        # Search #dreamyvr hashtag and filter results by this creator's username
         cursor   = None
         has_more = True
         while has_more:
@@ -1031,7 +960,6 @@ async def fetch_tiktok_posts_data(username: str):
                 break
 
             for video in videos:
-                # Get the author's unique_id to match against our username
                 author = video.get("author") or {}
                 vid_username = (
                     author.get("uniqueId")
@@ -1044,7 +972,6 @@ async def fetch_tiktok_posts_data(username: str):
                 if vid_username != username.lower():
                     continue
 
-                # Deduplicate (TikTok hashtag search can return duplicates)
                 vid_id = str(
                     video.get("id")
                     or video.get("aweme_id")
@@ -1079,7 +1006,6 @@ async def fetch_tiktok_stats(url: str):
     async with aiohttp.ClientSession() as session:
         try:
             profile_data = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
-            # Try common nickname field locations
             nickname = (
                 profile_data.get("user", {}).get("nickname")
                 or profile_data.get("nickname")
@@ -1549,21 +1475,11 @@ async def weekly_reset():
             )
             await announce_channel.send(content)
 
-    # Flush any pending (not-yet-written) counts before wiping the channel so
-    # nothing from the last ~90 seconds of the week is lost from the record
-    try:
-        await _flush_message_log()
-    except discord.HTTPException:
-        pass
-
     deleted = await db_channel.purge(limit=None)
 
-    # Clear live counts and any pending unflushed log entries after purge so
-    # the new week starts from zero
-    global _live_counts
-    _live_counts = {}
-    async with _pending_log_lock:
-        _pending_message_log.clear()
+    # Clear the cached leaderboard so the new week starts from zero
+    global _leaderboard_cache
+    _leaderboard_cache = {}
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -2134,9 +2050,8 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    message_log_flusher.start()
+    leaderboard_scanner.start()
     monthly_mod_status.start()
-    asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
