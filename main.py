@@ -34,7 +34,7 @@ VIDEO_ANNOUNCE_CHANNEL  = 1512853017920143560
 VIDEO_ANNOUNCE_ROLE_ID  = 1512854249174863882
 VIDEO_STATE_CHANNEL_ID  = 1495388852020445255
 TIKTOK_USERNAME          = "dreamyvrofficial"
-YOUTUBE_HANDLE           = "dreamyvr-official"
+YOUTUBE_HANDLE           = "dreamyvrofficial"
 VIDEO_CHECK_INTERVAL_MIN = 10
 
 # ── Streak config ────────────────────────────────────────────────────────────
@@ -60,39 +60,11 @@ CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
-DYNO_MOD_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban/kick logs
-EVENTS_ROLE_ID      = 1423121100228923483      # "Events" role — pinging it earns mod points
-PTS_BAN             = 2
-PTS_WARN            = 2
-PTS_KICK            = 2
-PTS_THANKS          = 1
-PTS_EVENTS_PING     = 2
-PTS_PER_MSG_MILESTONE = 1
-MSG_MILESTONE       = 75
-
-# Only these specific moderators are shown on the leaderboard / counted toward
-# the monthly requirement check, regardless of who else holds the mod role.
-TRACKED_MOD_IDS = [
-    939901393291051080,
-    1342234964841861192,
-    1120910285750943895,
-    1354802771500597390,
-    1382815397006540904,
-    1016825802207268956,
-    1253955909835554819,
-    1277506981858639949,
-    1294510847175032904,
-    1089206891982372934,
-    880643477292089414,
-]
-
-# ── Monthly moderator status report config ────────────────────────────────────
-MOD_STATUS_CHANNEL_ID      = 1495388852020445255
-MOD_STATUS_REQUIRED_POINTS = 10
-MOD_STATUS_TIME            = time(0, 5)  # daily check time (UTC); only acts on the 1st
-MOD_STATUS_MAG_EMOJI    = "<:Moderator_Magnifying_Glass:1497848294364418209>"
-MOD_STATUS_CHECK_EMOJI  = "<:check:1498653592372903986>"
-MOD_STATUS_CANCEL_EMOJI = "<:cancel:1508218455973957683>"
+PTS_BAN             = 3
+PTS_WARN            = 1
+PTS_THANKS          = 2
+PTS_PER_50_MSGS     = 1
+MSG_MILESTONE       = 50
 
 _staff_msg_counts: dict[str, int] = {}
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
@@ -102,10 +74,13 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Live message counts (incremented in real time, persisted as compact
-#    periodic snapshots rather than a growing per-message log) ───────────────
-_live_counts: dict[str, int] = {}
-_counts_ready = asyncio.Event()
+# ── Counts cache ─────────────────────────────────────────────────────────────
+_counts_cache: dict | None = None
+_counts_cache_time: float  = 0
+COUNTS_CACHE_TTL = 90  # seconds, matches counts_refresher interval
+
+# ── DB write queue (batches message log writes to avoid rate limits) ──────────
+_db_write_queue: list[str] = []
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -283,61 +258,6 @@ async def _tally_mod_points() -> dict:
         entry["breakdown"][reason] = entry["breakdown"].get(reason, 0) + pts
     return result
 
-# ── Monthly moderator status report ───────────────────────────────────────────
-async def _post_mod_status_report():
-    """Builds and posts the Monthly Moderator Status embed-style message to
-    MOD_STATUS_CHANNEL_ID. Only the fixed TRACKED_MOD_IDS roster is evaluated,
-    each user needing >= MOD_STATUS_REQUIRED_POINTS to have "met" the
-    requirement for the month."""
-    channel = bot.get_channel(MOD_STATUS_CHANNEL_ID)
-    if not channel:
-        return
-    guild = channel.guild
-    tally = await _tally_mod_points()
-
-    met, failed = [], []
-    for uid in TRACKED_MOD_IDS:
-        data   = tally.get(str(uid), {"total": 0, "breakdown": {}})
-        points = data["total"]
-        member = guild.get_member(uid) if guild else None
-        name   = member.mention if member else f"<@{uid}>"
-        (met if points >= MOD_STATUS_REQUIRED_POINTS else failed).append((name, points))
-
-    met.sort(key=lambda e: e[1], reverse=True)
-    failed.sort(key=lambda e: e[1], reverse=True)
-
-    met_lines = "\n".join(
-        f"> `{i + 1}.` {name} - `{points} mod points`" for i, (name, points) in enumerate(met)
-    ) or "> None"
-    failed_lines = "\n".join(
-        f"> {name} - `{points} mod points`" for name, points in failed
-    ) or "> None"
-
-    content = (
-        f"{MOD_STATUS_MAG_EMOJI}  __**Monthly Moderator Status**__ {MOD_STATUS_MAG_EMOJI} \n\n"
-        f"{MOD_STATUS_CHECK_EMOJI}  **{len(met)} Moderators, have acquired the requirement** {MOD_STATUS_CHECK_EMOJI} \n"
-        f"{MOD_STATUS_CANCEL_EMOJI}  **{len(failed)} Moderators, have failed the requirement** {MOD_STATUS_CANCEL_EMOJI}\n\n"
-        "*Met Requirements:*\n"
-        f"{met_lines}\n\n"
-        "*Failed Requirements*\n"
-        f"{failed_lines}"
-    )
-    await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
-
-async def _reset_mod_points_db():
-    db = bot.get_channel(MOD_PTS_DB_CHANNEL)
-    if db:
-        await db.purge(limit=None)
-
-@tasks.loop(time=MOD_STATUS_TIME)
-async def monthly_mod_status():
-    now = datetime.now(TIMEZONE)
-    if now.day != 1:
-        return
-    await _post_mod_status_report()
-    await _reset_mod_points_db()
-    print(f"[{now}] Monthly moderator status posted and points database reset.")
-
 async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
     try:
         async for m in channel.history(limit=25):
@@ -352,7 +272,9 @@ async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
         pass
     return None
 
-def _extract_dyno_text_blobs(message: discord.Message) -> list[str]:
+async def handle_dyno_warn(message: discord.Message):
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
     text_blobs = [message.content or ""]
     for e in message.embeds:
         if e.title:       text_blobs.append(e.title)
@@ -364,9 +286,11 @@ def _extract_dyno_text_blobs(message: discord.Message) -> list[str]:
             text_blobs.append(e.footer.text)
         if e.author and e.author.name:
             text_blobs.append(e.author.name)
-    return text_blobs
+    combined = " ".join(text_blobs).lower()
+    if "warn" not in combined:
+        return
 
-def _extract_dyno_invoker_id(message: discord.Message) -> int | None:
+    invoker_id = None
     id_re = re.compile(r"(\d{17,20})")
     for e in message.embeds:
         candidates = []
@@ -378,17 +302,10 @@ def _extract_dyno_invoker_id(message: discord.Message) -> int | None:
         for c in candidates:
             m = id_re.search(c)
             if m:
-                return int(m.group(1))
-    return None
-
-async def handle_dyno_warn(message: discord.Message):
-    if message.author.id != DYNO_BOT_ID or not message.guild:
-        return
-    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
-    if "warn" not in combined:
-        return
-
-    invoker_id = _extract_dyno_invoker_id(message)
+                invoker_id = int(m.group(1))
+                break
+        if invoker_id:
+            break
 
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
@@ -402,63 +319,9 @@ async def handle_dyno_warn(message: discord.Message):
         return
     await _award_points(invoker_id, PTS_WARN, "warn")
 
-async def handle_dyno_ban(message: discord.Message):
-    """Detects bans carried out via Dyno by watching its mod log channel,
-    since Dyno-issued bans show up in the audit log as executed by Dyno
-    itself rather than by the moderator who ran the command."""
-    if message.author.id != DYNO_BOT_ID or not message.guild:
-        return
-    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
-        return
-
-    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
-    if "ban" not in combined or "unban" in combined:
-        return
-
-    invoker_id = _extract_dyno_invoker_id(message)
-
-    if not invoker_id:
-        invoker = await _find_dyno_invoker(message.channel, "ban")
-        if invoker:
-            invoker_id = invoker.id
-
-    if not invoker_id:
-        return
-    member = message.guild.get_member(invoker_id)
-    if not _is_mod(member):
-        return
-    await _award_points(invoker_id, PTS_BAN, "ban")
-
-async def handle_dyno_kick(message: discord.Message):
-    """Detects kicks carried out via Dyno, the same way handle_dyno_ban does
-    for bans — Dyno's kick log shows Dyno itself as the actor, not the mod."""
-    if message.author.id != DYNO_BOT_ID or not message.guild:
-        return
-    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
-        return
-
-    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
-    if "kick" not in combined:
-        return
-
-    invoker_id = _extract_dyno_invoker_id(message)
-
-    if not invoker_id:
-        invoker = await _find_dyno_invoker(message.channel, "kick")
-        if invoker:
-            invoker_id = invoker.id
-
-    if not invoker_id:
-        return
-    member = message.guild.get_member(invoker_id)
-    if not _is_mod(member):
-        return
-    await _award_points(invoker_id, PTS_KICK, "kick")
-
 # ── Track messages to prevent double points for "thanks" ─────────────────────
 _thanked_messages: set[int] = set()
 _thank_cooldowns: dict[str, str] = {}
-_events_ping_cooldowns: dict[str, str] = {}
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -470,21 +333,7 @@ async def handle_mod_rewards(message: discord.Message):
         _staff_msg_counts[uid] = _staff_msg_counts.get(uid, 0) + 1
         if _staff_msg_counts[uid] >= MSG_MILESTONE:
             _staff_msg_counts[uid] = 0
-            await _award_points(message.author.id, PTS_PER_MSG_MILESTONE, "messages")
-
-        # Pinging the Events role earns points too, capped by a cooldown so it
-        # can't be farmed by repeatedly pinging the same role for points.
-        if any(r.id == EVENTS_ROLE_ID for r in message.role_mentions):
-            now = datetime.now(pytz.UTC)
-            uid = str(message.author.id)
-            last_ping_str = _events_ping_cooldowns.get(uid)
-            on_cooldown = False
-            if last_ping_str:
-                last_ping = datetime.fromisoformat(last_ping_str)
-                on_cooldown = (now - last_ping) < timedelta(minutes=20)
-            if not on_cooldown:
-                _events_ping_cooldowns[uid] = now.isoformat()
-                await _award_points(message.author.id, PTS_EVENTS_PING, "events_ping")
+            await _award_points(message.author.id, PTS_PER_50_MSGS, "messages")
 
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
         if message.id in _thanked_messages:
@@ -526,11 +375,10 @@ async def _sc_get(session: aiohttp.ClientSession, path: str, params: dict = {}) 
 
 # ── Video announcement helpers ────────────────────────────────────────────────
 _last_video_ids: dict[str, str] = {}
-_last_youtube_channel_id: str | None = None
 _video_ids_loaded = False
 
 async def _load_last_video_ids():
-    global _video_ids_loaded, _last_youtube_channel_id
+    global _video_ids_loaded
     if _video_ids_loaded:
         return
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
@@ -540,16 +388,13 @@ async def _load_last_video_ids():
     async for msg in state_channel.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
-        if msg.content.startswith("LASTVIDEO:"):
-            parts = msg.content.split(":", 2)
-            if len(parts) != 3:
-                continue
-            _, platform, video_id = parts
-            _last_video_ids[platform] = video_id
-        elif msg.content.startswith("LASTYTCHANNEL:"):
-            parts = msg.content.split(":", 1)
-            if len(parts) == 2:
-                _last_youtube_channel_id = parts[1]
+        if not msg.content.startswith("LASTVIDEO:"):
+            continue
+        parts = msg.content.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, platform, video_id = parts
+        _last_video_ids[platform] = video_id
     _video_ids_loaded = True
 
 async def _save_last_video_id(platform: str, video_id: str):
@@ -557,13 +402,6 @@ async def _save_last_video_id(platform: str, video_id: str):
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
     if state_channel:
         await state_channel.send(f"LASTVIDEO:{platform}:{video_id}")
-
-async def _save_last_youtube_channel_id(channel_id: str):
-    global _last_youtube_channel_id
-    _last_youtube_channel_id = channel_id
-    state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
-    if state_channel:
-        await state_channel.send(f"LASTYTCHANNEL:{channel_id}")
 
 async def get_latest_tiktok_video(username: str):
     """Returns (video_id, video_url) for the most recent post, or (None, None)."""
@@ -582,7 +420,7 @@ async def get_latest_tiktok_video(username: str):
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
 
 async def get_latest_youtube_video(handle: str):
-    """Returns (video_id, video_url, channel_id) for the most recent upload, or (None, None, None)."""
+    """Returns (video_id, video_url) for the most recent upload, or (None, None)."""
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
         params = {"part": "id", "forHandle": f"@{handle}", "key": YOUTUBE_API_KEY}
@@ -590,7 +428,7 @@ async def get_latest_youtube_video(handle: str):
             data = await r.json()
         items = data.get("items", [])
         if not items:
-            return None, None, None
+            return None, None
         channel_id = items[0]["id"]
 
         search_params = {
@@ -601,11 +439,11 @@ async def get_latest_youtube_video(handle: str):
             sdata = await r.json()
         sitems = sdata.get("items", [])
         if not sitems:
-            return None, None, channel_id
+            return None, None
         video_id = sitems[0].get("id", {}).get("videoId")
         if not video_id:
-            return None, None, channel_id
-        return video_id, f"https://www.youtube.com/watch?v={video_id}", channel_id
+            return None, None
+        return video_id, f"https://www.youtube.com/watch?v={video_id}"
 
 async def _announce_video(video_url: str):
     channel = bot.get_channel(VIDEO_ANNOUNCE_CHANNEL)
@@ -633,40 +471,28 @@ async def video_checker():
         print(f"[video_checker] TikTok check failed: {e}")
 
     try:
-        yt_id, yt_url, yt_channel_id = await get_latest_youtube_video(YOUTUBE_HANDLE)
-        if yt_id and yt_channel_id:
-            # If the resolved channel differs from the last one we tracked
-            # (e.g. the handle/channel changed), treat this as a fresh
-            # baseline rather than announcing whatever's currently latest.
-            channel_changed = (
-                _last_youtube_channel_id is not None
-                and yt_channel_id != _last_youtube_channel_id
-            )
-            is_first_check = "youtube" not in _last_video_ids or channel_changed
-
-            if yt_channel_id != _last_youtube_channel_id:
-                await _save_last_youtube_channel_id(yt_channel_id)
-
-            if yt_id != _last_video_ids.get("youtube") or channel_changed:
-                await _save_last_video_id("youtube", yt_id)
-                if not is_first_check:
-                    await _announce_video(yt_url)
+        yt_id, yt_url = await get_latest_youtube_video(YOUTUBE_HANDLE)
+        if yt_id and yt_id != _last_video_ids.get("youtube"):
+            is_first_check = "youtube" not in _last_video_ids
+            await _save_last_video_id("youtube", yt_id)
+            if not is_first_check:
+                await _announce_video(yt_url)
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
-# ── Log message activity for the weekly leaderboard ───────────────────────────
+# ── Log every message into the DB channel ────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
-    await handle_dyno_ban(message)
-    await handle_dyno_kick(message)
 
     if message.author.bot:
         return
     if message.channel.id in (DB_CHANNEL_ID, 1500327292830875898, STREAK_DB_CHANNEL, MOD_PTS_DB_CHANNEL):
         return
 
-    await _bump_live_count(message.author.id)
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if db_channel:
+        _db_write_queue.append(str(message.author.id))
 
     if message.channel.id == 1440105578839146517:
         has_image = any(
@@ -681,7 +507,7 @@ async def on_message(message: discord.Message):
     await handle_mod_rewards(message)
     await bot.process_commands(message)
 
-# ── Ban detection (fallback for native Discord bans, e.g. right-click → Ban) ─
+# ── Ban detection ────────────────────────────────────────────────────────────
 @bot.event
 async def on_member_ban(guild: discord.Guild, user):
     try:
@@ -694,113 +520,57 @@ async def on_member_ban(guild: discord.Guild, user):
     except discord.Forbidden:
         pass
 
-# ── Helper: bump a user's live message count ──────────────────────────────────
-async def _bump_live_count(user_id: int):
-    # Wait for the one-time startup rebuild so we don't clobber recovered state
-    # with an incomplete count if a message arrives before it finishes.
-    await _counts_ready.wait()
-    uid = str(user_id)
-    _live_counts[uid] = _live_counts.get(uid, 0) + 1
-
-# ── Counts persistence: compact, bounded snapshots instead of one log line
-#    per message. Previously every single message appended a line to
-#    DB_CHANNEL_ID forever, so on an active server that channel would balloon
-#    to thousands of messages within days, and a bot restart had to page
-#    through *all* of them to rebuild state — that's what was making
-#    /messageleaderboard slow again as messages piled up. Now we periodically
-#    persist the whole _live_counts dict as a handful of JSON messages and
-#    EDIT them in place, so both the write volume and the startup rebuild
-#    cost scale with the number of unique active users, not total messages.
-COUNTS_SNAPSHOT_PREFIX = "COUNTSNAP:"
-_snapshot_message_ids: list[int] = []
-
-async def _persist_counts_snapshot():
-    global _snapshot_message_ids
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        return
-
-    # Pack users into as few ~1900-char JSON chunks as possible
-    chunks: list[dict] = []
-    current: dict = {}
-    for uid, count in _live_counts.items():
-        current[uid] = count
-        encoded = COUNTS_SNAPSHOT_PREFIX + json.dumps(current, separators=(",", ":"))
-        if len(encoded) > 1900:
-            current.pop(uid)
-            chunks.append(current)
-            current = {uid: count}
-    chunks.append(current)  # always at least one chunk, even if empty
-
-    for i, chunk in enumerate(chunks):
-        content = COUNTS_SNAPSHOT_PREFIX + json.dumps(chunk, separators=(",", ":"))
-        if i < len(_snapshot_message_ids):
-            try:
-                msg = await db_channel.fetch_message(_snapshot_message_ids[i])
-                await msg.edit(content=content)
-            except (discord.NotFound, discord.HTTPException):
-                msg = await db_channel.send(content)
-                _snapshot_message_ids[i] = msg.id
-        else:
-            msg = await db_channel.send(content)
-            _snapshot_message_ids.append(msg.id)
-
-    # Clean up leftover snapshot messages if the user count shrank (e.g. after
-    # a purge mid-week) so we don't keep stale chunks around
-    while len(_snapshot_message_ids) > len(chunks):
-        old_id = _snapshot_message_ids.pop()
-        try:
-            old_msg = await db_channel.fetch_message(old_id)
-            await old_msg.delete()
-        except (discord.NotFound, discord.HTTPException):
-            pass
-
-@tasks.loop(seconds=60)
-async def counts_snapshotter():
-    if not _counts_ready.is_set():
-        return
-    try:
-        await _persist_counts_snapshot()
-    except discord.HTTPException as e:
-        print(f"[counts_snapshotter] Failed to persist snapshot: {e}")
-
-# ── Helper: rebuild live counts from the persisted snapshot (startup only) ───
-# Any leftover messages from the old per-message logging format are simply
-# ignored (they don't match COUNTS_SNAPSHOT_PREFIX), so this stays fast even
-# if old-format backlog is still sitting in the channel from before this
-# change — it'll be cleared out at the next weekly reset.
-async def _rebuild_live_counts():
-    global _live_counts, _snapshot_message_ids
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        _counts_ready.set()
-        return
-    counts: dict[str, int] = {}
-    snapshot_ids: list[int] = []
-    async for msg in db_channel.history(limit=None, oldest_first=True):
-        if not msg.author.bot:
-            continue
-        if not msg.content.startswith(COUNTS_SNAPSHOT_PREFIX):
-            continue
-        snapshot_ids.append(msg.id)
-        try:
-            chunk = json.loads(msg.content[len(COUNTS_SNAPSHOT_PREFIX):])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for uid, count in chunk.items():
-            try:
-                counts[uid] = counts.get(uid, 0) + int(count)
-            except (TypeError, ValueError):
-                continue
-    _live_counts = counts
-    _snapshot_message_ids = snapshot_ids
-    _counts_ready.set()
-    print(f"[counts] Rebuilt live counts from snapshot — {len(counts)} users tracked.")
-
-# ── Helper: tally message counts (now just reads live in-memory state) ───────
+# ── Helper: tally message counts (with 5-minute cache) ───────────────────────
 async def tally_counts() -> dict:
-    await _counts_ready.wait()
-    return dict(_live_counts)
+    global _counts_cache, _counts_cache_time
+    now = _time.monotonic()
+    if _counts_cache is not None and (now - _counts_cache_time) < COUNTS_CACHE_TTL:
+        return _counts_cache
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    counts = {}
+    async for msg in db_channel.history(limit=None, oldest_first=True):
+        if msg.author.bot:
+            for uid in msg.content.strip().splitlines():
+                uid = uid.strip()
+                if uid.isdigit():
+                    counts[uid] = counts.get(uid, 0) + 1
+    _counts_cache = counts
+    _counts_cache_time = now
+    return counts
+
+# ── Background task: flush queued DB writes every 5 seconds ──────────────────
+@tasks.loop(seconds=5)
+async def db_flusher():
+    if not _db_write_queue:
+        return
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        return
+    batch = _db_write_queue.copy()
+    _db_write_queue.clear()
+    content = "\n".join(batch)
+    for i in range(0, len(content), 1900):
+        await db_channel.send(content[i:i+1900])
+
+# ── Background task: refresh counts cache every 90 seconds ───────────────────
+@tasks.loop(seconds=90)
+async def counts_refresher():
+    global _counts_cache, _counts_cache_time
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        return
+    counts = {}
+    async for msg in db_channel.history(limit=None, oldest_first=True):
+        if msg.author.bot:
+            for uid in msg.content.strip().splitlines():
+                uid = uid.strip()
+                if uid.isdigit():
+                    counts[uid] = counts.get(uid, 0) + 1
+    _counts_cache = counts
+    _counts_cache_time = _time.monotonic()
+    now_str = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    await db_channel.send(f"SCAN:{now_str}:{len(counts)}")
+    print(f"[counts_refresher] Cache refreshed — {len(counts)} users tracked.")
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
@@ -924,13 +694,7 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        # Fetch channel stats + the "uploads" playlist ID in one call. We use the
-        # uploads playlist (not search.list) to find #dreamyvr videos, because
-        # YouTube's search.list endpoint uses a separate, often-incomplete search
-        # index that unreliably misses videos — especially on smaller channels —
-        # even when the hashtag is clearly present. Scanning the uploads playlist
-        # ourselves is both reliable and far cheaper on API quota.
-        params = {"part": "snippet,statistics,contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
+        params = {"part": "snippet,statistics", "id": channel_id, "key": YOUTUBE_API_KEY}
         async with session.get(f"{base}/channels", params=params) as r:
             data = await r.json()
         items = data.get("items", [])
@@ -939,51 +703,34 @@ async def fetch_youtube_stats(url: str):
         ch      = items[0]
         stats   = ch.get("statistics", {})
         snippet = ch.get("snippet", {})
-        uploads_playlist_id = (
-            ch.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
-        )
 
         dreamyvr_views = 0
         dreamyvr_count = 0
-
-        if uploads_playlist_id:
-            hashtag_video_ids = []
-            next_page_token = None
-            while True:
-                pl_params = {
-                    "part": "snippet", "playlistId": uploads_playlist_id,
-                    "maxResults": 50, "key": YOUTUBE_API_KEY,
-                }
-                if next_page_token:
-                    pl_params["pageToken"] = next_page_token
-                async with session.get(f"{base}/playlistItems", params=pl_params) as pr:
-                    pdata = await pr.json()
-                for item in pdata.get("items", []):
-                    sn   = item.get("snippet", {})
-                    text = f"{sn.get('title', '')} {sn.get('description', '')}".lower()
-                    if "#dreamyvr" in text:
-                        vid = sn.get("resourceId", {}).get("videoId")
-                        if vid:
-                            hashtag_video_ids.append(vid)
-                next_page_token = pdata.get("nextPageToken")
-                if not next_page_token:
-                    break
-
-            # Batch-fetch view counts for the matched videos, 50 at a time
-            for i in range(0, len(hashtag_video_ids), 50):
-                chunk = hashtag_video_ids[i:i + 50]
-                stats_params = {"part": "statistics", "id": ",".join(chunk), "key": YOUTUBE_API_KEY}
+        next_page_token = None
+        while True:
+            search_params = {
+                "part": "id", "channelId": channel_id, "q": "#dreamyvr",
+                "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
+            }
+            if next_page_token:
+                search_params["pageToken"] = next_page_token
+            async with session.get(f"{base}/search", params=search_params) as sr:
+                sdata = await sr.json()
+            video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
+            if video_ids:
+                stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
                 async with session.get(f"{base}/videos", params=stats_params) as vr:
                     vdata = await vr.json()
                 for v in vdata.get("items", []):
                     dreamyvr_count += 1
                     dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
+            next_page_token = sdata.get("nextPageToken")
+            if not next_page_token:
+                break
 
         return {
             "channel_name":   snippet.get("title", "Unknown"),
             "subscribers":    int(stats.get("subscriberCount", 0)),
-            "total_views":    int(stats.get("viewCount", 0)),
-            "total_videos":   int(stats.get("videoCount", 0)),
             "dreamyvr_count": dreamyvr_count,
             "dreamyvr_views": dreamyvr_views,
             "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
@@ -1221,8 +968,6 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",          value="YouTube",                          inline=True)
             embed.add_field(name="Subscribers",       value=f"`{stats['subscribers']:,}`",      inline=True)
-            embed.add_field(name="Total Views",       value=f"`{stats['total_views']:,}`",      inline=True)
-            embed.add_field(name="Total Videos",      value=f"`{stats['total_videos']:,}`",     inline=True)
             embed.add_field(name="#dreamyvr Videos",  value=f"`{stats['dreamyvr_count']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Views",   value=f"`{stats['dreamyvr_views']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
@@ -1301,8 +1046,6 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",         value="YouTube",                        inline=True)
             embed.add_field(name="Subscribers",      value=f"`{stats['subscribers']:,}`",    inline=True)
-            embed.add_field(name="Total Views",      value=f"`{stats['total_views']:,}`",    inline=True)
-            embed.add_field(name="Total Videos",     value=f"`{stats['total_videos']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
@@ -1357,8 +1100,6 @@ async def contentfullstats(interaction: discord.Interaction):
                     f"**{number}.** {mention}\n"
                     f"> URL: {url}\n"
                     f"> Subscribers: {stats['subscribers']:,}\n"
-                    f"> Total views: {stats['total_views']:,}\n"
-                    f"> Total videos: {stats['total_videos']:,}\n"
                     f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
                     f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
                 )
@@ -1418,11 +1159,10 @@ async def modleaderboard(interaction: discord.Interaction):
         return
     await interaction.response.defer()
     tally = await _tally_mod_points()
-    ranked = []
-    for uid in TRACKED_MOD_IDS:
-        data = tally.get(str(uid), {"total": 0, "breakdown": {}})
-        ranked.append((str(uid), data))
-    ranked.sort(key=lambda kv: kv[1]["total"], reverse=True)
+    if not tally:
+        await interaction.followup.send("No mod points tracked yet.")
+        return
+    ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
     lines = []
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
@@ -1435,17 +1175,6 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-
-# ── /moderatorstatus ─────────────────────────────────────────────────────────
-@tree.command(name="moderatorstatus", description="Post the monthly moderator status report (admin only)")
-async def moderatorstatus(interaction: discord.Interaction):
-    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-    if not _is_admin(member):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    await _post_mod_status_report()
-    await interaction.followup.send(f"Posted the moderator status report in <#{MOD_STATUS_CHANNEL_ID}>.", ephemeral=True)
 
 # ── /sendlevel ────────────────────────────────────────────────────────────────
 def _has_level_role(member: discord.Member) -> bool:
@@ -1555,11 +1284,10 @@ async def weekly_reset():
 
     deleted = await db_channel.purge(limit=None)
 
-    # Clear live counts (and forget the now-deleted snapshot messages) after
-    # purge so the new week starts from zero
-    global _live_counts, _snapshot_message_ids
-    _live_counts = {}
-    _snapshot_message_ids = []
+    # Invalidate counts cache after purge so stale data isn't served
+    global _counts_cache, _counts_cache_time
+    _counts_cache      = None
+    _counts_cache_time = 0
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -2087,39 +1815,6 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
-# ── /debugdyno ───────────────────────────────────────────────────────────────
-@tree.command(name="debugdyno", description="Dump the raw content/embeds of recent Dyno mod-log messages (admin only)")
-async def debugdyno(interaction: discord.Interaction, limit: int = 5):
-    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
-    if not _is_admin(member):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    channel = bot.get_channel(DYNO_MOD_LOG_CHANNEL_ID)
-    if not channel:
-        await interaction.followup.send("Could not reach the Dyno mod log channel.", ephemeral=True)
-        return
-    out_lines = []
-    async for msg in channel.history(limit=limit):
-        if msg.author.id != DYNO_BOT_ID:
-            continue
-        out_lines.append(f"--- message {msg.id} ---")
-        out_lines.append(f"content: {msg.content!r}")
-        for e in msg.embeds:
-            out_lines.append(f"embed.title: {e.title!r}")
-            out_lines.append(f"embed.description: {e.description!r}")
-            for f in e.fields:
-                out_lines.append(f"  field: {f.name!r} = {f.value!r}")
-            if e.footer:
-                out_lines.append(f"embed.footer: {e.footer.text!r}")
-            if e.author:
-                out_lines.append(f"embed.author: {e.author.name!r}")
-    if not out_lines:
-        await interaction.followup.send("No Dyno messages found in that channel.", ephemeral=True)
-        return
-    text = "\n".join(out_lines)[:1900]
-    await interaction.followup.send(f"```\n{text}\n```", ephemeral=True)
-
 # ── Startup ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -2130,13 +1825,18 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    counts_snapshotter.start()
-    monthly_mod_status.start()
-    asyncio.create_task(_rebuild_live_counts())
+    counts_refresher.start()
+    db_flusher.start()
+    asyncio.create_task(_delayed_counts_warmup())
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
     await post_ticket_panel()
     print(f"Logged in as {bot.user} ({bot.user.id})")
+
+async def _delayed_counts_warmup():
+    await asyncio.sleep(60)
+    await tally_counts()
+    print("[counts] Cache warmed up.")
 
 bot.run(TOKEN)
