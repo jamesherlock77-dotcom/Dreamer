@@ -67,6 +67,30 @@ PTS_THANKS          = 2
 PTS_PER_50_MSGS     = 1
 MSG_MILESTONE       = 50
 
+# Only these specific moderators are shown on the leaderboard / counted toward
+# the monthly requirement check, regardless of who else holds the mod role.
+TRACKED_MOD_IDS = [
+    939901393291051080,
+    1342234964841861192,
+    1120910285750943895,
+    1354802771500597390,
+    1382815397006540904,
+    1016825802207268956,
+    1253955909835554819,
+    1277506981858639949,
+    1294510847175032904,
+    1089206891982372934,
+    880643477292089414,
+]
+
+# ── Monthly moderator status report config ────────────────────────────────────
+MOD_STATUS_CHANNEL_ID      = 1495388852020445255
+MOD_STATUS_REQUIRED_POINTS = 10
+MOD_STATUS_TIME            = time(0, 5)  # daily check time (UTC); only acts on the 1st
+MOD_STATUS_MAG_EMOJI    = "<:Moderator_Magnifying_Glass:1497848294364418209>"
+MOD_STATUS_CHECK_EMOJI  = "<:check:1498653592372903986>"
+MOD_STATUS_CANCEL_EMOJI = "<:cancel:1508218455973957683>"
+
 _staff_msg_counts: dict[str, int] = {}
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
 
@@ -258,6 +282,61 @@ async def _tally_mod_points() -> dict:
         entry["total"] += pts
         entry["breakdown"][reason] = entry["breakdown"].get(reason, 0) + pts
     return result
+
+# ── Monthly moderator status report ───────────────────────────────────────────
+async def _post_mod_status_report():
+    """Builds and posts the Monthly Moderator Status embed-style message to
+    MOD_STATUS_CHANNEL_ID. Only the fixed TRACKED_MOD_IDS roster is evaluated,
+    each user needing >= MOD_STATUS_REQUIRED_POINTS to have "met" the
+    requirement for the month."""
+    channel = bot.get_channel(MOD_STATUS_CHANNEL_ID)
+    if not channel:
+        return
+    guild = channel.guild
+    tally = await _tally_mod_points()
+
+    met, failed = [], []
+    for uid in TRACKED_MOD_IDS:
+        data   = tally.get(str(uid), {"total": 0, "breakdown": {}})
+        points = data["total"]
+        member = guild.get_member(uid) if guild else None
+        name   = member.mention if member else f"<@{uid}>"
+        (met if points >= MOD_STATUS_REQUIRED_POINTS else failed).append((name, points))
+
+    met.sort(key=lambda e: e[1], reverse=True)
+    failed.sort(key=lambda e: e[1], reverse=True)
+
+    met_lines = "\n".join(
+        f"> `{i + 1}.` {name} - `{points} mod points`" for i, (name, points) in enumerate(met)
+    ) or "> None"
+    failed_lines = "\n".join(
+        f"> {name} - `{points} mod points`" for name, points in failed
+    ) or "> None"
+
+    content = (
+        f"{MOD_STATUS_MAG_EMOJI}  __**Monthly Moderator Status**__ {MOD_STATUS_MAG_EMOJI} \n"
+        f"{MOD_STATUS_CHECK_EMOJI}  **{len(met)} Moderators, have acquired the requirement** {MOD_STATUS_CHECK_EMOJI} \n"
+        f"{MOD_STATUS_CANCEL_EMOJI}  **{len(failed)} Moderators, have failed the requirement** {MOD_STATUS_CANCEL_EMOJI}\n"
+        "*Met Requirements:*\n"
+        f"{met_lines}\n"
+        "*Failed Requirements*\n"
+        f"{failed_lines}"
+    )
+    await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+
+async def _reset_mod_points_db():
+    db = bot.get_channel(MOD_PTS_DB_CHANNEL)
+    if db:
+        await db.purge(limit=None)
+
+@tasks.loop(time=MOD_STATUS_TIME)
+async def monthly_mod_status():
+    now = datetime.now(TIMEZONE)
+    if now.day != 1:
+        return
+    await _post_mod_status_report()
+    await _reset_mod_points_db()
+    print(f"[{now}] Monthly moderator status posted and points database reset.")
 
 async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
     try:
@@ -1240,10 +1319,11 @@ async def modleaderboard(interaction: discord.Interaction):
         return
     await interaction.response.defer()
     tally = await _tally_mod_points()
-    if not tally:
-        await interaction.followup.send("No mod points tracked yet.")
-        return
-    ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
+    ranked = []
+    for uid in TRACKED_MOD_IDS:
+        data = tally.get(str(uid), {"total": 0, "breakdown": {}})
+        ranked.append((str(uid), data))
+    ranked.sort(key=lambda kv: kv[1]["total"], reverse=True)
     lines = []
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
@@ -1256,6 +1336,17 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+# ── /moderatorstatus ─────────────────────────────────────────────────────────
+@tree.command(name="moderatorstatus", description="Post the monthly moderator status report (admin only)")
+async def moderatorstatus(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _post_mod_status_report()
+    await interaction.followup.send(f"Posted the moderator status report in <#{MOD_STATUS_CHANNEL_ID}>.", ephemeral=True)
 
 # ── /sendlevel ────────────────────────────────────────────────────────────────
 def _has_level_role(member: discord.Member) -> bool:
@@ -1939,6 +2030,7 @@ async def on_ready():
     streak_checker.start()
     video_checker.start()
     db_flusher.start()
+    monthly_mod_status.start()
     asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
     _streaks_ready.set()
