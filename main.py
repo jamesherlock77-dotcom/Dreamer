@@ -34,7 +34,7 @@ VIDEO_ANNOUNCE_CHANNEL  = 1512853017920143560
 VIDEO_ANNOUNCE_ROLE_ID  = 1512854249174863882
 VIDEO_STATE_CHANNEL_ID  = 1495388852020445255
 TIKTOK_USERNAME          = "dreamyvrofficial"
-YOUTUBE_HANDLE           = "dreamyvrofficial"
+YOUTUBE_HANDLE           = "dreamyvr-official"
 VIDEO_CHECK_INTERVAL_MIN = 10
 
 # ── Streak config ────────────────────────────────────────────────────────────
@@ -75,10 +75,10 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Counts cache ─────────────────────────────────────────────────────────────
-_counts_cache: dict | None = None
-_counts_cache_time: float  = 0
-COUNTS_CACHE_TTL = 90  # seconds, matches counts_refresher interval
+# ── Live message counts (incremented in real time, avoids re-scanning the
+#    entire log channel on a timer, which doesn't scale as messages pile up) ──
+_live_counts: dict[str, int] = {}
+_counts_ready = asyncio.Event()
 
 # ── DB write queue (batches message log writes to avoid rate limits) ──────────
 _db_write_queue: list[str] = []
@@ -406,10 +406,11 @@ async def _sc_get(session: aiohttp.ClientSession, path: str, params: dict = {}) 
 
 # ── Video announcement helpers ────────────────────────────────────────────────
 _last_video_ids: dict[str, str] = {}
+_last_youtube_channel_id: str | None = None
 _video_ids_loaded = False
 
 async def _load_last_video_ids():
-    global _video_ids_loaded
+    global _video_ids_loaded, _last_youtube_channel_id
     if _video_ids_loaded:
         return
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
@@ -419,13 +420,16 @@ async def _load_last_video_ids():
     async for msg in state_channel.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
-        if not msg.content.startswith("LASTVIDEO:"):
-            continue
-        parts = msg.content.split(":", 2)
-        if len(parts) != 3:
-            continue
-        _, platform, video_id = parts
-        _last_video_ids[platform] = video_id
+        if msg.content.startswith("LASTVIDEO:"):
+            parts = msg.content.split(":", 2)
+            if len(parts) != 3:
+                continue
+            _, platform, video_id = parts
+            _last_video_ids[platform] = video_id
+        elif msg.content.startswith("LASTYTCHANNEL:"):
+            parts = msg.content.split(":", 1)
+            if len(parts) == 2:
+                _last_youtube_channel_id = parts[1]
     _video_ids_loaded = True
 
 async def _save_last_video_id(platform: str, video_id: str):
@@ -433,6 +437,13 @@ async def _save_last_video_id(platform: str, video_id: str):
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
     if state_channel:
         await state_channel.send(f"LASTVIDEO:{platform}:{video_id}")
+
+async def _save_last_youtube_channel_id(channel_id: str):
+    global _last_youtube_channel_id
+    _last_youtube_channel_id = channel_id
+    state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
+    if state_channel:
+        await state_channel.send(f"LASTYTCHANNEL:{channel_id}")
 
 async def get_latest_tiktok_video(username: str):
     """Returns (video_id, video_url) for the most recent post, or (None, None)."""
@@ -451,7 +462,7 @@ async def get_latest_tiktok_video(username: str):
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
 
 async def get_latest_youtube_video(handle: str):
-    """Returns (video_id, video_url) for the most recent upload, or (None, None)."""
+    """Returns (video_id, video_url, channel_id) for the most recent upload, or (None, None, None)."""
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
         params = {"part": "id", "forHandle": f"@{handle}", "key": YOUTUBE_API_KEY}
@@ -459,7 +470,7 @@ async def get_latest_youtube_video(handle: str):
             data = await r.json()
         items = data.get("items", [])
         if not items:
-            return None, None
+            return None, None, None
         channel_id = items[0]["id"]
 
         search_params = {
@@ -470,11 +481,11 @@ async def get_latest_youtube_video(handle: str):
             sdata = await r.json()
         sitems = sdata.get("items", [])
         if not sitems:
-            return None, None
+            return None, None, channel_id
         video_id = sitems[0].get("id", {}).get("videoId")
         if not video_id:
-            return None, None
-        return video_id, f"https://www.youtube.com/watch?v={video_id}"
+            return None, None, channel_id
+        return video_id, f"https://www.youtube.com/watch?v={video_id}", channel_id
 
 async def _announce_video(video_url: str):
     channel = bot.get_channel(VIDEO_ANNOUNCE_CHANNEL)
@@ -502,12 +513,24 @@ async def video_checker():
         print(f"[video_checker] TikTok check failed: {e}")
 
     try:
-        yt_id, yt_url = await get_latest_youtube_video(YOUTUBE_HANDLE)
-        if yt_id and yt_id != _last_video_ids.get("youtube"):
-            is_first_check = "youtube" not in _last_video_ids
-            await _save_last_video_id("youtube", yt_id)
-            if not is_first_check:
-                await _announce_video(yt_url)
+        yt_id, yt_url, yt_channel_id = await get_latest_youtube_video(YOUTUBE_HANDLE)
+        if yt_id and yt_channel_id:
+            # If the resolved channel differs from the last one we tracked
+            # (e.g. the handle/channel changed), treat this as a fresh
+            # baseline rather than announcing whatever's currently latest.
+            channel_changed = (
+                _last_youtube_channel_id is not None
+                and yt_channel_id != _last_youtube_channel_id
+            )
+            is_first_check = "youtube" not in _last_video_ids or channel_changed
+
+            if yt_channel_id != _last_youtube_channel_id:
+                await _save_last_youtube_channel_id(yt_channel_id)
+
+            if yt_id != _last_video_ids.get("youtube") or channel_changed:
+                await _save_last_video_id("youtube", yt_id)
+                if not is_first_check:
+                    await _announce_video(yt_url)
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
@@ -525,6 +548,7 @@ async def on_message(message: discord.Message):
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     if db_channel:
         _db_write_queue.append(str(message.author.id))
+        await _bump_live_count(message.author.id)
 
     if message.channel.id == 1440105578839146517:
         has_image = any(
@@ -552,23 +576,39 @@ async def on_member_ban(guild: discord.Guild, user):
     except discord.Forbidden:
         pass
 
-# ── Helper: tally message counts (with 5-minute cache) ───────────────────────
-async def tally_counts() -> dict:
-    global _counts_cache, _counts_cache_time
-    now = _time.monotonic()
-    if _counts_cache is not None and (now - _counts_cache_time) < COUNTS_CACHE_TTL:
-        return _counts_cache
+# ── Helper: bump a user's live message count ──────────────────────────────────
+async def _bump_live_count(user_id: int):
+    # Wait for the one-time startup rebuild so we don't clobber recovered state
+    # with an incomplete count if a message arrives before it finishes.
+    await _counts_ready.wait()
+    uid = str(user_id)
+    _live_counts[uid] = _live_counts.get(uid, 0) + 1
+
+# ── Helper: rebuild live counts from history (run once, at startup only) ─────
+# This is the only place we ever do a full history scan of the log channel.
+# Everything else reads/writes the in-memory _live_counts dict directly, so
+# performance no longer degrades as the log channel fills up over the week.
+async def _rebuild_live_counts():
+    global _live_counts
     db_channel = bot.get_channel(DB_CHANNEL_ID)
-    counts = {}
+    if not db_channel:
+        _counts_ready.set()
+        return
+    counts: dict[str, int] = {}
     async for msg in db_channel.history(limit=None, oldest_first=True):
         if msg.author.bot:
             for uid in msg.content.strip().splitlines():
                 uid = uid.strip()
                 if uid.isdigit():
                     counts[uid] = counts.get(uid, 0) + 1
-    _counts_cache = counts
-    _counts_cache_time = now
-    return counts
+    _live_counts = counts
+    _counts_ready.set()
+    print(f"[counts] Rebuilt live counts from history — {len(counts)} users tracked.")
+
+# ── Helper: tally message counts (now just reads live in-memory state) ───────
+async def tally_counts() -> dict:
+    await _counts_ready.wait()
+    return dict(_live_counts)
 
 # ── Background task: flush queued DB writes every 5 seconds ──────────────────
 @tasks.loop(seconds=5)
@@ -583,26 +623,6 @@ async def db_flusher():
     content = "\n".join(batch)
     for i in range(0, len(content), 1900):
         await db_channel.send(content[i:i+1900])
-
-# ── Background task: refresh counts cache every 90 seconds ───────────────────
-@tasks.loop(seconds=90)
-async def counts_refresher():
-    global _counts_cache, _counts_cache_time
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if not db_channel:
-        return
-    counts = {}
-    async for msg in db_channel.history(limit=None, oldest_first=True):
-        if msg.author.bot:
-            for uid in msg.content.strip().splitlines():
-                uid = uid.strip()
-                if uid.isdigit():
-                    counts[uid] = counts.get(uid, 0) + 1
-    _counts_cache = counts
-    _counts_cache_time = _time.monotonic()
-    now_str = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await db_channel.send(f"SCAN:{now_str}:{len(counts)}")
-    print(f"[counts_refresher] Cache refreshed — {len(counts)} users tracked.")
 
 # ── Helper: build approved links cache ───────────────────────────────────────
 async def _build_links_cache() -> dict:
@@ -763,6 +783,8 @@ async def fetch_youtube_stats(url: str):
         return {
             "channel_name":   snippet.get("title", "Unknown"),
             "subscribers":    int(stats.get("subscriberCount", 0)),
+            "total_views":    int(stats.get("viewCount", 0)),
+            "total_videos":   int(stats.get("videoCount", 0)),
             "dreamyvr_count": dreamyvr_count,
             "dreamyvr_views": dreamyvr_views,
             "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
@@ -1000,6 +1022,8 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",          value="YouTube",                          inline=True)
             embed.add_field(name="Subscribers",       value=f"`{stats['subscribers']:,}`",      inline=True)
+            embed.add_field(name="Total Views",       value=f"`{stats['total_views']:,}`",      inline=True)
+            embed.add_field(name="Total Videos",      value=f"`{stats['total_videos']:,}`",     inline=True)
             embed.add_field(name="#dreamyvr Videos",  value=f"`{stats['dreamyvr_count']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Views",   value=f"`{stats['dreamyvr_views']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
@@ -1078,6 +1102,8 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",         value="YouTube",                        inline=True)
             embed.add_field(name="Subscribers",      value=f"`{stats['subscribers']:,}`",    inline=True)
+            embed.add_field(name="Total Views",      value=f"`{stats['total_views']:,}`",    inline=True)
+            embed.add_field(name="Total Videos",     value=f"`{stats['total_videos']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
@@ -1132,6 +1158,8 @@ async def contentfullstats(interaction: discord.Interaction):
                     f"**{number}.** {mention}\n"
                     f"> URL: {url}\n"
                     f"> Subscribers: {stats['subscribers']:,}\n"
+                    f"> Total views: {stats['total_views']:,}\n"
+                    f"> Total videos: {stats['total_videos']:,}\n"
                     f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
                     f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
                 )
@@ -1316,10 +1344,9 @@ async def weekly_reset():
 
     deleted = await db_channel.purge(limit=None)
 
-    # Invalidate counts cache after purge so stale data isn't served
-    global _counts_cache, _counts_cache_time
-    _counts_cache      = None
-    _counts_cache_time = 0
+    # Clear live counts after purge so the new week starts from zero
+    global _live_counts
+    _live_counts = {}
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -1890,18 +1917,12 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    counts_refresher.start()
     db_flusher.start()
-    asyncio.create_task(_delayed_counts_warmup())
+    asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
     await post_ticket_panel()
     print(f"Logged in as {bot.user} ({bot.user.id})")
-
-async def _delayed_counts_warmup():
-    await asyncio.sleep(60)
-    await tally_counts()
-    print("[counts] Cache warmed up.")
 
 bot.run(TOKEN)
