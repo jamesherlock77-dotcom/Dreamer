@@ -314,11 +314,11 @@ async def _post_mod_status_report():
     ) or "> None"
 
     content = (
-        f"{MOD_STATUS_MAG_EMOJI}  __**Monthly Moderator Status**__ {MOD_STATUS_MAG_EMOJI} \n"
+        f"{MOD_STATUS_MAG_EMOJI}  __**Monthly Moderator Status**__ {MOD_STATUS_MAG_EMOJI} \n\n"
         f"{MOD_STATUS_CHECK_EMOJI}  **{len(met)} Moderators, have acquired the requirement** {MOD_STATUS_CHECK_EMOJI} \n"
-        f"{MOD_STATUS_CANCEL_EMOJI}  **{len(failed)} Moderators, have failed the requirement** {MOD_STATUS_CANCEL_EMOJI}\n"
+        f"{MOD_STATUS_CANCEL_EMOJI}  **{len(failed)} Moderators, have failed the requirement** {MOD_STATUS_CANCEL_EMOJI}\n\n"
         "*Met Requirements:*\n"
-        f"{met_lines}\n"
+        f"{met_lines}\n\n"
         "*Failed Requirements*\n"
         f"{failed_lines}"
     )
