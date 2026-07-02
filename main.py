@@ -1,3 +1,4 @@
+
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -60,8 +61,8 @@ CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
-DYNO_MOD_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban/kick logs
-EVENTS_ROLE_ID      = 1423121100228923483      # "Events" role — pinging it earns mod points
+DYNO_MOD_LOG_CHANNEL_ID = 1423121107057246238
+EVENTS_ROLE_ID      = 1423121100228923483
 PTS_BAN             = 2
 PTS_WARN            = 2
 PTS_KICK            = 2
@@ -70,8 +71,6 @@ PTS_EVENTS_PING     = 2
 PTS_PER_MSG_MILESTONE = 1
 MSG_MILESTONE       = 75
 
-# Only these specific moderators are shown on the leaderboard / counted toward
-# the monthly requirement check, regardless of who else holds the mod role.
 TRACKED_MOD_IDS = [
     939901393291051080,
     1342234964841861192,
@@ -89,7 +88,7 @@ TRACKED_MOD_IDS = [
 # ── Monthly moderator status report config ────────────────────────────────────
 MOD_STATUS_CHANNEL_ID      = 1495388852020445255
 MOD_STATUS_REQUIRED_POINTS = 10
-MOD_STATUS_TIME            = time(0, 5)  # daily check time (UTC); only acts on the 1st
+MOD_STATUS_TIME            = time(0, 5)
 MOD_STATUS_MAG_EMOJI    = "<:Moderator_Magnifying_Glass:1497848294364418209>"
 MOD_STATUS_CHECK_EMOJI  = "<:check:1498653592372903986>"
 MOD_STATUS_CANCEL_EMOJI = "<:cancel:1508218455973957683>"
@@ -102,13 +101,17 @@ _approved_links_cache: dict | None = None
 _approved_links_cache_time: float  = 0
 CACHE_TTL = 300
 
-# ── Message leaderboard state ────────────────────────────────────────────────
-# Every message logs the sender's user ID into DB_CHANNEL_ID (one message = one
-# entry). A background task scans the whole channel every 2 minutes and caches
-# a {user_id: count} tally so /messageleaderboard is instant.
-LEADERBOARD_SCAN_INTERVAL_MIN = 2
-_leaderboard_cache: dict[str, int] = {}
-_leaderboard_ready = asyncio.Event()
+# ── Message leaderboard state (in-memory counter + batched DB persistence) ────
+# Every message increments an in-memory counter (instant leaderboard) and is
+# queued for a batched write to DB_CHANNEL_ID. A flusher packs up to ~100 IDs
+# into one message every 5s so we never hit send rate limits. The channel is
+# scanned only ONCE at startup to recover counts after a restart.
+LOG_PREFIX     = "IDS:"
+LOG_FLUSH_SECS = 5
+_live_counts: dict[str, int] = {}
+_counts_ready = asyncio.Event()
+_pending_ids: list[str] = []
+_pending_lock = asyncio.Lock()
 
 # ── Ticket system config ──────────────────────────────────────────────────────
 TICKET_PANEL_CHANNEL    = 1495162997734117386
@@ -288,10 +291,6 @@ async def _tally_mod_points() -> dict:
 
 # ── Monthly moderator status report ───────────────────────────────────────────
 async def _post_mod_status_report():
-    """Builds and posts the Monthly Moderator Status embed-style message to
-    MOD_STATUS_CHANNEL_ID. Only the fixed TRACKED_MOD_IDS roster is evaluated,
-    each user needing >= MOD_STATUS_REQUIRED_POINTS to have "met" the
-    requirement for the month."""
     channel = bot.get_channel(MOD_STATUS_CHANNEL_ID)
     if not channel:
         return
@@ -390,14 +389,11 @@ async def handle_dyno_warn(message: discord.Message):
     combined = " ".join(_extract_dyno_text_blobs(message)).lower()
     if "warn" not in combined:
         return
-
     invoker_id = _extract_dyno_invoker_id(message)
-
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
         if invoker:
             invoker_id = invoker.id
-
     if not invoker_id:
         return
     member = message.guild.get_member(invoker_id)
@@ -406,25 +402,18 @@ async def handle_dyno_warn(message: discord.Message):
     await _award_points(invoker_id, PTS_WARN, "warn")
 
 async def handle_dyno_ban(message: discord.Message):
-    """Detects bans carried out via Dyno by watching its mod log channel,
-    since Dyno-issued bans show up in the audit log as executed by Dyno
-    itself rather than by the moderator who ran the command."""
     if message.author.id != DYNO_BOT_ID or not message.guild:
         return
     if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
         return
-
     combined = " ".join(_extract_dyno_text_blobs(message)).lower()
     if "ban" not in combined or "unban" in combined:
         return
-
     invoker_id = _extract_dyno_invoker_id(message)
-
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "ban")
         if invoker:
             invoker_id = invoker.id
-
     if not invoker_id:
         return
     member = message.guild.get_member(invoker_id)
@@ -433,24 +422,18 @@ async def handle_dyno_ban(message: discord.Message):
     await _award_points(invoker_id, PTS_BAN, "ban")
 
 async def handle_dyno_kick(message: discord.Message):
-    """Detects kicks carried out via Dyno, the same way handle_dyno_ban does
-    for bans — Dyno's kick log shows Dyno itself as the actor, not the mod."""
     if message.author.id != DYNO_BOT_ID or not message.guild:
         return
     if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
         return
-
     combined = " ".join(_extract_dyno_text_blobs(message)).lower()
     if "kick" not in combined:
         return
-
     invoker_id = _extract_dyno_invoker_id(message)
-
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "kick")
         if invoker:
             invoker_id = invoker.id
-
     if not invoker_id:
         return
     member = message.guild.get_member(invoker_id)
@@ -475,8 +458,6 @@ async def handle_mod_rewards(message: discord.Message):
             _staff_msg_counts[uid] = 0
             await _award_points(message.author.id, PTS_PER_MSG_MILESTONE, "messages")
 
-        # Pinging the Events role earns points too, capped by a cooldown so it
-        # can't be farmed by repeatedly pinging the same role for points.
         if any(r.id == EVENTS_ROLE_ID for r in message.role_mentions):
             now = datetime.now(pytz.UTC)
             uid = str(message.author.id)
@@ -492,10 +473,8 @@ async def handle_mod_rewards(message: discord.Message):
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
         if message.id in _thanked_messages:
             return
-
         now = datetime.now(pytz.UTC)
         targets = []
-
         for m in message.mentions:
             mem = message.guild.get_member(m.id)
             if _is_mod(mem) and mem.id != message.author.id:
@@ -506,7 +485,6 @@ async def handle_mod_rewards(message: discord.Message):
                         continue
                 _thank_cooldowns[str(m.id)] = now.isoformat()
                 targets.append(mem)
-
         if targets:
             _thanked_messages.add(message.id)
             for staff in targets:
@@ -569,7 +547,6 @@ async def _save_last_youtube_channel_id(channel_id: str):
         await state_channel.send(f"LASTYTCHANNEL:{channel_id}")
 
 async def get_latest_tiktok_video(username: str):
-    """Returns (video_id, video_url) for the most recent post, or (None, None)."""
     async with aiohttp.ClientSession() as session:
         try:
             data = await _sc_get(session, "v3/tiktok/profile/videos", {"handle": username})
@@ -585,7 +562,6 @@ async def get_latest_tiktok_video(username: str):
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
 
 async def get_latest_youtube_video(handle: str):
-    """Returns (video_id, video_url, channel_id) for the most recent upload, or (None, None, None)."""
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
         params = {"part": "id", "forHandle": f"@{handle}", "key": YOUTUBE_API_KEY}
@@ -595,7 +571,6 @@ async def get_latest_youtube_video(handle: str):
         if not items:
             return None, None, None
         channel_id = items[0]["id"]
-
         search_params = {
             "part": "id", "channelId": channel_id, "type": "video",
             "order": "date", "maxResults": 1, "key": YOUTUBE_API_KEY,
@@ -624,7 +599,6 @@ async def _announce_video(video_url: str):
 @tasks.loop(minutes=VIDEO_CHECK_INTERVAL_MIN)
 async def video_checker():
     await _load_last_video_ids()
-
     try:
         tiktok_id, tiktok_url = await get_latest_tiktok_video(TIKTOK_USERNAME)
         if tiktok_id and tiktok_id != _last_video_ids.get("tiktok"):
@@ -634,7 +608,6 @@ async def video_checker():
                 await _announce_video(tiktok_url)
     except Exception as e:
         print(f"[video_checker] TikTok check failed: {e}")
-
     try:
         yt_id, yt_url, yt_channel_id = await get_latest_youtube_video(YOUTUBE_HANDLE)
         if yt_id and yt_channel_id:
@@ -643,10 +616,8 @@ async def video_checker():
                 and yt_channel_id != _last_youtube_channel_id
             )
             is_first_check = "youtube" not in _last_video_ids or channel_changed
-
             if yt_channel_id != _last_youtube_channel_id:
                 await _save_last_youtube_channel_id(yt_channel_id)
-
             if yt_id != _last_video_ids.get("youtube") or channel_changed:
                 await _save_last_video_id("youtube", yt_id)
                 if not is_first_check:
@@ -654,49 +625,66 @@ async def video_checker():
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
-# ── Message leaderboard: log + periodic scan ─────────────────────────────────
+# ── Message leaderboard: log (batched) + in-memory counter ───────────────────
 async def _log_message(user_id: int):
-    """Log a single message by sending the sender's user ID to the DB channel."""
-    db_channel = bot.get_channel(DB_CHANNEL_ID)
-    if db_channel:
-        try:
-            await db_channel.send(str(user_id))
-        except discord.HTTPException:
-            pass
+    uid = str(user_id)
+    _live_counts[uid] = _live_counts.get(uid, 0) + 1
+    async with _pending_lock:
+        _pending_ids.append(uid)
 
-async def _scan_message_log() -> dict:
-    """Scan the entire DB channel and tally how many times each user ID appears."""
+@tasks.loop(seconds=LOG_FLUSH_SECS)
+async def log_flusher():
+    async with _pending_lock:
+        if not _pending_ids:
+            return
+        batch = _pending_ids.copy()
+        _pending_ids.clear()
+    db_channel = bot.get_channel(DB_CHANNEL_ID)
+    if not db_channel:
+        async with _pending_lock:
+            _pending_ids[:0] = batch  # put them back so nothing is lost
+        return
+    try:
+        line = ""
+        for uid in batch:
+            piece = uid if not line else "," + uid
+            if len(LOG_PREFIX) + len(line) + len(piece) > 1900:
+                await db_channel.send(LOG_PREFIX + line)
+                line = uid
+            else:
+                line += piece
+        if line:
+            await db_channel.send(LOG_PREFIX + line)
+    except discord.HTTPException as e:
+        print(f"[log_flusher] failed to write batch: {e}")
+        async with _pending_lock:
+            _pending_ids[:0] = batch
+
+async def _rebuild_live_counts():
+    """One-time startup scan: read the whole DB channel and rebuild counts."""
+    global _live_counts
     db_channel = bot.get_channel(DB_CHANNEL_ID)
     counts: dict[str, int] = {}
-    if not db_channel:
-        return counts
-    async for msg in db_channel.history(limit=None, oldest_first=True):
-        if not msg.author.bot:
-            continue
-        content = (msg.content or "").strip()
-        if not content.isdigit():
-            continue
-        counts[content] = counts.get(content, 0) + 1
-    return counts
+    if db_channel:
+        async for msg in db_channel.history(limit=None, oldest_first=True):
+            if not msg.author.bot:
+                continue
+            c = (msg.content or "").strip()
+            if c.startswith(LOG_PREFIX):
+                for uid in c[len(LOG_PREFIX):].split(","):
+                    if uid.isdigit():
+                        counts[uid] = counts.get(uid, 0) + 1
+            elif c.isdigit():  # legacy single-ID logs
+                counts[c] = counts.get(c, 0) + 1
+    # merge anything counted live while the scan was running
+    for uid, cnt in _live_counts.items():
+        counts[uid] = counts.get(uid, 0) + cnt
+    _live_counts = counts
+    _counts_ready.set()
+    print(f"[leaderboard] Startup scan complete — {len(counts)} users tracked.")
 
-@tasks.loop(minutes=LEADERBOARD_SCAN_INTERVAL_MIN)
-async def leaderboard_scanner():
-    global _leaderboard_cache
-    try:
-        _leaderboard_cache = await _scan_message_log()
-        _leaderboard_ready.set()
-        print(f"[leaderboard] Rebuilt cache — {len(_leaderboard_cache)} users tracked.")
-    except discord.HTTPException as e:
-        print(f"[leaderboard_scanner] Scan failed: {e}")
-
-# ── Helper: tally message counts (reads the cached scan) ─────────────────────
 async def tally_counts() -> dict:
-    # If the first scan hasn't finished yet, build it once on demand.
-    if not _leaderboard_ready.is_set():
-        global _leaderboard_cache
-        _leaderboard_cache = await _scan_message_log()
-        _leaderboard_ready.set()
-    return dict(_leaderboard_cache)
+    return dict(_live_counts)
 
 # ── Log message activity for the weekly leaderboard ───────────────────────────
 @bot.event
@@ -725,7 +713,7 @@ async def on_message(message: discord.Message):
     await handle_mod_rewards(message)
     await bot.process_commands(message)
 
-# ── Ban detection (fallback for native Discord bans, e.g. right-click → Ban) ─
+# ── Ban detection (fallback for native Discord bans) ─────────────────────────
 @bot.event
 async def on_member_ban(guild: discord.Guild, user):
     try:
@@ -875,7 +863,6 @@ async def fetch_youtube_stats(url: str):
 
         dreamyvr_views = 0
         dreamyvr_count = 0
-
         if uploads_playlist_id:
             hashtag_video_ids = []
             next_page_token = None
@@ -898,7 +885,6 @@ async def fetch_youtube_stats(url: str):
                 next_page_token = pdata.get("nextPageToken")
                 if not next_page_token:
                     break
-
             for i in range(0, len(hashtag_video_ids), 50):
                 chunk = hashtag_video_ids[i:i + 50]
                 stats_params = {"part": "statistics", "id": ",".join(chunk), "key": YOUTUBE_API_KEY}
@@ -924,12 +910,10 @@ def extract_tiktok_username(url: str):
     return m.group(1) if m else None
 
 async def fetch_tiktok_posts_data(username: str):
-    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count)."""
     total_views    = 0
     video_count    = 0
     follower_count = 0
     seen_ids: set[str] = set()
-
     async with aiohttp.ClientSession() as session:
         try:
             profile_data   = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
@@ -940,7 +924,6 @@ async def fetch_tiktok_posts_data(username: str):
             )
         except ValueError:
             pass
-
         cursor   = None
         has_more = True
         while has_more:
@@ -951,14 +934,11 @@ async def fetch_tiktok_posts_data(username: str):
                 data = await _sc_get(session, "v1/tiktok/search/hashtag", params)
             except ValueError:
                 break
-
             videos   = data.get("videos") or data.get("aweme_list") or []
             has_more = bool(data.get("hasMore", data.get("has_more", False)))
             cursor   = data.get("cursor") if has_more else None
-
             if not videos:
                 break
-
             for video in videos:
                 author = video.get("author") or {}
                 vid_username = (
@@ -968,10 +948,8 @@ async def fetch_tiktok_posts_data(username: str):
                     or video.get("author_unique_id")
                     or ""
                 ).lower()
-
                 if vid_username != username.lower():
                     continue
-
                 vid_id = str(
                     video.get("id")
                     or video.get("aweme_id")
@@ -982,7 +960,6 @@ async def fetch_tiktok_posts_data(username: str):
                     continue
                 if vid_id:
                     seen_ids.add(vid_id)
-
                 stats      = video.get("stats") or video.get("statistics") or {}
                 play_count = (
                     stats.get("playCount")
@@ -993,10 +970,8 @@ async def fetch_tiktok_posts_data(username: str):
                 )
                 total_views += int(play_count)
                 video_count += 1
-
             if not has_more or not cursor:
                 break
-
     return total_views, video_count, follower_count
 
 async def fetch_tiktok_stats(url: str):
@@ -1317,10 +1292,7 @@ async def modstats(interaction: discord.Interaction, user: discord.Member = None
     tally  = await _tally_mod_points()
     entry  = tally.get(str(target.id), {"total": 0, "breakdown": {}})
     bd     = entry["breakdown"]
-    embed = discord.Embed(
-        title=f"Mod Stats — {target.display_name}",
-        color=0x5865F2,
-    )
+    embed = discord.Embed(title=f"Mod Stats — {target.display_name}", color=0x5865F2)
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="Total Points", value=f"`{entry['total']}`", inline=False)
     embed.add_field(name="Bans (×2)",     value=f"`{bd.get('ban', 0)}`",      inline=True)
@@ -1351,11 +1323,7 @@ async def modleaderboard(interaction: discord.Interaction):
         name   = member.mention if member else f"<@{uid}>"
         points = data['total']
         lines.append(f"> **{i + 1}.** {name} - {points} mod points")
-    embed = discord.Embed(
-        title="__Staff Point Leaderboard__",
-        description="\n".join(lines),
-        color=0x808080,
-    )
+    embed = discord.Embed(title="__Staff Point Leaderboard__", description="\n".join(lines), color=0x808080)
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 # ── /moderatorstatus ─────────────────────────────────────────────────────────
@@ -1380,35 +1348,28 @@ def _has_level_role(member: discord.Member) -> bool:
 async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4, 5, 6]):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
-        await interaction.response.send_message(
-            "You don't have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
-
     level_data = LEVELS.get(level)
     if not level_data:
         await interaction.response.send_message("That level isn't configured yet.", ephemeral=True)
         return
-
     await interaction.response.defer(ephemeral=True)
-
     forum_channel = bot.get_channel(LEVEL_FORUM_CHANNEL_ID)
     if not forum_channel or not isinstance(forum_channel, discord.ForumChannel):
         await interaction.followup.send("Could not reach the forum channel.", ephemeral=True)
         return
-
     applied_tags = []
     tag_id = level_data.get("tag_id")
     if tag_id:
         tag = discord.utils.get(forum_channel.available_tags, id=tag_id)
         if tag:
             applied_tags.append(tag)
-
     files = []
     for filename in level_data.get("images", []):
         path = os.path.join(LEVEL_IMAGES_DIR, filename)
         if os.path.isfile(path):
             files.append(discord.File(path, filename=filename))
-
     try:
         thread_with_message = await forum_channel.create_thread(
             name=level_data["title"],
@@ -1419,7 +1380,6 @@ async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4,
     except discord.HTTPException as e:
         await interaction.followup.send(f"Failed to create the forum post: {e}", ephemeral=True)
         return
-
     thread = thread_with_message.thread
     await interaction.followup.send(f"Posted: {thread.mention}", ephemeral=True)
 
@@ -1427,8 +1387,7 @@ async def sendlevel(interaction: discord.Interaction, level: Literal[1, 2, 3, 4,
 async def test(interaction: discord.Interaction):
     member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
     if not _has_level_role(member):
-        await interaction.response.send_message(
-            "You don't have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
         return
     await interaction.response.send_message("✅ Test command works!")
 
@@ -1448,14 +1407,12 @@ async def weekly_reset():
         sorted_users = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:TOP_N_WINNERS]
         lines = []
         winner_role = guild.get_role(LEADERBOARD_WINNER_ROLE_ID)
-
         if winner_role:
             for member in list(winner_role.members):
                 try:
                     await member.remove_roles(winner_role)
                 except discord.HTTPException:
                     pass
-
         for i, (uid, count) in enumerate(sorted_users):
             member = guild.get_member(int(uid))
             name   = member.mention if member else f"<@{uid}>"
@@ -1465,7 +1422,6 @@ async def weekly_reset():
                     await member.add_roles(winner_role)
                 except discord.HTTPException:
                     pass
-
         announce_channel = bot.get_channel(LEADERBOARD_WINNERS_CHANNEL)
         if announce_channel and lines:
             content = (
@@ -1477,9 +1433,11 @@ async def weekly_reset():
 
     deleted = await db_channel.purge(limit=None)
 
-    # Clear the cached leaderboard so the new week starts from zero
-    global _leaderboard_cache
-    _leaderboard_cache = {}
+    # Reset counters for the new week
+    global _live_counts
+    _live_counts = {}
+    async with _pending_lock:
+        _pending_ids.clear()
 
     print(f"[{now}] Weekly reset — deleted {len(deleted)} log entries.")
 
@@ -1589,7 +1547,6 @@ async def streak_checker():
 async def handle_streak(message: discord.Message):
     from datetime import datetime, timezone
     await _streaks_ready.wait()
-
     uid = str(message.author.id)
     async with _get_streak_lock(uid):
         now  = datetime.now(timezone.utc)
@@ -1673,21 +1630,10 @@ async def _next_ticket_number() -> int:
 def _format_ticket_number(n: int) -> str:
     return str(n).zfill(4)
 
-# ── Modals ─────────────────────────────────────────────────────────────────
 class InGameSupportModal(discord.ui.Modal, title="In-game Support"):
-    about_user = discord.ui.TextInput(
-        label="Is your issue about another in-game user?",
-        required=True,
-        max_length=100,
-    )
-    needs = discord.ui.TextInput(
-        label="What do you need?",
-        style=discord.TextStyle.paragraph,
-        placeholder="Describe what you need",
-        required=True,
-        max_length=1000,
-    )
-
+    about_user = discord.ui.TextInput(label="Is your issue about another in-game user?", required=True, max_length=100)
+    needs = discord.ui.TextInput(label="What do you need?", style=discord.TextStyle.paragraph,
+                                 placeholder="Describe what you need", required=True, max_length=1000)
     async def on_submit(self, interaction: discord.Interaction):
         answers = {
             "Is your issue about another in-game user?": str(self.about_user),
@@ -1695,21 +1641,10 @@ class InGameSupportModal(discord.ui.Modal, title="In-game Support"):
         }
         await create_ticket(interaction, "In-game Support", answers)
 
-
 class DiscordSupportModal(discord.ui.Modal, title="Discord Support"):
-    about_user = discord.ui.TextInput(
-        label="Is your issue about another Discord user?",
-        required=True,
-        max_length=100,
-    )
-    needs = discord.ui.TextInput(
-        label="What do you need?",
-        style=discord.TextStyle.paragraph,
-        placeholder="Describe what you need",
-        required=True,
-        max_length=1000,
-    )
-
+    about_user = discord.ui.TextInput(label="Is your issue about another Discord user?", required=True, max_length=100)
+    needs = discord.ui.TextInput(label="What do you need?", style=discord.TextStyle.paragraph,
+                                 placeholder="Describe what you need", required=True, max_length=1000)
     async def on_submit(self, interaction: discord.Interaction):
         answers = {
             "Is your issue about another Discord user?": str(self.about_user),
@@ -1717,107 +1652,71 @@ class DiscordSupportModal(discord.ui.Modal, title="Discord Support"):
         }
         await create_ticket(interaction, "Discord Support", answers)
 
-
-# ── Ticket creation ──────────────────────────────────────────────────────────
 async def create_ticket(interaction: discord.Interaction, category: str, answers: dict):
     await interaction.response.defer(ephemeral=True)
-
     panel_channel = bot.get_channel(TICKET_PANEL_CHANNEL)
     if not panel_channel:
         await interaction.followup.send("Could not reach the ticket channel.", ephemeral=True)
         return
-
     number = await _next_ticket_number()
     padded = _format_ticket_number(number)
     thread_name = f"🎫・ticket-{padded}"
-
     try:
-        thread = await panel_channel.create_thread(
-            name=thread_name,
-            type=discord.ChannelType.private_thread,
-            invitable=False,
-        )
+        thread = await panel_channel.create_thread(name=thread_name, type=discord.ChannelType.private_thread, invitable=False)
     except discord.HTTPException as e:
         await interaction.followup.send(f"Couldn't create your ticket: {e}", ephemeral=True)
         return
-
     try:
         await thread.add_user(interaction.user)
     except discord.HTTPException:
         pass
-
     support_role = interaction.guild.get_role(SUPPORT_ROLE_ID)
-
     embed = discord.Embed(title=category, color=0x2b2d31)
     for question, answer in answers.items():
         embed.add_field(name=question, value=f"`{answer}`" if answer else "—", inline=False)
     embed.set_footer(text=f"Ticket #{padded} • Opened by {interaction.user}")
-
     ping = f"<@&{SUPPORT_ROLE_ID}>" if support_role else ""
     content = f"## Welcome {interaction.user.mention}\n{ping}"
-
-    await thread.send(
-        content=content,
-        embed=embed,
-        view=TicketOpenView(),
-        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-    )
-
+    await thread.send(content=content, embed=embed, view=TicketOpenView(),
+                      allowed_mentions=discord.AllowedMentions(users=True, roles=True))
     await interaction.followup.send(f"Your ticket has been created: {thread.mention}", ephemeral=True)
 
-
-# ── Select menu / panel ──────────────────────────────────────────────────────
 class TicketSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(
-                label="Dreamy VR Discord Support",
-                emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
-                value="discord_support",
-                description="Get help with Discord-related issues",
-            ),
-            discord.SelectOption(
-                label="Dreamy VR In-Game Support",
-                emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
-                value="ingame_support",
-                description="Get help with in-game issues",
-            ),
+            discord.SelectOption(label="Dreamy VR Discord Support",
+                                 emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
+                                 value="discord_support", description="Get help with Discord-related issues"),
+            discord.SelectOption(label="Dreamy VR In-Game Support",
+                                 emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
+                                 value="ingame_support", description="Get help with in-game issues"),
         ]
-        super().__init__(
-            placeholder="Click the option that best matches your issue...",
-            min_values=1, max_values=1, options=options, custom_id="ticket_select",
-        )
-
+        super().__init__(placeholder="Click the option that best matches your issue...",
+                         min_values=1, max_values=1, options=options, custom_id="ticket_select")
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "ingame_support":
             await interaction.response.send_modal(InGameSupportModal())
         else:
             await interaction.response.send_modal(DiscordSupportModal())
 
-
 class TicketPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(TicketSelect())
-
 
 async def post_ticket_panel():
     channel = bot.get_channel(TICKET_PANEL_CHANNEL)
     if not channel:
         print(f"[ticket panel] ERROR: could not find channel with ID {TICKET_PANEL_CHANNEL}.")
         return
-
     perms = channel.permissions_for(channel.guild.me)
     missing = [name for name, ok in
-               [("View Channel", perms.view_channel),
-                ("Send Messages", perms.send_messages),
-                ("Embed Links", perms.embed_links),
-                ("Manage Messages", perms.manage_messages)]
+               [("View Channel", perms.view_channel), ("Send Messages", perms.send_messages),
+                ("Embed Links", perms.embed_links), ("Manage Messages", perms.manage_messages)]
                if not ok]
     if missing:
         print(f"[ticket panel] ERROR: bot is missing permissions in #{channel}: {', '.join(missing)}")
         return
-
     try:
         async for msg in channel.history(limit=50):
             if msg.author == bot.user:
@@ -1827,27 +1726,17 @@ async def post_ticket_panel():
         return
     except discord.HTTPException as e:
         print(f"[ticket panel] ERROR while clearing old panel messages: {e}")
-
-    embed = discord.Embed(
-        title="🎫  How to Create a Ticket",
-        description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
-        color=0x2b2d31,
-    )
-    embed.set_author(
-        name="Dreamy VR Support System",
-        icon_url=channel.guild.icon.url if channel.guild.icon else None,
-    )
-    embed.add_field(
-        name="📋  Ticket Rules",
-        value=(
-            "`1.` Only open tickets for valid issues such as in-game problems or Discord-related reports.\n"
-            "`2.` Do not open tickets to ask for staff roles, free items, or currency.\n"
-            "`3.` Do not use tickets to report bugs, use the proper bug report channel instead.\n"
-            "`4.` Be respectful and provide clear, detailed information about your issue.\n"
-            "`5.` Do not spam or open multiple tickets for the same issue."
-        ),
-        inline=False,
-    )
+    embed = discord.Embed(title="🎫  How to Create a Ticket",
+                          description="Click the option from the dropdown menu that best matches your reason for opening a ticket.",
+                          color=0x2b2d31)
+    embed.set_author(name="Dreamy VR Support System", icon_url=channel.guild.icon.url if channel.guild.icon else None)
+    embed.add_field(name="📋  Ticket Rules",
+                    value=("`1.` Only open tickets for valid issues such as in-game problems or Discord-related reports.\n"
+                           "`2.` Do not open tickets to ask for staff roles, free items, or currency.\n"
+                           "`3.` Do not use tickets to report bugs, use the proper bug report channel instead.\n"
+                           "`4.` Be respectful and provide clear, detailed information about your issue.\n"
+                           "`5.` Do not spam or open multiple tickets for the same issue."),
+                    inline=False)
     embed.set_image(url="https://cdn.discordapp.com/attachments/1495388852020445255/1495396291914629362/SUPORTTICKETS.png?ex=6a313d53&is=6a2febd3&hm=ac38999087c38cc8f5687a7c8c1e16aa5d71f8f568e3c123cef33ff2693b012c")
     try:
         await channel.send(embed=embed, view=TicketPanelView())
@@ -1855,51 +1744,36 @@ async def post_ticket_panel():
     except discord.HTTPException as e:
         print(f"[ticket panel] ERROR sending panel message: {e}")
 
-
-# ── Ticket controls ───────────────────────────────────────────────────────────
 class TicketOpenView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red,
-                        emoji="🔒", custom_id="ticket_close")
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, emoji="🔒", custom_id="ticket_close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
             await interaction.response.send_message("This isn't a ticket thread.", ephemeral=True)
             return
-
         await interaction.response.defer()
-
         transcript_file = await _build_transcript(thread)
         notifs_channel = bot.get_channel(MOD_NOTIFS_CHANNEL_ID)
         transcript_link = f"<#{MOD_NOTIFS_CHANNEL_ID}>"
         if notifs_channel and transcript_file:
-            await notifs_channel.send(
-                content=f"📄 Transcript for {thread.name} (closed by {interaction.user.mention})",
-                file=transcript_file,
-            )
-
+            await notifs_channel.send(content=f"📄 Transcript for {thread.name} (closed by {interaction.user.mention})",
+                                      file=transcript_file)
         await thread.send(f"Ticket Closed by {interaction.user.mention}")
         msg = await thread.send(f"Transcript saved to {transcript_link}")
         try:
             await msg.edit(content=f"Transcript saved to {transcript_link}", suppress=False)
         except discord.HTTPException:
             pass
-
-        control_embed = discord.Embed(
-            description="Support team ticket controls",
-            color=0x2b2d31,
-        )
+        control_embed = discord.Embed(description="Support team ticket controls", color=0x2b2d31)
         await thread.send(embed=control_embed, view=TicketClosedView())
-
         m = re.search(r"ticket-(\d+)", thread.name)
         number = m.group(1) if m else "0000"
         try:
             await thread.edit(name=f"Closed-{number}")
         except discord.HTTPException:
             pass
-
         opener_id = await _get_ticket_opener_id(thread)
         if opener_id:
             try:
@@ -1908,13 +1782,11 @@ class TicketOpenView(discord.ui.View):
             except (discord.HTTPException, discord.NotFound):
                 pass
 
-
 async def _get_ticket_opener_id(thread: discord.Thread):
     async for msg in thread.history(limit=20, oldest_first=True):
         if msg.mentions:
             return msg.mentions[0].id
     return None
-
 
 async def _build_transcript(thread: discord.Thread) -> discord.File | None:
     lines = [f"Transcript for #{thread.name}", "=" * 40, ""]
@@ -1932,13 +1804,10 @@ async def _build_transcript(thread: discord.Thread) -> discord.File | None:
     buffer = io.BytesIO("\n".join(lines).encode("utf-8"))
     return discord.File(buffer, filename=f"{thread.name}-transcript.txt")
 
-
 class TicketClosedView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-
-    @discord.ui.button(label="Transcript", style=discord.ButtonStyle.secondary,
-                        emoji="📄", custom_id="ticket_transcript")
+    @discord.ui.button(label="Transcript", style=discord.ButtonStyle.secondary, emoji="📄", custom_id="ticket_transcript")
     async def transcript(self, interaction: discord.Interaction, button: discord.ui.Button):
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
@@ -1948,9 +1817,7 @@ class TicketClosedView(discord.ui.View):
         transcript_file = await _build_transcript(thread)
         if transcript_file:
             await interaction.followup.send(file=transcript_file, ephemeral=True)
-
-    @discord.ui.button(label="Open", style=discord.ButtonStyle.secondary,
-                        emoji="🔓", custom_id="ticket_open")
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.secondary, emoji="🔓", custom_id="ticket_open")
     async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
@@ -1970,9 +1837,7 @@ class TicketClosedView(discord.ui.View):
             except (discord.HTTPException, discord.NotFound):
                 pass
         await interaction.response.send_message(f"🔓 Ticket reopened by {interaction.user.mention}")
-
-    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger,
-                        emoji="⛔", custom_id="ticket_delete")
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="⛔", custom_id="ticket_delete")
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
@@ -1983,7 +1848,6 @@ class TicketClosedView(discord.ui.View):
             await thread.delete()
         except discord.HTTPException:
             pass
-
 
 # ── /debugtiktok ─────────────────────────────────────────────────────────────
 @tree.command(name="debugtiktok", description="Debug TikTok API response (admin only)")
@@ -2000,10 +1864,8 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
         except ValueError as e:
             await interaction.followup.send(f"API error: {e}", ephemeral=True)
             return
-
     profile_str = json.dumps(profile, indent=2)[:1800]
     videos_str  = json.dumps(videos,  indent=2)[:1800]
-
     await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
@@ -2050,8 +1912,9 @@ async def on_ready():
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
-    leaderboard_scanner.start()
+    log_flusher.start()
     monthly_mod_status.start()
+    asyncio.create_task(_rebuild_live_counts())
     await _load_streaks()
     _streaks_ready.set()
     await _load_ticket_counter()
