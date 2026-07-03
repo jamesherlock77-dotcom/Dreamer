@@ -943,80 +943,155 @@ def extract_tiktok_username(url: str):
     m = re.search(r"tiktok\.com/@([A-Za-z0-9_\.]+)", url)
     return m.group(1) if m else None
 
-async def fetch_tiktok_video_stats(username: str):
-    """Returns (total_views, total_videos, dreamyvr_views, dreamyvr_count).
+async def fetch_tiktok_posts_data(username: str):
+    """Returns (total_dreamyvr_views, dreamyvr_video_count, follower_count).
 
-    Pages through this creator's OWN videos (not a global hashtag search) and
-    computes everything in a single pass. TikTok doesn't expose an aggregate
-    "channel views" stat the way YouTube does, so summing every video's view
-    count ourselves is the only reliable way to get a total. Scanning the
-    creator's own uploads directly is also more reliable for finding
-    #dreamyvr videos than TikTok's global hashtag search — the same class of
-    search-index unreliability we hit and fixed on the YouTube side.
+    Uses the hashtag search endpoint to find all #dreamyvr videos, then filters
+    by username so we only count videos from this specific creator.
     """
     total_views    = 0
-    total_videos   = 0
-    dreamyvr_views = 0
-    dreamyvr_count = 0
+    video_count    = 0
+    follower_count = 0
+    seen_ids: set[str] = set()
 
     async with aiohttp.ClientSession() as session:
-        cursor = None
-        first_page = True
-        while True:
-            params = {"handle": username}
+        # Fetch follower count from profile endpoint
+        try:
+            profile_data   = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
+            follower_count = int(
+                profile_data.get("stats", {}).get("followerCount", 0)
+                or profile_data.get("followerCount", 0)
+                or 0
+            )
+        except ValueError:
+            pass
+
+        # Search #dreamyvr hashtag and filter results by this creator's username
+        cursor   = None
+        has_more = True
+        while has_more:
+            params = {"hashtag": "dreamyvr"}
             if cursor:
                 params["cursor"] = cursor
             try:
-                data = await _sc_get(session, "v3/tiktok/profile/videos", params)
-            except ValueError as e:
-                if first_page:
-                    # Don't silently return zeros — surface the real failure
-                    # so it's visible in /ccstats etc. instead of looking like
-                    # "no videos found".
-                    raise ValueError(f"Couldn't fetch TikTok videos for @{username}: {e}") from e
+                data = await _sc_get(session, "v1/tiktok/search/hashtag", params)
+            except ValueError:
                 break
-            first_page = False
 
-            videos = data.get("videos") or []
+            videos   = data.get("videos") or data.get("aweme_list") or []
+            has_more = bool(data.get("hasMore", data.get("has_more", False)))
+            cursor   = data.get("cursor") if has_more else None
+
             if not videos:
                 break
 
             for video in videos:
-                stats = video.get("stats") or video.get("statistics") or {}
-                play_count = int(
+                # Get the author's unique_id to match against our username
+                author = video.get("author") or {}
+                vid_username = (
+                    author.get("uniqueId")
+                    or author.get("unique_id")
+                    or video.get("authorUniqueId")
+                    or video.get("author_unique_id")
+                    or ""
+                ).lower()
+
+                if vid_username != username.lower():
+                    continue
+
+                # Deduplicate (TikTok hashtag search can return duplicates)
+                vid_id = str(
+                    video.get("id")
+                    or video.get("aweme_id")
+                    or video.get("video_id")
+                    or ""
+                )
+                if vid_id and vid_id in seen_ids:
+                    continue
+                if vid_id:
+                    seen_ids.add(vid_id)
+
+                stats      = video.get("stats") or video.get("statistics") or {}
+                play_count = (
                     stats.get("playCount")
                     or stats.get("play_count")
                     or video.get("playCount")
                     or video.get("play_count")
                     or 0
                 )
-                total_views  += play_count
-                total_videos += 1
+                total_views += int(play_count)
+                video_count += 1
 
-                caption = (
-                    video.get("desc")
-                    or video.get("description")
-                    or video.get("text")
-                    or video.get("title")
-                    or ""
-                ).lower()
-                if "#dreamyvr" in caption:
-                    dreamyvr_count += 1
-                    dreamyvr_views += play_count
+            if not has_more or not cursor:
+                break
+
+    return total_views, video_count, follower_count
+
+async def fetch_tiktok_totals(username: str):
+    """Best-effort: returns (total_views, total_videos) by paging through this
+    creator's own video list, or (None, None) if that endpoint doesn't return
+    usable data. Kept separate from the (proven-working) hashtag search above
+    so that if this fails, it doesn't take the whole /ccstats command down
+    with it — the UI just shows "Unavailable" for these two fields."""
+    total_views  = 0
+    total_videos = 0
+    got_any      = False
+
+    async with aiohttp.ClientSession() as session:
+        cursor = None
+        while True:
+            params = {"handle": username}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                data = await _sc_get(session, "v3/tiktok/profile/videos", params)
+            except ValueError:
+                break
+
+            videos = (
+                data.get("videos")
+                or data.get("aweme_list")
+                or data.get("itemList")
+                or data.get("item_list")
+                or []
+            )
+            if not videos:
+                break
+
+            for video in videos:
+                stats = video.get("stats") or video.get("statistics") or {}
+                play_count = (
+                    stats.get("playCount")
+                    or stats.get("play_count")
+                    or video.get("playCount")
+                    or video.get("play_count")
+                )
+                if play_count is None:
+                    continue
+                total_views  += int(play_count)
+                total_videos += 1
+                got_any = True
 
             has_more = bool(data.get("hasMore", data.get("has_more", False)))
             cursor   = data.get("cursor") if has_more else None
             if not has_more or not cursor:
                 break
 
-    return total_views, total_videos, dreamyvr_views, dreamyvr_count
+    if not got_any:
+        return None, None
+    return total_views, total_videos
+
+def _fmt_stat(value) -> str:
+    """Formats a stat for display, showing 'Unavailable' if it's None
+    (e.g. TikTok totals when that endpoint didn't return usable data)."""
+    return f"{value:,}" if value is not None else "Unavailable"
 
 async def fetch_tiktok_stats(url: str):
     username = extract_tiktok_username(url)
     if not username:
         raise ValueError("Couldn't parse that TikTok URL.")
-    nickname       = username
-    follower_count = 0
+    dreamyvr_views, dreamyvr_count, followers = await fetch_tiktok_posts_data(username)
+    total_views, total_videos = await fetch_tiktok_totals(username)
     async with aiohttp.ClientSession() as session:
         try:
             profile_data = await _sc_get(session, "v1/tiktok/profile", {"handle": username})
@@ -1026,19 +1101,13 @@ async def fetch_tiktok_stats(url: str):
                 or profile_data.get("nickname")
                 or username
             )
-            follower_count = int(
-                profile_data.get("stats", {}).get("followerCount", 0)
-                or profile_data.get("followerCount", 0)
-                or 0
-            )
         except Exception:
-            pass
-    total_views, total_videos, dreamyvr_views, dreamyvr_count = await fetch_tiktok_video_stats(username)
+            nickname = username
     return {
         "channel_name":   nickname,
         "username":       username,
         "channel_url":    f"https://www.tiktok.com/@{username}",
-        "followers":      follower_count,
+        "followers":      followers,
         "total_views":    total_views,
         "total_videos":   total_videos,
         "dreamyvr_views": dreamyvr_views,
@@ -1174,8 +1243,8 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
             embed.add_field(name="Platform",         value="TikTok",                         inline=True)
             embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
-            embed.add_field(name="Total Views",      value=f"`{stats['total_views']:,}`",    inline=True)
-            embed.add_field(name="Total Videos",     value=f"`{stats['total_videos']:,}`",   inline=True)
+            embed.add_field(name="Total Views",      value=f"`{_fmt_stat(stats['total_views'])}`",    inline=True)
+            embed.add_field(name="Total Videos",     value=f"`{_fmt_stat(stats['total_videos'])}`",   inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
@@ -1256,8 +1325,8 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0x010101)
             embed.add_field(name="Platform",         value="TikTok",                         inline=True)
             embed.add_field(name="Followers",        value=f"`{stats['followers']:,}`",      inline=True)
-            embed.add_field(name="Total Views",      value=f"`{stats['total_views']:,}`",    inline=True)
-            embed.add_field(name="Total Videos",     value=f"`{stats['total_videos']:,}`",   inline=True)
+            embed.add_field(name="Total Views",      value=f"`{_fmt_stat(stats['total_views'])}`",    inline=True)
+            embed.add_field(name="Total Videos",     value=f"`{_fmt_stat(stats['total_videos'])}`",   inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
@@ -1294,8 +1363,8 @@ async def contentfullstats(interaction: discord.Interaction):
                     f"**{number}.** {mention}\n"
                     f"> URL: {url}\n"
                     f"> Followers: {stats['followers']:,}\n"
-                    f"> Total views: {stats['total_views']:,}\n"
-                    f"> Total videos: {stats['total_videos']:,}\n"
+                    f"> Total views: {_fmt_stat(stats['total_views'])}\n"
+                    f"> Total videos: {_fmt_stat(stats['total_videos'])}\n"
                     f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
                     f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
                 )
