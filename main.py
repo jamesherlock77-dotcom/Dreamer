@@ -961,14 +961,21 @@ async def fetch_tiktok_video_stats(username: str):
 
     async with aiohttp.ClientSession() as session:
         cursor = None
+        first_page = True
         while True:
             params = {"handle": username}
             if cursor:
                 params["cursor"] = cursor
             try:
                 data = await _sc_get(session, "v3/tiktok/profile/videos", params)
-            except ValueError:
+            except ValueError as e:
+                if first_page:
+                    # Don't silently return zeros — surface the real failure
+                    # so it's visible in /ccstats etc. instead of looking like
+                    # "no videos found".
+                    raise ValueError(f"Couldn't fetch TikTok videos for @{username}: {e}") from e
                 break
+            first_page = False
 
             videos = data.get("videos") or []
             if not videos:
