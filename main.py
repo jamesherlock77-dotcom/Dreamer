@@ -34,7 +34,7 @@ VIDEO_ANNOUNCE_CHANNEL  = 1512853017920143560
 VIDEO_ANNOUNCE_ROLE_ID  = 1512854249174863882
 VIDEO_STATE_CHANNEL_ID  = 1495388852020445255
 TIKTOK_USERNAME          = "dreamyvrofficial"
-YOUTUBE_HANDLE           = "dreamyvrofficial"
+YOUTUBE_HANDLE           = "dreamyvr-official"
 VIDEO_CHECK_INTERVAL_MIN = 10
 
 # ── Streak config ────────────────────────────────────────────────────────────
@@ -60,11 +60,39 @@ CC_ROLE_ID          = 1495165348654219344
 MOD_PTS_DB_CHANNEL  = 1516176492663537875
 DYNO_BOT_ID         = 155149108183695360
 DYNO_PREFIXES       = ("?", "!", ".")
-PTS_BAN             = 3
-PTS_WARN            = 1
-PTS_THANKS          = 2
-PTS_PER_50_MSGS     = 1
-MSG_MILESTONE       = 50
+DYNO_MOD_LOG_CHANNEL_ID = 1423121107057246238  # Channel where Dyno posts its ban/kick logs
+EVENTS_ROLE_ID      = 1423121100228923483      # "Events" role — pinging it earns mod points
+PTS_BAN             = 2
+PTS_WARN            = 2
+PTS_KICK            = 2
+PTS_THANKS          = 1
+PTS_EVENTS_PING     = 2
+PTS_PER_MSG_MILESTONE = 1
+MSG_MILESTONE       = 75
+
+# Only these specific moderators are shown on the leaderboard / counted toward
+# the monthly requirement check, regardless of who else holds the mod role.
+TRACKED_MOD_IDS = [
+    939901393291051080,
+    1342234964841861192,
+    1120910285750943895,
+    1354802771500597390,
+    1382815397006540904,
+    1016825802207268956,
+    1253955909835554819,
+    1277506981858639949,
+    1294510847175032904,
+    1089206891982372934,
+    880643477292089414,
+]
+
+# ── Monthly moderator status report config ────────────────────────────────────
+MOD_STATUS_CHANNEL_ID      = 1495388852020445255
+MOD_STATUS_REQUIRED_POINTS = 10
+MOD_STATUS_TIME            = time(0, 5)  # daily check time (UTC); only acts on the 1st
+MOD_STATUS_MAG_EMOJI    = "<:Moderator_Magnifying_Glass:1497848294364418209>"
+MOD_STATUS_CHECK_EMOJI  = "<:check:1498653592372903986>"
+MOD_STATUS_CANCEL_EMOJI = "<:cancel:1508218455973957683>"
 
 _staff_msg_counts: dict[str, int] = {}
 THANKS_PATTERNS = re.compile(r"\b(thanks?|thank\s*you|ty|thx|tysm)\b", re.IGNORECASE)
@@ -258,6 +286,61 @@ async def _tally_mod_points() -> dict:
         entry["breakdown"][reason] = entry["breakdown"].get(reason, 0) + pts
     return result
 
+# ── Monthly moderator status report ───────────────────────────────────────────
+async def _post_mod_status_report():
+    """Builds and posts the Monthly Moderator Status embed-style message to
+    MOD_STATUS_CHANNEL_ID. Only the fixed TRACKED_MOD_IDS roster is evaluated,
+    each user needing >= MOD_STATUS_REQUIRED_POINTS to have "met" the
+    requirement for the month."""
+    channel = bot.get_channel(MOD_STATUS_CHANNEL_ID)
+    if not channel:
+        return
+    guild = channel.guild
+    tally = await _tally_mod_points()
+
+    met, failed = [], []
+    for uid in TRACKED_MOD_IDS:
+        data   = tally.get(str(uid), {"total": 0, "breakdown": {}})
+        points = data["total"]
+        member = guild.get_member(uid) if guild else None
+        name   = member.mention if member else f"<@{uid}>"
+        (met if points >= MOD_STATUS_REQUIRED_POINTS else failed).append((name, points))
+
+    met.sort(key=lambda e: e[1], reverse=True)
+    failed.sort(key=lambda e: e[1], reverse=True)
+
+    met_lines = "\n".join(
+        f"> `{i + 1}.` {name} - `{points} mod points`" for i, (name, points) in enumerate(met)
+    ) or "> None"
+    failed_lines = "\n".join(
+        f"> {name} - `{points} mod points`" for name, points in failed
+    ) or "> None"
+
+    content = (
+        f"{MOD_STATUS_MAG_EMOJI}  __**Monthly Moderator Status**__ {MOD_STATUS_MAG_EMOJI} \n\n"
+        f"{MOD_STATUS_CHECK_EMOJI}  **{len(met)} Moderators, have acquired the requirement** {MOD_STATUS_CHECK_EMOJI} \n"
+        f"{MOD_STATUS_CANCEL_EMOJI}  **{len(failed)} Moderators, have failed the requirement** {MOD_STATUS_CANCEL_EMOJI}\n\n"
+        "*Met Requirements:*\n"
+        f"{met_lines}\n\n"
+        "*Failed Requirements*\n"
+        f"{failed_lines}"
+    )
+    await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+
+async def _reset_mod_points_db():
+    db = bot.get_channel(MOD_PTS_DB_CHANNEL)
+    if db:
+        await db.purge(limit=None)
+
+@tasks.loop(time=MOD_STATUS_TIME)
+async def monthly_mod_status():
+    now = datetime.now(TIMEZONE)
+    if now.day != 1:
+        return
+    await _post_mod_status_report()
+    await _reset_mod_points_db()
+    print(f"[{now}] Monthly moderator status posted and points database reset.")
+
 async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
     try:
         async for m in channel.history(limit=25):
@@ -272,9 +355,7 @@ async def _find_dyno_invoker(channel: discord.TextChannel, keyword: str):
         pass
     return None
 
-async def handle_dyno_warn(message: discord.Message):
-    if message.author.id != DYNO_BOT_ID or not message.guild:
-        return
+def _extract_dyno_text_blobs(message: discord.Message) -> list[str]:
     text_blobs = [message.content or ""]
     for e in message.embeds:
         if e.title:       text_blobs.append(e.title)
@@ -286,11 +367,9 @@ async def handle_dyno_warn(message: discord.Message):
             text_blobs.append(e.footer.text)
         if e.author and e.author.name:
             text_blobs.append(e.author.name)
-    combined = " ".join(text_blobs).lower()
-    if "warn" not in combined:
-        return
+    return text_blobs
 
-    invoker_id = None
+def _extract_dyno_invoker_id(message: discord.Message) -> int | None:
     id_re = re.compile(r"(\d{17,20})")
     for e in message.embeds:
         candidates = []
@@ -302,10 +381,17 @@ async def handle_dyno_warn(message: discord.Message):
         for c in candidates:
             m = id_re.search(c)
             if m:
-                invoker_id = int(m.group(1))
-                break
-        if invoker_id:
-            break
+                return int(m.group(1))
+    return None
+
+async def handle_dyno_warn(message: discord.Message):
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "warn" not in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
 
     if not invoker_id:
         invoker = await _find_dyno_invoker(message.channel, "warn")
@@ -319,9 +405,63 @@ async def handle_dyno_warn(message: discord.Message):
         return
     await _award_points(invoker_id, PTS_WARN, "warn")
 
+async def handle_dyno_ban(message: discord.Message):
+    """Detects bans carried out via Dyno by watching its mod log channel,
+    since Dyno-issued bans show up in the audit log as executed by Dyno
+    itself rather than by the moderator who ran the command."""
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
+        return
+
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "ban" not in combined or "unban" in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
+
+    if not invoker_id:
+        invoker = await _find_dyno_invoker(message.channel, "ban")
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
+        return
+    member = message.guild.get_member(invoker_id)
+    if not _is_mod(member):
+        return
+    await _award_points(invoker_id, PTS_BAN, "ban")
+
+async def handle_dyno_kick(message: discord.Message):
+    """Detects kicks carried out via Dyno, the same way handle_dyno_ban does
+    for bans — Dyno's kick log shows Dyno itself as the actor, not the mod."""
+    if message.author.id != DYNO_BOT_ID or not message.guild:
+        return
+    if message.channel.id != DYNO_MOD_LOG_CHANNEL_ID:
+        return
+
+    combined = " ".join(_extract_dyno_text_blobs(message)).lower()
+    if "kick" not in combined:
+        return
+
+    invoker_id = _extract_dyno_invoker_id(message)
+
+    if not invoker_id:
+        invoker = await _find_dyno_invoker(message.channel, "kick")
+        if invoker:
+            invoker_id = invoker.id
+
+    if not invoker_id:
+        return
+    member = message.guild.get_member(invoker_id)
+    if not _is_mod(member):
+        return
+    await _award_points(invoker_id, PTS_KICK, "kick")
+
 # ── Track messages to prevent double points for "thanks" ─────────────────────
 _thanked_messages: set[int] = set()
 _thank_cooldowns: dict[str, str] = {}
+_events_ping_cooldowns: dict[str, str] = {}
 
 async def handle_mod_rewards(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -333,7 +473,21 @@ async def handle_mod_rewards(message: discord.Message):
         _staff_msg_counts[uid] = _staff_msg_counts.get(uid, 0) + 1
         if _staff_msg_counts[uid] >= MSG_MILESTONE:
             _staff_msg_counts[uid] = 0
-            await _award_points(message.author.id, PTS_PER_50_MSGS, "messages")
+            await _award_points(message.author.id, PTS_PER_MSG_MILESTONE, "messages")
+
+        # Pinging the Events role earns points too, capped by a cooldown so it
+        # can't be farmed by repeatedly pinging the same role for points.
+        if any(r.id == EVENTS_ROLE_ID for r in message.role_mentions):
+            now = datetime.now(pytz.UTC)
+            uid = str(message.author.id)
+            last_ping_str = _events_ping_cooldowns.get(uid)
+            on_cooldown = False
+            if last_ping_str:
+                last_ping = datetime.fromisoformat(last_ping_str)
+                on_cooldown = (now - last_ping) < timedelta(minutes=20)
+            if not on_cooldown:
+                _events_ping_cooldowns[uid] = now.isoformat()
+                await _award_points(message.author.id, PTS_EVENTS_PING, "events_ping")
 
     if not _is_mod(author_member) and THANKS_PATTERNS.search(message.content or ""):
         if message.id in _thanked_messages:
@@ -375,10 +529,11 @@ async def _sc_get(session: aiohttp.ClientSession, path: str, params: dict = {}) 
 
 # ── Video announcement helpers ────────────────────────────────────────────────
 _last_video_ids: dict[str, str] = {}
+_last_youtube_channel_id: str | None = None
 _video_ids_loaded = False
 
 async def _load_last_video_ids():
-    global _video_ids_loaded
+    global _video_ids_loaded, _last_youtube_channel_id
     if _video_ids_loaded:
         return
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
@@ -388,13 +543,16 @@ async def _load_last_video_ids():
     async for msg in state_channel.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
-        if not msg.content.startswith("LASTVIDEO:"):
-            continue
-        parts = msg.content.split(":", 2)
-        if len(parts) != 3:
-            continue
-        _, platform, video_id = parts
-        _last_video_ids[platform] = video_id
+        if msg.content.startswith("LASTVIDEO:"):
+            parts = msg.content.split(":", 2)
+            if len(parts) != 3:
+                continue
+            _, platform, video_id = parts
+            _last_video_ids[platform] = video_id
+        elif msg.content.startswith("LASTYTCHANNEL:"):
+            parts = msg.content.split(":", 1)
+            if len(parts) == 2:
+                _last_youtube_channel_id = parts[1]
     _video_ids_loaded = True
 
 async def _save_last_video_id(platform: str, video_id: str):
@@ -402,6 +560,13 @@ async def _save_last_video_id(platform: str, video_id: str):
     state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
     if state_channel:
         await state_channel.send(f"LASTVIDEO:{platform}:{video_id}")
+
+async def _save_last_youtube_channel_id(channel_id: str):
+    global _last_youtube_channel_id
+    _last_youtube_channel_id = channel_id
+    state_channel = bot.get_channel(VIDEO_STATE_CHANNEL_ID)
+    if state_channel:
+        await state_channel.send(f"LASTYTCHANNEL:{channel_id}")
 
 async def get_latest_tiktok_video(username: str):
     """Returns (video_id, video_url) for the most recent post, or (None, None)."""
@@ -420,7 +585,7 @@ async def get_latest_tiktok_video(username: str):
         return video_id, f"https://www.tiktok.com/@{username}/video/{video_id}"
 
 async def get_latest_youtube_video(handle: str):
-    """Returns (video_id, video_url) for the most recent upload, or (None, None)."""
+    """Returns (video_id, video_url, channel_id) for the most recent upload, or (None, None, None)."""
     base = "https://www.googleapis.com/youtube/v3"
     async with aiohttp.ClientSession() as session:
         params = {"part": "id", "forHandle": f"@{handle}", "key": YOUTUBE_API_KEY}
@@ -428,7 +593,7 @@ async def get_latest_youtube_video(handle: str):
             data = await r.json()
         items = data.get("items", [])
         if not items:
-            return None, None
+            return None, None, None
         channel_id = items[0]["id"]
 
         search_params = {
@@ -439,11 +604,11 @@ async def get_latest_youtube_video(handle: str):
             sdata = await r.json()
         sitems = sdata.get("items", [])
         if not sitems:
-            return None, None
+            return None, None, channel_id
         video_id = sitems[0].get("id", {}).get("videoId")
         if not video_id:
-            return None, None
-        return video_id, f"https://www.youtube.com/watch?v={video_id}"
+            return None, None, channel_id
+        return video_id, f"https://www.youtube.com/watch?v={video_id}", channel_id
 
 async def _announce_video(video_url: str):
     channel = bot.get_channel(VIDEO_ANNOUNCE_CHANNEL)
@@ -471,12 +636,24 @@ async def video_checker():
         print(f"[video_checker] TikTok check failed: {e}")
 
     try:
-        yt_id, yt_url = await get_latest_youtube_video(YOUTUBE_HANDLE)
-        if yt_id and yt_id != _last_video_ids.get("youtube"):
-            is_first_check = "youtube" not in _last_video_ids
-            await _save_last_video_id("youtube", yt_id)
-            if not is_first_check:
-                await _announce_video(yt_url)
+        yt_id, yt_url, yt_channel_id = await get_latest_youtube_video(YOUTUBE_HANDLE)
+        if yt_id and yt_channel_id:
+            # If the resolved channel differs from the last one we tracked
+            # (e.g. the handle/channel changed), treat this as a fresh
+            # baseline rather than announcing whatever's currently latest.
+            channel_changed = (
+                _last_youtube_channel_id is not None
+                and yt_channel_id != _last_youtube_channel_id
+            )
+            is_first_check = "youtube" not in _last_video_ids or channel_changed
+
+            if yt_channel_id != _last_youtube_channel_id:
+                await _save_last_youtube_channel_id(yt_channel_id)
+
+            if yt_id != _last_video_ids.get("youtube") or channel_changed:
+                await _save_last_video_id("youtube", yt_id)
+                if not is_first_check:
+                    await _announce_video(yt_url)
     except Exception as e:
         print(f"[video_checker] YouTube check failed: {e}")
 
@@ -484,6 +661,8 @@ async def video_checker():
 @bot.event
 async def on_message(message: discord.Message):
     await handle_dyno_warn(message)
+    await handle_dyno_ban(message)
+    await handle_dyno_kick(message)
 
     if message.author.bot:
         return
@@ -507,7 +686,7 @@ async def on_message(message: discord.Message):
     await handle_mod_rewards(message)
     await bot.process_commands(message)
 
-# ── Ban detection ────────────────────────────────────────────────────────────
+# ── Ban detection (fallback for native Discord bans, e.g. right-click → Ban) ─
 @bot.event
 async def on_member_ban(guild: discord.Guild, user):
     try:
@@ -694,7 +873,13 @@ async def fetch_youtube_stats(url: str):
             else:
                 channel_id = items[0]["id"]
 
-        params = {"part": "snippet,statistics", "id": channel_id, "key": YOUTUBE_API_KEY}
+        # Fetch channel stats + the "uploads" playlist ID in one call. We use the
+        # uploads playlist (not search.list) to find #dreamyvr videos, because
+        # YouTube's search.list endpoint uses a separate, often-incomplete search
+        # index that unreliably misses videos — especially on smaller channels —
+        # even when the hashtag is clearly present. Scanning the uploads playlist
+        # ourselves is both reliable and far cheaper on API quota.
+        params = {"part": "snippet,statistics,contentDetails", "id": channel_id, "key": YOUTUBE_API_KEY}
         async with session.get(f"{base}/channels", params=params) as r:
             data = await r.json()
         items = data.get("items", [])
@@ -703,34 +888,51 @@ async def fetch_youtube_stats(url: str):
         ch      = items[0]
         stats   = ch.get("statistics", {})
         snippet = ch.get("snippet", {})
+        uploads_playlist_id = (
+            ch.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        )
 
         dreamyvr_views = 0
         dreamyvr_count = 0
-        next_page_token = None
-        while True:
-            search_params = {
-                "part": "id", "channelId": channel_id, "q": "#dreamyvr",
-                "type": "video", "maxResults": 50, "key": YOUTUBE_API_KEY,
-            }
-            if next_page_token:
-                search_params["pageToken"] = next_page_token
-            async with session.get(f"{base}/search", params=search_params) as sr:
-                sdata = await sr.json()
-            video_ids = [i["id"]["videoId"] for i in sdata.get("items", []) if "videoId" in i.get("id", {})]
-            if video_ids:
-                stats_params = {"part": "statistics", "id": ",".join(video_ids), "key": YOUTUBE_API_KEY}
+
+        if uploads_playlist_id:
+            hashtag_video_ids = []
+            next_page_token = None
+            while True:
+                pl_params = {
+                    "part": "snippet", "playlistId": uploads_playlist_id,
+                    "maxResults": 50, "key": YOUTUBE_API_KEY,
+                }
+                if next_page_token:
+                    pl_params["pageToken"] = next_page_token
+                async with session.get(f"{base}/playlistItems", params=pl_params) as pr:
+                    pdata = await pr.json()
+                for item in pdata.get("items", []):
+                    sn   = item.get("snippet", {})
+                    text = f"{sn.get('title', '')} {sn.get('description', '')}".lower()
+                    if "#dreamyvr" in text:
+                        vid = sn.get("resourceId", {}).get("videoId")
+                        if vid:
+                            hashtag_video_ids.append(vid)
+                next_page_token = pdata.get("nextPageToken")
+                if not next_page_token:
+                    break
+
+            # Batch-fetch view counts for the matched videos, 50 at a time
+            for i in range(0, len(hashtag_video_ids), 50):
+                chunk = hashtag_video_ids[i:i + 50]
+                stats_params = {"part": "statistics", "id": ",".join(chunk), "key": YOUTUBE_API_KEY}
                 async with session.get(f"{base}/videos", params=stats_params) as vr:
                     vdata = await vr.json()
                 for v in vdata.get("items", []):
                     dreamyvr_count += 1
                     dreamyvr_views += int(v.get("statistics", {}).get("viewCount", 0))
-            next_page_token = sdata.get("nextPageToken")
-            if not next_page_token:
-                break
 
         return {
             "channel_name":   snippet.get("title", "Unknown"),
             "subscribers":    int(stats.get("subscriberCount", 0)),
+            "total_views":    int(stats.get("viewCount", 0)),
+            "total_videos":   int(stats.get("videoCount", 0)),
             "dreamyvr_count": dreamyvr_count,
             "dreamyvr_views": dreamyvr_views,
             "channel_url":    f"https://www.youtube.com/channel/{channel_id}",
@@ -968,6 +1170,8 @@ async def ccstats(interaction: discord.Interaction, platform: Literal["YouTube",
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",          value="YouTube",                          inline=True)
             embed.add_field(name="Subscribers",       value=f"`{stats['subscribers']:,}`",      inline=True)
+            embed.add_field(name="Total Views",       value=f"`{stats['total_views']:,}`",      inline=True)
+            embed.add_field(name="Total Videos",      value=f"`{stats['total_videos']:,}`",     inline=True)
             embed.add_field(name="#dreamyvr Videos",  value=f"`{stats['dreamyvr_count']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Views",   value=f"`{stats['dreamyvr_views']:,}`",   inline=True)
             embed.set_footer(text=f"Requested by {interaction.user}")
@@ -1046,6 +1250,8 @@ async def adminccstats(interaction: discord.Interaction, user: discord.Member, p
             embed = discord.Embed(title=stats["channel_name"], url=stats["channel_url"], color=0xFF0000)
             embed.add_field(name="Platform",         value="YouTube",                        inline=True)
             embed.add_field(name="Subscribers",      value=f"`{stats['subscribers']:,}`",    inline=True)
+            embed.add_field(name="Total Views",      value=f"`{stats['total_views']:,}`",    inline=True)
+            embed.add_field(name="Total Videos",     value=f"`{stats['total_videos']:,}`",   inline=True)
             embed.add_field(name="#dreamyvr Videos", value=f"`{stats['dreamyvr_count']:,}`", inline=True)
             embed.add_field(name="#dreamyvr Views",  value=f"`{stats['dreamyvr_views']:,}`", inline=True)
             embed.set_footer(text=f"Requested by {interaction.user} • For {user}")
@@ -1100,6 +1306,8 @@ async def contentfullstats(interaction: discord.Interaction):
                     f"**{number}.** {mention}\n"
                     f"> URL: {url}\n"
                     f"> Subscribers: {stats['subscribers']:,}\n"
+                    f"> Total views: {stats['total_views']:,}\n"
+                    f"> Total videos: {stats['total_videos']:,}\n"
                     f"> #dreamyvr videos: {stats['dreamyvr_count']:,}\n"
                     f"> #dreamyvr total views: {stats['dreamyvr_views']:,}"
                 )
@@ -1159,10 +1367,11 @@ async def modleaderboard(interaction: discord.Interaction):
         return
     await interaction.response.defer()
     tally = await _tally_mod_points()
-    if not tally:
-        await interaction.followup.send("No mod points tracked yet.")
-        return
-    ranked = sorted(tally.items(), key=lambda kv: kv[1]["total"], reverse=True)[:10]
+    ranked = []
+    for uid in TRACKED_MOD_IDS:
+        data = tally.get(str(uid), {"total": 0, "breakdown": {}})
+        ranked.append((str(uid), data))
+    ranked.sort(key=lambda kv: kv[1]["total"], reverse=True)
     lines = []
     for i, (uid, data) in enumerate(ranked):
         member = interaction.guild.get_member(int(uid))
@@ -1175,6 +1384,17 @@ async def modleaderboard(interaction: discord.Interaction):
         color=0x808080,
     )
     await interaction.followup.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+# ── /moderatorstatus ─────────────────────────────────────────────────────────
+@tree.command(name="moderatorstatus", description="Post the monthly moderator status report (admin only)")
+async def moderatorstatus(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _post_mod_status_report()
+    await interaction.followup.send(f"Posted the moderator status report in <#{MOD_STATUS_CHANNEL_ID}>.", ephemeral=True)
 
 # ── /sendlevel ────────────────────────────────────────────────────────────────
 def _has_level_role(member: discord.Member) -> bool:
@@ -1815,15 +2035,45 @@ async def debugtiktok(interaction: discord.Interaction, username: str):
     await interaction.followup.send(f"**Profile:**\n```json\n{profile_str}\n```", ephemeral=True)
     await interaction.followup.send(f"**Videos:**\n```json\n{videos_str}\n```", ephemeral=True)
 
+# ── /debugdyno ───────────────────────────────────────────────────────────────
+@tree.command(name="debugdyno", description="Dump the raw content/embeds of recent Dyno mod-log messages (admin only)")
+async def debugdyno(interaction: discord.Interaction, limit: int = 5):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not _is_admin(member):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel = bot.get_channel(DYNO_MOD_LOG_CHANNEL_ID)
+    if not channel:
+        await interaction.followup.send("Could not reach the Dyno mod log channel.", ephemeral=True)
+        return
+    out_lines = []
+    async for msg in channel.history(limit=limit):
+        if msg.author.id != DYNO_BOT_ID:
+            continue
+        out_lines.append(f"--- message {msg.id} ---")
+        out_lines.append(f"content: {msg.content!r}")
+        for e in msg.embeds:
+            out_lines.append(f"embed.title: {e.title!r}")
+            out_lines.append(f"embed.description: {e.description!r}")
+            for f in e.fields:
+                out_lines.append(f"  field: {f.name!r} = {f.value!r}")
+            if e.footer:
+                out_lines.append(f"embed.footer: {e.footer.text!r}")
+            if e.author:
+                out_lines.append(f"embed.author: {e.author.name!r}")
+    if not out_lines:
+        await interaction.followup.send("No Dyno messages found in that channel.", ephemeral=True)
+        return
+    text = "\n".join(out_lines)[:1900]
+    await interaction.followup.send(f"```\n{text}\n```", ephemeral=True)
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ── Moderation commands (/ban, /kick, /warn, /warnings) ──────────────────────
 # ═════════════════════════════════════════════════════════════════════════════
 
 MOD_ACTION_ROLE_ID  = ADMIN_ROLE_ID          # only admins can use /ban /kick /warn /warnings
-WARNINGS_DB_CHANNEL = 1516176492663537875    # reuse mod pts channel — or set a dedicated one
-
-# ── Warnings storage helpers ─────────────────────────────────────────────────
-WARN_DB_CHANNEL_ID = 1516176492663537875     # channel used to persist warning records
+WARN_DB_CHANNEL_ID  = 1516176492663537875    # channel used to persist warning records (shared with mod points — safe, distinguished by message prefix)
 
 async def _save_warning(guild_id: int, target: discord.Member, moderator: discord.Member, reason: str) -> dict:
     """Appends a warning record to the DB channel and returns the record."""
@@ -1846,7 +2096,7 @@ async def _get_warnings(guild_id: int, user_id: int) -> list[dict]:
     db = bot.get_channel(WARN_DB_CHANNEL_ID)
     if not db:
         return []
-    warnings = []
+    warnings_list = []
     async for msg in db.history(limit=None, oldest_first=True):
         if not msg.author.bot:
             continue
@@ -1856,24 +2106,24 @@ async def _get_warnings(guild_id: int, user_id: int) -> list[dict]:
                 record = json.loads(content[len("WARNING:"):])
                 if record.get("guild_id") == guild_id and record.get("user_id") == user_id:
                     record["_msg_id"] = msg.id
-                    warnings.append(record)
+                    warnings_list.append(record)
             except Exception:
                 continue
         elif content.startswith("DELWARN:"):
             try:
                 del_info = json.loads(content[len("DELWARN:"):])
                 # Remove the warning whose message id matches
-                warnings = [w for w in warnings if w.get("_msg_id") != del_info.get("msg_id")]
+                warnings_list = [w for w in warnings_list if w.get("_msg_id") != del_info.get("msg_id")]
             except Exception:
                 continue
-    return warnings
+    return warnings_list
 
 async def _delete_warning_by_index(guild_id: int, user_id: int, index: int) -> bool:
     """Marks warning at 0-based index as deleted. Returns True on success."""
-    warnings = await _get_warnings(guild_id, user_id)
-    if index < 0 or index >= len(warnings):
+    warnings_list = await _get_warnings(guild_id, user_id)
+    if index < 0 or index >= len(warnings_list):
         return False
-    target_msg_id = warnings[index].get("_msg_id")
+    target_msg_id = warnings_list[index].get("_msg_id")
     if not target_msg_id:
         return False
     db = bot.get_channel(WARN_DB_CHANNEL_ID)
@@ -1926,15 +2176,15 @@ class DeleteWarningView(discord.ui.View):
             await interaction.response.send_message("You don't have permission to delete warnings.", ephemeral=True)
             return
 
-        warnings = await _get_warnings(self.guild_id, self.target_id)
-        if not warnings:
+        warnings_list = await _get_warnings(self.guild_id, self.target_id)
+        if not warnings_list:
             await interaction.response.send_message("This user has no warnings to delete.", ephemeral=True)
             return
 
         # Build a select with each warning as an option
         options = []
-        for i, w in enumerate(warnings):
-            label   = f"#{i+1} — {w.get('reason', 'No reason')}"[:100]
+        for i, w in enumerate(warnings_list):
+            label = f"#{i+1} — {w.get('reason', 'No reason')}"[:100]
             options.append(discord.SelectOption(label=label, value=str(i)))
 
         class WarningSelectView(discord.ui.View):
@@ -1972,7 +2222,6 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
 
         await user.ban(reason=f"{reason} (banned by {interaction.user})")
 
-        # Green embed matching Dyno style
         embed = discord.Embed(
             description=f"✅ **{user}** was banned.",
             color=0x2ECC71,
@@ -2032,7 +2281,6 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
     except discord.Forbidden:
         pass
 
-    # Green embed matching Dyno style: "username has been warned. || reason"
     embed = discord.Embed(
         description=f"✅ **{user}** has been warned. || {reason}",
         color=0x2ECC71,
@@ -2065,9 +2313,9 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
         return
 
     for w in warns:
-        mod_name  = w.get("mod_name", "Unknown")
-        reason    = w.get("reason", "No reason provided")
-        time_str  = _time_ago(w.get("timestamp", ""))
+        mod_name = w.get("mod_name", "Unknown")
+        reason   = w.get("reason", "No reason provided")
+        time_str = _time_ago(w.get("timestamp", ""))
         embed.add_field(
             name=f"Moderator: {mod_name}",
             value=f"{reason} — {time_str}",
@@ -2089,6 +2337,7 @@ async def on_ready():
     video_checker.start()
     counts_refresher.start()
     db_flusher.start()
+    monthly_mod_status.start()
     asyncio.create_task(_delayed_counts_warmup())
     await _load_streaks()
     _streaks_ready.set()
