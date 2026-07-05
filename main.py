@@ -2438,12 +2438,19 @@ async def on_ready():
     bot.add_view(TicketClosedView())
     await tree.sync()
 
-    # Do the lightweight, important stuff first so it isn't stuck behind
-    # the global rate limit consumed by the heavy history scans below.
-    await _load_streaks()
-    _streaks_ready.set()
-    await _load_ticket_counter()
+    # Post the panel FIRST, right after syncing commands. Don't let it wait
+    # on _load_streaks() / _load_ticket_counter() — those scan the full
+    # history of channels that are never purged, so they only get slower
+    # as the server grows and must never be allowed to block anything else.
     await post_ticket_panel()
+
+    async def _load_streaks_bg():
+        await _load_streaks()
+        _streaks_ready.set()
+        print("[startup] Streak data loaded.")
+
+    asyncio.create_task(_load_streaks_bg())
+    asyncio.create_task(_load_ticket_counter())
 
     # Now start the heavier/background loops
     weekly_reset.start()
