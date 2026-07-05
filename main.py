@@ -2437,6 +2437,15 @@ async def on_ready():
     bot.add_view(TicketOpenView())
     bot.add_view(TicketClosedView())
     await tree.sync()
+
+    # Do the lightweight, important stuff first so it isn't stuck behind
+    # the global rate limit consumed by the heavy history scans below.
+    await _load_streaks()
+    _streaks_ready.set()
+    await _load_ticket_counter()
+    await post_ticket_panel()
+
+    # Now start the heavier/background loops
     weekly_reset.start()
     streak_checker.start()
     video_checker.start()
@@ -2444,10 +2453,7 @@ async def on_ready():
     db_flusher.start()
     monthly_mod_status.start()
     asyncio.create_task(_delayed_counts_warmup())
-    await _load_streaks()
-    _streaks_ready.set()
-    await _load_ticket_counter()
-    await post_ticket_panel()
+
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 async def _delayed_counts_warmup():
