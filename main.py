@@ -1814,6 +1814,30 @@ class DiscordSupportModal(discord.ui.Modal, title="Discord Support"):
         await create_ticket(interaction, "Discord Support", answers)
 
 
+class CreatorSupportModal(discord.ui.Modal, title="Creator Support"):
+    issue = discord.ui.TextInput(
+        label="What's the issue?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe your issue",
+        required=True,
+        max_length=1000,
+    )
+    social_links = discord.ui.TextInput(
+        label="Send the links to your socials",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. TikTok/YouTube links",
+        required=True,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "What's the issue?": str(self.issue),
+            "Send the links to your socials": str(self.social_links),
+        }
+        await create_ticket(interaction, "Creator Support", answers)
+
+
 # ── Ticket creation ──────────────────────────────────────────────────────────
 async def create_ticket(interaction: discord.Interaction, category: str, answers: dict):
     await interaction.response.defer(ephemeral=True)
@@ -1878,6 +1902,12 @@ class TicketSelect(discord.ui.Select):
                 value="ingame_support",
                 description="Get help with in-game issues",
             ),
+            discord.SelectOption(
+                label="Creator Support",
+                emoji=discord.PartialEmoji(name="UhOkay", id=1495243635132731702),
+                value="creator_support",
+                description="For content creators only",
+            ),
         ]
         super().__init__(
             placeholder="Click the option that best matches your issue...",
@@ -1887,6 +1917,13 @@ class TicketSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "ingame_support":
             await interaction.response.send_modal(InGameSupportModal())
+        elif self.values[0] == "creator_support":
+            member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+            if not _is_cc(member):
+                await interaction.response.send_message(
+                    "You don't have permission to use this option.", ephemeral=True)
+                return
+            await interaction.response.send_modal(CreatorSupportModal())
         else:
             await interaction.response.send_modal(DiscordSupportModal())
 
