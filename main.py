@@ -87,6 +87,31 @@ async def backup_db_to_log_channel():
     _db_message_cache = sent
 
 
+async def restore_db_from_log_channel():
+    """Pulls the last known database backup from the log channel into local storage.
+    Critical because Railway wipes the container's disk on every redeploy — without this,
+    every restart would silently start from an empty database even though a good backup
+    is sitting in Discord."""
+    global _db_message_cache
+
+    if os.path.exists(DB_FILE):
+        return  # local data already present (e.g. a crash-restart, not a fresh container)
+
+    try:
+        channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+        async for msg in channel.history(limit=50):
+            if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == DB_FILE:
+                data = await msg.attachments[0].read()
+                with open(DB_FILE, "wb") as f:
+                    f.write(data)
+                _db_message_cache = msg
+                print("Restored database from log channel backup.")
+                return
+        print("No existing database backup found in log channel — starting fresh.")
+    except discord.HTTPException as e:
+        print(f"Failed to restore database from log channel: {e}")
+
+
 def find_team_by_leader(db: dict, user_id: int):
     for name, info in db.items():
         if info["leader_id"] == user_id:
@@ -502,8 +527,92 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
     await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
+@bot.tree.command(
+    name="registerteam",
+    description="(Admin) Re-link an existing role/channel/leader into the database",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    name="Team name",
+    emoji="A single standard Discord emoji for the team",
+    colour="Hex colour for the team, e.g. #5865F2",
+    role="The team's existing role",
+    channel="The team's existing channel",
+    leader="The team leader",
+    member1="Optional additional member",
+    member2="Optional additional member",
+    member3="Optional additional member",
+    member4="Optional additional member",
+    member5="Optional additional member",
+)
+async def registerteam(
+    interaction: discord.Interaction,
+    name: str,
+    emoji: str,
+    colour: str,
+    role: discord.Role,
+    channel: discord.TextChannel,
+    leader: discord.Member,
+    member1: discord.Member = None,
+    member2: discord.Member = None,
+    member3: discord.Member = None,
+    member4: discord.Member = None,
+    member5: discord.Member = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
+        return
+
+    if not is_valid_standard_emoji(emoji):
+        await interaction.followup.send(
+            "That's not a standard Discord emoji. Please use a single regular emoji.", ephemeral=True
+        )
+        return
+
+    normalized_colour = normalize_hex_colour(colour)
+    if normalized_colour is None:
+        await interaction.followup.send(
+            "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+        )
+        return
+
+    db = load_db()
+    if find_team_key_ci(db["teams"], name):
+        await interaction.followup.send(
+            f"A team called **{name}** already exists in the database. "
+            f"Pick a different name or check /teammembers first.",
+            ephemeral=True,
+        )
+        return
+
+    members = [leader.id]
+    for extra in (member1, member2, member3, member4, member5):
+        if extra is not None and extra.id not in members:
+            members.append(extra.id)
+
+    db["teams"][name] = {
+        "emoji": emoji,
+        "leader_id": leader.id,
+        "role_id": role.id,
+        "channel_id": channel.id,
+        "members": members,
+    }
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    await interaction.followup.send(
+        f"✅ Registered **{name}** {emoji} — role {role.mention}, channel {channel.mention}, "
+        f"leader {leader.mention}, {len(members)} member(s) total. This is now saved and will "
+        f"survive redeploys.",
+        ephemeral=True,
+    )
+
+
 @bot.event
 async def on_ready():
+    await restore_db_from_log_channel()
     await bot.tree.sync()
     for guild in bot.guilds:
         try:
