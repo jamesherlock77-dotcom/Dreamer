@@ -1,356 +1,166 @@
-import asyncio
-import html
-import json
 import os
-import re
-import time
-from pathlib import Path
-from typing import Any, Optional
-
-import aiohttp
+import io
+import json
 import discord
-from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ext import commands
 
-# ---------------------------------------------------------------------------
-# Configuration (set these as environment variables, don't hardcode secrets)
-# ---------------------------------------------------------------------------
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
+# ---------- Config ----------
+CONFIRM_CHANNEL_ID = 1528146431138074624   # where the Yes/No confirmation is posted
+TEAM_CATEGORY_ID = 1528146975554404552     # category the new team channel is created in
+LOG_CHANNEL_ID = 1528147225799037008       # where the JSON "database" is backed up
 
-OCULUS_ACCESS_TOKEN = os.environ.get("OCULUS_ACCESS_TOKEN", "OC|752908224809889|")
-APP_ID = int(os.environ.get("OCULUS_APP_ID", "7190422614401072"))
-DOCID = int(os.environ.get("OCULUS_DOCID", "6771539532935162"))
+DB_FILE = "teams.json"
 
-CHECK_INTERVAL_MINUTES = float(os.environ.get("CHECK_INTERVAL_MINUTES", "10"))
-STATE_FILE = Path(__file__).parent / "state.json"
-
-# Branding / display config
-BOT_BRAND_NAME = os.environ.get("BOT_BRAND_NAME", "Kirbs - Tracker")
-GAME_PUBLISHER = os.environ.get("GAME_PUBLISHER", "Wooster Games")
-GAME_NAME = os.environ.get("GAME_NAME", "Animal Company")
-GAME_STORE_URL = os.environ.get(
-    "GAME_STORE_URL", f"https://www.meta.com/en-us/experiences/{APP_ID}/"
-)
-EMBED_COLOR = discord.Color.dark_grey()
-
-# ---------------------------------------------------------------------------
-# GraphQL client (from your original script, unchanged logic)
-# ---------------------------------------------------------------------------
-class GraphQLClient:
-    def __init__(
-        self,
-        url: str = "https://graph.oculus.com/graphql",
-        max_requests: int = 5,
-        per_seconds: float = 5.0,
-    ) -> None:
-        self.url = url
-        self.max_requests = max_requests
-        self.per_seconds = per_seconds
-        self._timestamps: list[float] = []
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._timeout = aiohttp.ClientTimeout(total=15)
-
-    async def _acquire_slot(self) -> None:
-        now = asyncio.get_running_loop().time()
-        self._timestamps = [t for t in self._timestamps if now - t < self.per_seconds]
-
-        if len(self._timestamps) >= self.max_requests:
-            delay = self.per_seconds - (now - self._timestamps[0])
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-        self._timestamps.append(asyncio.get_running_loop().time())
-
-    async def post(self, payload: dict) -> Optional[dict]:
-        await self._acquire_slot()
-
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self._timeout)
-
-        try:
-            async with self._session.post(self.url, data=payload) as resp:
-                if resp.status != 200:
-                    body_text = await resp.text()
-                    print(f"GraphQL error: HTTP {resp.status} — response body: {body_text[:2000]}")
-                    return None
-                return await resp.json(content_type=None)
-        except Exception as e:
-            print(f"GraphQL error: {type(e).__name__}: {e}")
-
-            if self._session and not self._session.closed:
-                await self._session.close()
-            self._session = None
-            return None
-
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-
-graphql_client = GraphQLClient()
-
-
-def _payload() -> dict:
-    return {
-        "access_token": OCULUS_ACCESS_TOKEN,
-        "variables": json.dumps({"applicationID": str(APP_ID)}),
-        "doc_id": str(DOCID),
-    }
-
-
-async def fetch_store_metadata() -> Optional[dict]:
-    data = await graphql_client.post(_payload())
-    return data if isinstance(data, dict) else None
-
-
-def _extract_live_version(meta: dict) -> Optional[str]:
-    nodes = meta.get("data", {}).get("node", {}).get("liveChannel", {}).get("nodes", [])
-    if not nodes:
-        return None
-    return nodes[0].get("latest_supported_binary", {}).get("version")
-
-
-def _extract_dev_version(meta: dict) -> Optional[str]:
-    nodes = meta.get("data", {}).get("node", {}).get("primary_binaries", {}).get("nodes", [])
-    if not nodes:
-        return None
-    return nodes[0].get("version")
-
-
-async def get_versions() -> tuple[Optional[str], Optional[str]]:
-    """Returns (live_version, dev_version)."""
-    meta = await fetch_store_metadata()
-    if not isinstance(meta, dict):
-        return None, None
-    return _extract_live_version(meta), _extract_dev_version(meta)
-
-
-# ---------------------------------------------------------------------------
-# Game banner image (auto-detected from the store page)
-# ---------------------------------------------------------------------------
-# Optional manual override — leave unset to keep auto-detecting.
-GAME_BANNER_URL_OVERRIDE = os.environ.get("GAME_BANNER_URL", "").strip()
-
-# Several possible tag shapes across meta.com / oculus.com page variants.
-_META_TAG_PATTERNS = [
-    re.compile(r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE),
-    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']', re.IGNORECASE),
-    re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE),
-    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']', re.IGNORECASE),
-    re.compile(r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE),
-]
-
-# Fallback: scan for CDN-hosted image URLs embedded anywhere in the page
-# (e.g. inside a Next.js __NEXT_DATA__ JSON blob) if no meta tag is present.
-_CDN_IMAGE_RE = re.compile(
-    r'https:\\?/\\?/[a-zA-Z0-9.\-]*(?:fbcdn\.net|cdninstagram\.com|oculuscdn\.com|scontent[a-zA-Z0-9.\-]*)'
-    r'[^\s"\'\\]+\.(?:jpg|jpeg|png|webp)',
-    re.IGNORECASE,
-)
-
-_STORE_URL_CANDIDATES = [
-    GAME_STORE_URL,
-    f"https://www.meta.com/experiences/{APP_ID}/",
-    f"https://www.oculus.com/experiences/quest/{APP_ID}/",
-]
-
-# Discord's own link-unfurling bot — sites serve full server-rendered OG tags
-# to this UA even when they'd serve a JS-only shell to a regular browser.
-_CRAWLER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"}
-
-_banner_cache: dict[str, Any] = {"url": None, "fetched_at": 0.0}
-_BANNER_CACHE_TTL = 60 * 60  # 1 hour
-
-
-async def _fetch_og_image(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    try:
-        async with session.get(url, allow_redirects=True) as resp:
-            print(f"Banner fetch: GET {url} -> HTTP {resp.status}")
-            if resp.status != 200:
-                return None
-            html = await resp.text()
-    except Exception as e:
-        print(f"Banner fetch error for {url}: {type(e).__name__}: {e}")
-        return None
-
-    print(f"Banner fetch: got {len(html)} bytes of HTML from {url}")
-
-    for pattern in _META_TAG_PATTERNS:
-        match = pattern.search(html)
-        if match:
-            found = html.unescape(match.group(1).replace("\\/", "/"))
-            print(f"Banner fetch: found meta tag image -> {found}")
-            return found
-
-    cdn_match = _CDN_IMAGE_RE.search(html)
-    if cdn_match:
-        found = html.unescape(cdn_match.group(0).replace("\\/", "/"))
-        print(f"Banner fetch: found embedded CDN image -> {found}")
-        return found
-
-    print(f"Banner fetch: no image found in HTML from {url}")
-    return None
-
-
-async def fetch_game_banner_url() -> Optional[str]:
-    """Returns a banner image URL: manual override > cached > auto-detected from the store page(s)."""
-    if GAME_BANNER_URL_OVERRIDE:
-        return GAME_BANNER_URL_OVERRIDE
-
-    now = time.time()
-    if _banner_cache["url"] and (now - _banner_cache["fetched_at"] < _BANNER_CACHE_TTL):
-        return _banner_cache["url"]
-
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=10),
-        headers=_CRAWLER_HEADERS,
-    ) as session:
-        for url in _STORE_URL_CANDIDATES:
-            image_url = await _fetch_og_image(session, url)
-            if image_url:
-                _banner_cache["url"] = image_url
-                _banner_cache["fetched_at"] = now
-                return image_url
-
-    print("Banner fetch: all candidate URLs failed, falling back to last cached value (if any).")
-    return _banner_cache["url"]
-
-
-# ---------------------------------------------------------------------------
-# Simple persisted state so we don't re-announce after a restart
-# ---------------------------------------------------------------------------
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"live_version": None, "dev_version": None}
-
-
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state))
-
-
-def build_update_embed(
-    old_version: Optional[str],
-    new_version: Optional[str],
-    banner_url: Optional[str],
-) -> discord.Embed:
-    now_ts = int(time.time())
-
-    embed = discord.Embed(
-        title="Update Detected!",
-        description=(
-            f"<t:{now_ts}:F> (<t:{now_ts}:R>)\n"
-            f"**{GAME_PUBLISHER}, {GAME_NAME}**"
-        ),
-        color=EMBED_COLOR,
-    )
-    embed.set_author(name=BOT_BRAND_NAME)
-    embed.add_field(
-        name="🟢 | Updated Version:",
-        value=f"```{new_version or 'unknown'}```",
-        inline=False,
-    )
-    embed.add_field(
-        name="🔴 | Last Logged:",
-        value=f"```{old_version or 'none'}```",
-        inline=False,
-    )
-    if banner_url:
-        embed.set_image(url=banner_url)
-
-    return embed
-
-
-# ---------------------------------------------------------------------------
-# Discord bot
-# ---------------------------------------------------------------------------
+# ---------- Bot setup ----------
 intents = discord.Intents.default()
-intents.message_content = True
+intents.members = True  # needed to reliably add roles / resolve members
+
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ---------- Simple JSON "database" ----------
+def load_db() -> dict:
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_db(data: dict) -> None:
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_db_to_log_channel():
+    """Uploads the current teams.json to the log channel so there's a durable copy."""
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+
+    with open(DB_FILE, "rb") as f:
+        file_bytes = f.read()
+
+    await channel.send(
+        content="📦 Teams database updated:",
+        file=discord.File(io.BytesIO(file_bytes), filename=DB_FILE),
+    )
+
+
+# ---------- Confirmation view ----------
+class ConfirmTeamView(discord.ui.View):
+    def __init__(self, author_id: int, team_name: str, emoji: str, guild: discord.Guild):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.team_name = team_name
+        self.emoji = emoji
+        self.guild = guild
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can confirm this.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def disable_all(self, interaction: discord.Interaction):
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await self.disable_all(interaction)
+
+        guild = self.guild
+        category = guild.get_channel(TEAM_CATEGORY_ID)
+
+        # Create the role
+        role = await guild.create_role(
+            name=f"{self.team_name} team",
+            reason=f"Team created by {interaction.user}",
+        )
+
+        # Create the channel inside the category
+        channel_name = f"{self.emoji}┃{self.team_name}-Team"
+        team_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            reason=f"Team created by {interaction.user}",
+        )
+
+        # Give the leader the new role
+        member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
+        await member.add_roles(role, reason="New team leader")
+
+        # DM the leader
+        try:
+            await interaction.user.send(
+                f"You're now the leader of **{self.team_name}** {self.emoji}!"
+            )
+        except discord.Forbidden:
+            pass  # user has DMs off; not fatal
+
+        # Save to the JSON "database"
+        db = load_db()
+        db[self.team_name] = {
+            "emoji": self.emoji,
+            "leader_id": interaction.user.id,
+            "role_id": role.id,
+            "channel_id": team_channel.id,
+        }
+        save_db(db)
+        await backup_db_to_log_channel()
+
+        await interaction.followup.send(
+            f"✅ Team **{self.team_name}** {self.emoji} created — {team_channel.mention}"
+        )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.disable_all(interaction)
+        await interaction.response.send_message("Team creation cancelled.", ephemeral=True)
+
+
+# ---------- Slash command ----------
+@bot.tree.command(name="createteam", description="Create a new team")
+@app_commands.describe(name="Team name", emoji="Emoji for the team")
+async def createteam(interaction: discord.Interaction, name: str, emoji: str):
+    confirm_channel = bot.get_channel(CONFIRM_CHANNEL_ID)
+    if confirm_channel is None:
+        confirm_channel = await bot.fetch_channel(CONFIRM_CHANNEL_ID)
+
+    view = ConfirmTeamView(
+        author_id=interaction.user.id,
+        team_name=name,
+        emoji=emoji,
+        guild=interaction.guild,
+    )
+
+    await confirm_channel.send(
+        content=(
+            f"{interaction.user.mention} wants to create team **{name}** {emoji}. "
+            f"Confirm?"
+        ),
+        view=view,
+    )
+
+    await interaction.response.send_message(
+        f"Confirmation sent in {confirm_channel.mention} ✅", ephemeral=True
+    )
 
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
-    if not version_check_loop.is_running():
-        version_check_loop.start()
-
-
-@bot.command(name="testupdate")
-async def testupdate(ctx: commands.Context):
-    """Posts a sample update embed immediately, using real current data if available."""
-    await ctx.send("🔧 Test message — the bot is alive and listening.")
-
-    live, dev = await get_versions()
-    banner_url = await fetch_game_banner_url()
-
-    if live is None and dev is None:
-        await ctx.send("⚠️ Couldn't fetch version info right now — check the access token/app ID.")
-        # Still show what a formatted embed looks like, with placeholder versions.
-        embed = build_update_embed("1.82.1.3202", "1.82.2.3211", banner_url)
-        await ctx.send(embed=embed)
-        return
-
-    state = load_state()
-    embed = build_update_embed(state.get("live_version"), live, banner_url)
-    await ctx.send(embed=embed)
-
-
-@bot.command(name="checknow")
-async def checknow(ctx: commands.Context):
-    """Manually triggers an update check right now (posts only if something changed)."""
-    await check_for_updates(force_channel=ctx.channel)
-
-
-async def check_for_updates(force_channel: Optional[discord.abc.Messageable] = None) -> None:
-    state = load_state()
-    live, dev = await get_versions()
-
-    if live is None and dev is None:
-        print("Version check failed, skipping this cycle.")
-        if force_channel is not None:
-            await force_channel.send("⚠️ Couldn't fetch version info right now.")
-        return
-
-    embeds_to_send = []
-
-    if live is not None and live != state.get("live_version"):
-        banner_url = await fetch_game_banner_url()
-        embeds_to_send.append(build_update_embed(state.get("live_version"), live, banner_url))
-        state["live_version"] = live
-
-    if dev is not None and dev != state.get("dev_version"):
-        banner_url = await fetch_game_banner_url()
-        embeds_to_send.append(build_update_embed(state.get("dev_version"), dev, banner_url))
-        state["dev_version"] = dev
-
-    if embeds_to_send:
-        save_state(state)
-        channel = force_channel or bot.get_channel(CHANNEL_ID)
-        if channel is not None:
-            for embed in embeds_to_send:
-                await channel.send(embed=embed)
-    elif force_channel is not None:
-        await force_channel.send("No changes since the last check.")
-
-
-@tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
-async def version_check_loop():
-    await check_for_updates()
-
-
-@version_check_loop.before_loop
-async def before_loop():
-    await bot.wait_until_ready()
-
-
-@bot.event
-async def on_disconnect():
-    await graphql_client.close()
+    print("Slash commands synced.")
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN environment variable is not set")
+    bot.run(token)
