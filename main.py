@@ -534,11 +534,11 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     name="Team name",
-    emoji="A single standard Discord emoji for the team",
-    colour="Hex colour for the team, e.g. #5865F2",
     role="The team's existing role",
     channel="The team's existing channel",
     leader="The team leader",
+    emoji="Optional: override the emoji (auto-detected from the channel name if omitted)",
+    colour="Optional: override the hex colour (auto-detected from the role's colour if omitted)",
     member1="Optional additional member",
     member2="Optional additional member",
     member3="Optional additional member",
@@ -548,11 +548,11 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
 async def registerteam(
     interaction: discord.Interaction,
     name: str,
-    emoji: str,
-    colour: str,
     role: discord.Role,
     channel: discord.TextChannel,
     leader: discord.Member,
+    emoji: str = None,
+    colour: str = None,
     member1: discord.Member = None,
     member2: discord.Member = None,
     member3: discord.Member = None,
@@ -565,18 +565,31 @@ async def registerteam(
         await interaction.followup.send("Only admins can use this command.", ephemeral=True)
         return
 
-    if not is_valid_standard_emoji(emoji):
+    if emoji is None:
+        candidate = channel.name.split("┃", 1)[0] if "┃" in channel.name else None
+        if candidate and is_valid_standard_emoji(candidate):
+            emoji = candidate
+        else:
+            await interaction.followup.send(
+                "Couldn't detect an emoji from that channel's name — pass `emoji:` manually.",
+                ephemeral=True,
+            )
+            return
+    elif not is_valid_standard_emoji(emoji):
         await interaction.followup.send(
             "That's not a standard Discord emoji. Please use a single regular emoji.", ephemeral=True
         )
         return
 
-    normalized_colour = normalize_hex_colour(colour)
-    if normalized_colour is None:
-        await interaction.followup.send(
-            "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
-        )
-        return
+    if colour is None:
+        normalized_colour = f"#{role.colour.value:06x}"
+    else:
+        normalized_colour = normalize_hex_colour(colour)
+        if normalized_colour is None:
+            await interaction.followup.send(
+                "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+            )
+            return
 
     db = load_db()
     if find_team_key_ci(db["teams"], name):
