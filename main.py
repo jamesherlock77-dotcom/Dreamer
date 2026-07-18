@@ -68,7 +68,10 @@ class GraphQLClient:
 
         try:
             async with self._session.post(self.url, data=payload) as resp:
-                resp.raise_for_status()
+                if resp.status != 200:
+                    body_text = await resp.text()
+                    print(f"GraphQL error: HTTP {resp.status} — response body: {body_text[:2000]}")
+                    return None
                 return await resp.json(content_type=None)
         except Exception as e:
             print(f"GraphQL error: {type(e).__name__}: {e}")
