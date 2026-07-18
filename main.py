@@ -122,46 +122,94 @@ async def get_versions() -> tuple[Optional[str], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Game banner image (pulled from the store page's Open Graph image)
+# Game banner image (auto-detected from the store page)
 # ---------------------------------------------------------------------------
-_OG_IMAGE_RE = re.compile(
-    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+# Optional manual override — leave unset to keep auto-detecting.
+GAME_BANNER_URL_OVERRIDE = os.environ.get("GAME_BANNER_URL", "").strip()
+
+# Several possible tag shapes across meta.com / oculus.com page variants.
+_META_TAG_PATTERNS = [
+    re.compile(r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE),
+    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']', re.IGNORECASE),
+    re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE),
+    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']', re.IGNORECASE),
+    re.compile(r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']', re.IGNORECASE),
+]
+
+# Fallback: scan for CDN-hosted image URLs embedded anywhere in the page
+# (e.g. inside a Next.js __NEXT_DATA__ JSON blob) if no meta tag is present.
+_CDN_IMAGE_RE = re.compile(
+    r'https:\\?/\\?/[a-zA-Z0-9.\-]*(?:fbcdn\.net|cdninstagram\.com|oculuscdn\.com|scontent[a-zA-Z0-9.\-]*)'
+    r'[^\s"\'\\]+\.(?:jpg|jpeg|png|webp)',
     re.IGNORECASE,
 )
+
+_STORE_URL_CANDIDATES = [
+    GAME_STORE_URL,
+    f"https://www.meta.com/experiences/{APP_ID}/",
+    f"https://www.oculus.com/experiences/quest/{APP_ID}/",
+]
+
+# Discord's own link-unfurling bot — sites serve full server-rendered OG tags
+# to this UA even when they'd serve a JS-only shell to a regular browser.
+_CRAWLER_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"}
 
 _banner_cache: dict[str, Any] = {"url": None, "fetched_at": 0.0}
 _BANNER_CACHE_TTL = 60 * 60  # 1 hour
 
 
+async def _fetch_og_image(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url, allow_redirects=True) as resp:
+            print(f"Banner fetch: GET {url} -> HTTP {resp.status}")
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+    except Exception as e:
+        print(f"Banner fetch error for {url}: {type(e).__name__}: {e}")
+        return None
+
+    print(f"Banner fetch: got {len(html)} bytes of HTML from {url}")
+
+    for pattern in _META_TAG_PATTERNS:
+        match = pattern.search(html)
+        if match:
+            found = match.group(1).replace("\\/", "/")
+            print(f"Banner fetch: found meta tag image -> {found}")
+            return found
+
+    cdn_match = _CDN_IMAGE_RE.search(html)
+    if cdn_match:
+        found = cdn_match.group(0).replace("\\/", "/")
+        print(f"Banner fetch: found embedded CDN image -> {found}")
+        return found
+
+    print(f"Banner fetch: no image found in HTML from {url}")
+    return None
+
+
 async def fetch_game_banner_url() -> Optional[str]:
-    """Scrapes the game's store page for its og:image (banner/cover art)."""
+    """Returns a banner image URL: manual override > cached > auto-detected from the store page(s)."""
+    if GAME_BANNER_URL_OVERRIDE:
+        return GAME_BANNER_URL_OVERRIDE
+
     now = time.time()
     if _banner_cache["url"] and (now - _banner_cache["fetched_at"] < _BANNER_CACHE_TTL):
         return _banner_cache["url"]
 
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            headers={"User-Agent": "Mozilla/5.0 (compatible; VersionTrackerBot/1.0)"},
-        ) as session:
-            async with session.get(GAME_STORE_URL) as resp:
-                if resp.status != 200:
-                    print(f"Banner fetch failed: HTTP {resp.status}")
-                    return _banner_cache["url"]
-                html = await resp.text()
-    except Exception as e:
-        print(f"Banner fetch error: {type(e).__name__}: {e}")
-        return _banner_cache["url"]
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10),
+        headers=_CRAWLER_HEADERS,
+    ) as session:
+        for url in _STORE_URL_CANDIDATES:
+            image_url = await _fetch_og_image(session, url)
+            if image_url:
+                _banner_cache["url"] = image_url
+                _banner_cache["fetched_at"] = now
+                return image_url
 
-    match = _OG_IMAGE_RE.search(html)
-    if not match:
-        print("Banner fetch: no og:image tag found on store page.")
-        return _banner_cache["url"]
-
-    url = match.group(1)
-    _banner_cache["url"] = url
-    _banner_cache["fetched_at"] = now
-    return url
+    print("Banner fetch: all candidate URLs failed, falling back to last cached value (if any).")
+    return _banner_cache["url"]
 
 
 # ---------------------------------------------------------------------------
