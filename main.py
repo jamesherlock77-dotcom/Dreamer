@@ -467,6 +467,41 @@ async def leaveteam(interaction: discord.Interaction):
     await interaction.followup.send(f"You left **{team_key}**.", ephemeral=True)
 
 
+@bot.tree.command(name="kickteammember", description="Remove a member from your team")
+@app_commands.describe(member="The team member to remove")
+async def kickteammember(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    if not team_key:
+        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+
+    if member.id == interaction.user.id:
+        await interaction.followup.send(
+            "You can't kick yourself. Use /createteam to delete the team instead if you want that.",
+            ephemeral=True,
+        )
+        return
+
+    if member.id not in info.get("members", []):
+        await interaction.followup.send(f"{member.mention} isn't a member of **{team_key}**.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(info["role_id"])
+    if role:
+        await member.remove_roles(role, reason=f"Kicked from team by {interaction.user}")
+
+    info["members"] = [uid for uid in info["members"] if uid != member.id]
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
