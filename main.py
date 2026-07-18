@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import re
@@ -177,13 +178,13 @@ async def _fetch_og_image(session: aiohttp.ClientSession, url: str) -> Optional[
     for pattern in _META_TAG_PATTERNS:
         match = pattern.search(html)
         if match:
-            found = match.group(1).replace("\\/", "/")
+            found = html.unescape(match.group(1).replace("\\/", "/"))
             print(f"Banner fetch: found meta tag image -> {found}")
             return found
 
     cdn_match = _CDN_IMAGE_RE.search(html)
     if cdn_match:
-        found = cdn_match.group(0).replace("\\/", "/")
+        found = html.unescape(cdn_match.group(0).replace("\\/", "/"))
         print(f"Banner fetch: found embedded CDN image -> {found}")
         return found
 
