@@ -158,7 +158,7 @@ class ConfirmTeamView(discord.ui.View):
             role = await guild.create_role(
                 name=f"{self.team_name} Team",
                 colour=role_colour,
-                unicode_emoji=self.emoji,
+                display_icon=self.emoji,
                 reason=f"Team created, confirmed by {interaction.user}",
             )
         except discord.HTTPException:
