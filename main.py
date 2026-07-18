@@ -10,7 +10,8 @@ from discord.ext import commands
 # ---------- Config ----------
 CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
 TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are created in
-LOG_CHANNEL_ID = 1528147225799037008       # JSON "database" backups go here
+LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message lives here
+INVITE_LOG_CHANNEL_ID = 1528160701955313722  # invite-tracking messages go here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 
 DB_FILE = "teams.json"
@@ -24,10 +25,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---------- JSON "database" helpers ----------
 def load_db() -> dict:
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    if not os.path.exists(DB_FILE):
+        return {"teams": {}, "invites": {}}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if "teams" not in data:
+        # migrate old flat-format {team_name: {...}} files
+        data = {"teams": data, "invites": {}}
+    data.setdefault("teams", {})
+    data.setdefault("invites", {})
+    return data
 
 
 def save_db(data: dict) -> None:
@@ -35,14 +42,49 @@ def save_db(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+# Cache of the single database message so we edit it in place instead of
+# posting a new file every time. Populated lazily by scanning channel history.
+_db_message_cache = None
+
+# Per-guild cache of invite code -> uses, used to detect which invite a new
+# member used when they join.
+invite_cache: dict = {}
+
+
+async def get_or_create_db_message():
+    global _db_message_cache
+    if _db_message_cache is not None:
+        return _db_message_cache
+
+    channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == DB_FILE:
+            _db_message_cache = msg
+            return msg
+    return None
+
+
 async def backup_db_to_log_channel():
+    """Keeps a single message in the log channel updated with the current database,
+    editing it in place rather than posting a new file every time."""
+    global _db_message_cache
+
     channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
     with open(DB_FILE, "rb") as f:
         file_bytes = f.read()
-    await channel.send(
-        content="📦 Teams database updated:",
-        file=discord.File(io.BytesIO(file_bytes), filename=DB_FILE),
-    )
+    new_file = discord.File(io.BytesIO(file_bytes), filename=DB_FILE)
+
+    msg = await get_or_create_db_message()
+    if msg is not None:
+        try:
+            edited = await msg.edit(content="📦 Database (auto-updated):", attachments=[new_file])
+            _db_message_cache = edited
+            return
+        except discord.HTTPException:
+            pass  # message may have been deleted; fall through and send a fresh one
+
+    sent = await channel.send(content="📦 Database (auto-updated):", file=new_file)
+    _db_message_cache = sent
 
 
 def find_team_by_leader(db: dict, user_id: int):
@@ -98,7 +140,7 @@ class DeleteTeamView(discord.ui.View):
     @discord.ui.button(label="Delete current team", style=discord.ButtonStyle.danger)
     async def delete_team(self, interaction: discord.Interaction, button: discord.ui.Button):
         db = load_db()
-        info = db.pop(self.team_name, None)
+        info = db["teams"].pop(self.team_name, None)
         if info is None:
             await interaction.response.edit_message(content="That team no longer exists.", view=None)
             return
@@ -203,7 +245,7 @@ class ConfirmTeamView(discord.ui.View):
             pass
 
         db = load_db()
-        db[self.team_name] = {
+        db["teams"][self.team_name] = {
             "emoji": self.emoji,
             "leader_id": self.requester_id,
             "role_id": role.id,
@@ -240,7 +282,7 @@ class InviteResponseView(discord.ui.View):
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         db = load_db()
-        info = db.get(self.team_name)
+        info = db["teams"].get(self.team_name)
         if info is None:
             for child in self.children:
                 child.disabled = True
@@ -299,7 +341,7 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
         return
 
     db = load_db()
-    existing = find_team_by_leader(db, interaction.user.id)
+    existing = find_team_by_leader(db["teams"], interaction.user.id)
     if existing:
         view = DeleteTeamView(interaction.user.id, existing, interaction.guild)
         await interaction.followup.send(
@@ -332,12 +374,12 @@ async def teammembers(interaction: discord.Interaction, team: str):
     await interaction.response.defer()
 
     db = load_db()
-    key = find_team_key_ci(db, team)
+    key = find_team_key_ci(db["teams"], team)
     if not key:
         await interaction.followup.send("No team found with that name.", ephemeral=True)
         return
 
-    info = db[key]
+    info = db["teams"][key]
     lines = [
         f"<@{uid}>" + (" (Leader)" if uid == info["leader_id"] else "")
         for uid in info.get("members", [])
@@ -354,7 +396,7 @@ async def teammembers_team_autocomplete(interaction: discord.Interaction, curren
     db = load_db()
     return [
         app_commands.Choice(name=key, value=key)
-        for key in db.keys()
+        for key in db["teams"].keys()
         if current.lower() in key.lower()
     ][:25]
 
@@ -365,7 +407,7 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
     db = load_db()
-    team_key = find_team_by_leader(db, interaction.user.id)
+    team_key = find_team_by_leader(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You must be a team leader to invite people.", ephemeral=True)
         return
@@ -374,11 +416,11 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("You can't invite bots.", ephemeral=True)
         return
 
-    if find_team_by_member(db, user.id):
+    if find_team_by_member(db["teams"], user.id):
         await interaction.followup.send("That user is already in a guild.", ephemeral=True)
         return
 
-    info = db[team_key]
+    info = db["teams"][team_key]
     view = InviteResponseView(team_key, user.id, interaction.guild.id)
     try:
         await user.send(
@@ -400,12 +442,12 @@ async def leaveteam(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     db = load_db()
-    team_key = find_team_by_member(db, interaction.user.id)
+    team_key = find_team_by_member(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You're not in a team.", ephemeral=True)
         return
 
-    info = db[team_key]
+    info = db["teams"][team_key]
     if interaction.user.id == info["leader_id"]:
         await interaction.followup.send(
             "You're the leader of this team, so you can't leave it. "
@@ -428,8 +470,59 @@ async def leaveteam(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+            invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+        except discord.Forbidden:
+            invite_cache[guild.id] = {}
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    invite_cache.setdefault(invite.guild.id, {})[invite.code] = invite.uses
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    invite_cache.get(invite.guild.id, {}).pop(invite.code, None)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+
+    try:
+        invites_now = await guild.invites()
+    except discord.Forbidden:
+        return  # bot lacks Manage Server permission; can't tell which invite was used
+
+    before = invite_cache.get(guild.id, {})
+    used_invite = None
+    for inv in invites_now:
+        if inv.uses is not None and inv.uses > before.get(inv.code, 0):
+            used_invite = inv
+            break
+
+    invite_cache[guild.id] = {inv.code: inv.uses for inv in invites_now}
+
+    if used_invite is None or used_invite.inviter is None:
+        return  # e.g. vanity URL invite, or the diff couldn't be determined
+
+    inviter = used_invite.inviter
+    db = load_db()
+    key = str(inviter.id)
+    db["invites"][key] = db["invites"].get(key, 0) + 1
+    count = db["invites"][key]
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    log_channel = bot.get_channel(INVITE_LOG_CHANNEL_ID) or await bot.fetch_channel(INVITE_LOG_CHANNEL_ID)
+    await log_channel.send(
+        f"{member.mention} has been invited by {inviter.mention} and has now {count} invites."
+    )
 
 
 if __name__ == "__main__":
