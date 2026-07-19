@@ -698,7 +698,7 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
 
     if not has_create_team_access(interaction.user):
         await interaction.followup.send(
-            "You don't have permission to create a team.", ephemeral=True
+            "You must be level 5 to create a team.", ephemeral=True
         )
         return
 
