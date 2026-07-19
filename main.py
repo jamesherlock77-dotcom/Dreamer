@@ -166,20 +166,16 @@ SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
 def build_support_ticket_embed() -> discord.Embed:
-    divider = "─" * 30
     description = (
         "Welcome! Before opening a ticket, please read the rules below "
-        "carefully. Our team is here to help with server issues.\n"
-        f"\n{divider}\n\n"
+        "carefully. Our team is here to help with server issues.\n\n"
         "## 📘 Ticket Rules\n"
         "`1.` Please follow our server rules and stay respectful.\n"
         "`2.` Do not open a ticket to report in-game issues.\n"
         "`3.` Do not spam or open multiple tickets for the same issue.\n"
-        "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n"
-        f"\n{divider}\n\n"
+        "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n\n"
         "## ⏳ Response Time\n"
-        "If you don't respond within 48 hours, your ticket will be closed.\n"
-        f"\n{divider}\n\n"
+        "If you don't respond within 48 hours, your ticket will be closed.\n\n"
         "## 🤔 Need Help With Something Else?\n"
         "<#1528007337699311740>\n"
         "<#1528009356119900210>\n"
@@ -195,6 +191,27 @@ def build_support_ticket_embed() -> discord.Embed:
     return embed
 
 
+# ---------- Cosmetic dropdown shown under the support ticket panel banner ----------
+class SupportPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(
+        placeholder="Select a category...",
+        options=[
+            discord.SelectOption(label="General Support", emoji="❓"),
+            discord.SelectOption(label="Report an Issue", emoji="⚠️"),
+            discord.SelectOption(label="Other", emoji="✏️"),
+        ],
+        custom_id="support_panel_category_select",
+    )
+    async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        # Cosmetic only for now — no ticket creation logic wired up yet.
+        await interaction.response.send_message(
+            "Ticket creation isn't set up yet — check back soon!", ephemeral=True
+        )
+
+
 async def refresh_support_ticket_panel():
     """Deletes any previously posted support ticket panel in the target channel and
     posts a fresh one. Called on every bot startup so the panel never goes stale or
@@ -208,14 +225,16 @@ async def refresh_support_ticket_panel():
             except discord.HTTPException:
                 pass
 
+    view = SupportPanelView()
+
     if not os.path.exists(SUPPORT_BANNER_PATH):
         print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — panel sent without image.")
-        await channel.send(embed=build_support_ticket_embed())
+        await channel.send(embed=build_support_ticket_embed(), view=view)
         return
 
     embed = build_support_ticket_embed()
     file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-    await channel.send(embed=embed, file=file)
+    await channel.send(embed=embed, file=file, view=view)
 
 
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
@@ -1011,6 +1030,7 @@ async def registerteam(
 @bot.event
 async def on_ready():
     await restore_db_from_log_channel()
+    bot.add_view(SupportPanelView())
     await bot.tree.sync()
     for guild in bot.guilds:
         try:
