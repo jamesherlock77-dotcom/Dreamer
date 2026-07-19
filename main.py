@@ -166,37 +166,25 @@ SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
 def build_support_ticket_embed() -> discord.Embed:
+    description = (
+        "Welcome! Before opening a ticket, please read the rules below "
+        "carefully. Our team is here to help with server issues.\n\n"
+        "# 📘 Ticket Rules\n"
+        "1️⃣ Please follow our server rules and stay respectful.\n"
+        "2️⃣ Do not open a ticket to report in-game issues.\n"
+        "3️⃣ Do not spam or open multiple tickets for the same issue.\n"
+        "4️⃣ Do not use tickets to report bugs, use the proper bug report channel.\n\n"
+        "# ⏳ Response Time\n"
+        "If you don't respond within 48 hours, your ticket will be closed.\n\n"
+        "# 🤔 Need Help With Something Else?\n"
+        "<#1528007337699311740>\n"
+        "<#1528009356119900210>\n"
+        "<#1528230357072347146>"
+    )
     embed = discord.Embed(
         title=SUPPORT_PANEL_TITLE,
-        description=(
-            "Welcome! Before opening a ticket, please read the rules below "
-            "carefully. Our team is here to help with server issues."
-        ),
+        description=description,
         colour=discord.Colour.orange(),
-    )
-    embed.add_field(
-        name="📘 Ticket Rules",
-        value=(
-            "1️⃣ Please follow our server rules and stay respectful.\n"
-            "2️⃣ Do not open a ticket to report in-game issues.\n"
-            "3️⃣ Do not spam or open multiple tickets for the same issue.\n"
-            "4️⃣ Do not use tickets to report bugs, use the proper bug report channel."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="⏳ Response Time",
-        value="If you don't respond within 48 hours, your ticket will be closed.",
-        inline=False,
-    )
-    embed.add_field(
-        name="🤔 Need Help With Something Else?",
-        value=(
-            "<#1528007337699311740>\n"
-            "<#1528009356119900210>\n"
-            "<#1528230357072347146>"
-        ),
-        inline=False,
     )
     embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
     embed.set_footer(text="Animal Company: Arena Hub")
