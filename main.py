@@ -26,6 +26,8 @@ LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message live
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
+CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-existing teams are grandfathered in)
+TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 
@@ -174,6 +176,22 @@ def has_premium_access(member: discord.Member) -> bool:
     return any(role.id in (PREMIUM_ROLE_ID, STAFF_ROLE_ID) for role in member.roles)
 
 
+def has_create_team_access(member: discord.Member) -> bool:
+    return any(role.id == CREATE_TEAM_ROLE_ID for role in member.roles)
+
+
+def team_leader_channel_overwrite() -> discord.PermissionOverwrite:
+    """Permissions granted to a team leader in their own team channel: on top of viewing/
+    sending, manage_messages lets them delete and pin messages, and mention_everyone lets
+    them ping their team's role even though the role itself isn't set to be mentionable."""
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        manage_messages=True,
+        mention_everyone=True,
+    )
+
+
 # Preset palette offered in /premiumteamsettings' colour1/colour2 dropdowns (Discord caps choices at 25).
 PREMIUM_COLOUR_CHOICES = [
     app_commands.Choice(name="Red", value="#ED4245"),
@@ -301,6 +319,68 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
     save_db(db)
     await backup_db_to_log_channel()
     return True
+
+
+async def sync_existing_teams():
+    """Backfill pass run on every startup: makes sure every current team leader holds
+    TEAM_LEADER_ROLE_ID and has the manage-messages/mention-everyone overrides in their
+    own team channel (so they can ping the team, delete messages, and pin messages).
+    Idempotent — cheap after the first run, and self-heals if a permission or role is
+    ever reverted manually."""
+    db = load_db()
+    if not db["teams"]:
+        return
+
+    guild = None
+    leader_role_granted = 0
+    perms_updated = 0
+
+    for team_name, info in db["teams"].items():
+        leader_id = info.get("leader_id")
+        channel_id = info.get("channel_id")
+        if leader_id is None:
+            continue
+
+        try:
+            if guild is None:
+                # all teams live in one guild for this bot; grab it from any known channel
+                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                guild = seed_channel.guild
+            member = guild.get_member(leader_id) or await guild.fetch_member(leader_id)
+        except discord.HTTPException:
+            continue
+
+        leader_marker_role = guild.get_role(TEAM_LEADER_ROLE_ID)
+        if leader_marker_role is None:
+            print(f"TEAM_LEADER_ROLE_ID ({TEAM_LEADER_ROLE_ID}) not found in guild — skipping role backfill.")
+        elif leader_marker_role not in member.roles:
+            try:
+                await member.add_roles(
+                    leader_marker_role, reason=f"Backfilled team-leader role for existing team {team_name}"
+                )
+                leader_role_granted += 1
+            except discord.HTTPException:
+                pass
+
+        channel = guild.get_channel(channel_id)
+        if channel is not None:
+            existing = channel.overwrites_for(member)
+            if not (existing.manage_messages and existing.mention_everyone):
+                try:
+                    await channel.set_permissions(
+                        member,
+                        overwrite=team_leader_channel_overwrite(),
+                        reason=f"Backfilled leader channel permissions for existing team {team_name}",
+                    )
+                    perms_updated += 1
+                except discord.HTTPException:
+                    pass
+
+    if leader_role_granted or perms_updated:
+        print(
+            f"Backfilled team-leader role onto {leader_role_granted} leader(s) and "
+            f"channel permissions onto {perms_updated} leader(s)."
+        )
 
 
 # ---------- Delete-existing-team view (shown when a leader tries to make a 2nd team) ----------
@@ -481,10 +561,15 @@ class ConfirmTeamView(discord.ui.View):
                 # Bot's own top role may be too low to move things this high; skip silently
                 pass
 
+        leader = guild.get_member(self.requester_id) or await guild.fetch_member(self.requester_id)
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+            # Leader gets extra rights in their own channel: delete/pin messages, and ping
+            # the team role even though it isn't set to be mentionable.
+            leader: team_leader_channel_overwrite(),
         }
 
         channel_name = f"{self.emoji}┃{self.team_name}-Team"
@@ -495,8 +580,14 @@ class ConfirmTeamView(discord.ui.View):
             reason=f"Team created, confirmed by {interaction.user}",
         )
 
-        leader = guild.get_member(self.requester_id) or await guild.fetch_member(self.requester_id)
         await leader.add_roles(role, reason="New team leader")
+
+        leader_marker_role = guild.get_role(TEAM_LEADER_ROLE_ID)
+        if leader_marker_role is not None:
+            try:
+                await leader.add_roles(leader_marker_role, reason="New team leader")
+            except discord.HTTPException:
+                pass
 
         try:
             await leader.send(f"You're now the leader of **{self.team_name}** {self.emoji}!")
@@ -604,6 +695,12 @@ class InviteResponseView(discord.ui.View):
 )
 async def createteam(interaction: discord.Interaction, name: str, emoji: str, colour: str):
     await interaction.response.defer(ephemeral=True)
+
+    if not has_create_team_access(interaction.user):
+        await interaction.followup.send(
+            "You don't have permission to create a team.", ephemeral=True
+        )
+        return
 
     if not is_valid_standard_emoji(emoji):
         await interaction.followup.send(
@@ -1436,6 +1533,22 @@ async def registerteam(
         if extra is not None and extra.id not in members:
             members.append(extra.id)
 
+    leader_marker_role = interaction.guild.get_role(TEAM_LEADER_ROLE_ID)
+    if leader_marker_role is not None:
+        try:
+            await leader.add_roles(leader_marker_role, reason="Registered as existing team leader")
+        except discord.HTTPException:
+            pass
+
+    try:
+        await channel.set_permissions(
+            leader,
+            overwrite=team_leader_channel_overwrite(),
+            reason="Registered as existing team leader",
+        )
+    except discord.HTTPException:
+        pass
+
     db["teams"][name] = {
         "emoji": emoji,
         "leader_id": leader.id,
@@ -1459,6 +1572,10 @@ async def on_ready():
     await restore_db_from_log_channel()
     bot.add_view(SupportPanelView())
     await bot.tree.sync()
+    try:
+        await sync_existing_teams()
+    except discord.HTTPException as e:
+        print(f"Failed to sync existing teams (leader role/permissions): {e}")
     try:
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
