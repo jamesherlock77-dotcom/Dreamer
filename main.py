@@ -19,7 +19,7 @@ SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is p
 DB_FILE = "teams.json"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "assets", "support_banner.png")
+SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
 
 # ---------- Bot setup ----------
