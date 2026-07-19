@@ -166,16 +166,20 @@ SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
 def build_support_ticket_embed() -> discord.Embed:
+    divider = "─" * 30
     description = (
         "Welcome! Before opening a ticket, please read the rules below "
-        "carefully. Our team is here to help with server issues.\n\n"
+        "carefully. Our team is here to help with server issues.\n"
+        f"\n{divider}\n\n"
         "## 📘 Ticket Rules\n"
         "`1.` Please follow our server rules and stay respectful.\n"
         "`2.` Do not open a ticket to report in-game issues.\n"
         "`3.` Do not spam or open multiple tickets for the same issue.\n"
-        "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n\n"
+        "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n"
+        f"\n{divider}\n\n"
         "## ⏳ Response Time\n"
-        "If you don't respond within 48 hours, your ticket will be closed.\n\n"
+        "If you don't respond within 48 hours, your ticket will be closed.\n"
+        f"\n{divider}\n\n"
         "## 🤔 Need Help With Something Else?\n"
         "<#1528007337699311740>\n"
         "<#1528009356119900210>\n"
