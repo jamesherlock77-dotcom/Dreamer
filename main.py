@@ -294,7 +294,7 @@ class DeleteTeamView(discord.ui.View):
         )
 
 
-# ---------- Confirmation view for /deleteteam ----------
+# ---------- Confirmation view for team deletion (used by /changeteamsettings and /staffchangesetting) ----------
 class ConfirmDeleteTeamView(discord.ui.View):
     def __init__(self, invoker_id: int, team_name: str, guild: discord.Guild):
         super().__init__(timeout=60)
@@ -717,9 +717,25 @@ async def team_name_autocomplete(interaction: discord.Interaction, current: str)
     ][:25]
 
 
-@bot.tree.command(name="deleteteam", description="(Staff) Delete a team's role, channel, and database entry")
-@app_commands.describe(team="Team to delete")
-async def deleteteam(interaction: discord.Interaction, team: str):
+@bot.tree.command(
+    name="staffchangesetting",
+    description="(Staff) Change a team's name, colour, or icon, or delete it",
+)
+@app_commands.describe(
+    team="Team to modify",
+    delete="Delete the team — removes the role, channel, and database entry (can't be undone)",
+    changename="New team name",
+    changecolour="New hex colour for the team's role, e.g. #5865F2",
+    changeicon="New single standard emoji for the team (no custom server emojis)",
+)
+async def staffchangesetting(
+    interaction: discord.Interaction,
+    team: str,
+    delete: bool = False,
+    changename: str = None,
+    changecolour: str = None,
+    changeicon: str = None,
+):
     await interaction.response.defer(ephemeral=True)
 
     if not has_staff_role(interaction.user):
@@ -727,124 +743,132 @@ async def deleteteam(interaction: discord.Interaction, team: str):
         return
 
     db = load_db()
-    key = find_team_key_ci(db["teams"], team)
-    if not key:
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
         await interaction.followup.send("No team found with that name.", ephemeral=True)
         return
 
-    view = ConfirmDeleteTeamView(interaction.user.id, key, interaction.guild)
-    await interaction.followup.send(
-        f"Are you sure you want to delete **{key}**? This will remove the team's role, channel, "
-        f"and database entry, and can't be undone.",
-        view=view,
-        ephemeral=True,
-    )
-
-
-deleteteam.autocomplete("team")(team_name_autocomplete)
-
-
-@bot.tree.command(name="recolour", description="(Staff) Change a team's role colour")
-@app_commands.describe(team="Team to recolour", hex="New hex colour, e.g. #5865F2")
-async def recolour(interaction: discord.Interaction, team: str, hex: str):
-    await interaction.response.defer(ephemeral=True)
-
-    if not has_staff_role(interaction.user):
-        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    normalized_colour = normalize_hex_colour(hex)
-    if normalized_colour is None:
+    if delete:
+        view = ConfirmDeleteTeamView(interaction.user.id, team_key, interaction.guild)
         await interaction.followup.send(
-            "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+            f"Are you sure you want to delete **{team_key}**? This will remove the team's role, "
+            f"channel, and database entry, and can't be undone.",
+            view=view,
+            ephemeral=True,
         )
         return
 
-    db = load_db()
-    key = find_team_key_ci(db["teams"], team)
-    if not key:
-        await interaction.followup.send("No team found with that name.", ephemeral=True)
-        return
-
-    info = db["teams"][key]
-    role = interaction.guild.get_role(info["role_id"])
-    if role is None:
-        await interaction.followup.send("That team's role no longer exists.", ephemeral=True)
-        return
-
-    await role.edit(
-        colour=discord.Colour.from_str(normalized_colour),
-        reason=f"Colour changed by staff member {interaction.user}",
-    )
-
-    await interaction.followup.send(
-        f"✅ **{key}**'s colour is now `{normalized_colour}`.", ephemeral=True
-    )
-
-
-recolour.autocomplete("team")(team_name_autocomplete)
-
-
-@bot.tree.command(name="rename", description="(Staff) Rename a team")
-@app_commands.describe(team="Team to rename", name="New team name")
-async def rename(interaction: discord.Interaction, team: str, name: str):
-    await interaction.response.defer(ephemeral=True)
-
-    if not has_staff_role(interaction.user):
-        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    db = load_db()
-    key = find_team_key_ci(db["teams"], team)
-    if not key:
-        await interaction.followup.send("No team found with that name.", ephemeral=True)
-        return
-
-    if name.lower() == key.lower():
-        await interaction.followup.send("That's already this team's name.", ephemeral=True)
-        return
-
-    if find_team_key_ci(db["teams"], name):
+    if not any([changename, changecolour, changeicon]):
         await interaction.followup.send(
-            f"A team called **{name}** already exists. Pick a different name.", ephemeral=True
+            "You didn't specify anything to change. Provide `changename`, `changecolour`, "
+            "`changeicon`, or set `delete:` to True.",
+            ephemeral=True,
         )
         return
 
-    info = db["teams"][key]
+    if changename and changename.lower() != team_key.lower() and find_team_key_ci(db["teams"], changename):
+        await interaction.followup.send(
+            f"A team called **{changename}** already exists. Pick a different name.", ephemeral=True
+        )
+        return
+
+    normalized_colour = None
+    if changecolour:
+        normalized_colour = normalize_hex_colour(changecolour)
+        if normalized_colour is None:
+            await interaction.followup.send(
+                "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+            )
+            return
+
+    if changeicon and not is_valid_standard_emoji(changeicon):
+        await interaction.followup.send(
+            "That's not a standard Discord emoji. Please use a single regular emoji "
+            "(custom server emojis can't be used in channel names or role icons).",
+            ephemeral=True,
+        )
+        return
+
+    info = db["teams"][team_key]
     role = interaction.guild.get_role(info["role_id"])
     channel = interaction.guild.get_channel(info["channel_id"])
 
-    if role:
+    new_name = changename if changename else team_key
+    new_emoji = changeicon if changeicon else info["emoji"]
+
+    role_edit_kwargs = {}
+    if changename:
+        role_edit_kwargs["name"] = f"{new_name} Team"
+    if changecolour:
+        role_edit_kwargs["colour"] = discord.Colour.from_str(normalized_colour)
+    if changeicon:
+        role_edit_kwargs["display_icon"] = new_emoji
+
+    icon_warning = None
+    if role and role_edit_kwargs:
         try:
-            await role.edit(name=f"{name} Team", reason=f"Team renamed by staff member {interaction.user}")
+            await role.edit(reason=f"Team settings changed by staff member {interaction.user}", **role_edit_kwargs)
         except discord.HTTPException:
-            await interaction.followup.send(
-                "Couldn't rename the role — Discord rejected the new name (check length/characters).",
-                ephemeral=True,
-            )
-            return
-    if channel:
+            if "display_icon" in role_edit_kwargs:
+                # Role icons require a certain server boost level; retry without it
+                role_edit_kwargs.pop("display_icon")
+                icon_warning = "couldn't set the role icon (requires a certain server boost level)"
+                if role_edit_kwargs:
+                    try:
+                        await role.edit(
+                            reason=f"Team settings changed by staff member {interaction.user}",
+                            **role_edit_kwargs,
+                        )
+                    except discord.HTTPException:
+                        await interaction.followup.send(
+                            "Couldn't apply those changes — Discord rejected the request.", ephemeral=True
+                        )
+                        return
+            else:
+                await interaction.followup.send(
+                    "Couldn't apply those changes — Discord rejected the request.", ephemeral=True
+                )
+                return
+
+    if channel and (changename or changeicon):
         try:
             await channel.edit(
-                name=f"{info['emoji']}┃{name}-Team", reason=f"Team renamed by staff member {interaction.user}"
+                name=f"{new_emoji}┃{new_name}-Team",
+                reason=f"Team settings changed by staff member {interaction.user}",
             )
         except discord.HTTPException:
             await interaction.followup.send(
-                "Renamed the role, but Discord rejected the new channel name "
-                "(check length/characters). Team is now inconsistently named — please fix manually.",
+                "Updated the role, but couldn't rename the channel — Discord rejected the new "
+                "name (check length/characters). Team may now be inconsistently named.",
                 ephemeral=True,
             )
             return
 
-    db["teams"][name] = info
-    del db["teams"][key]
+    if changename and new_name.lower() != team_key.lower():
+        db["teams"][new_name] = info
+        del db["teams"][team_key]
+        team_key = new_name
+    if changeicon:
+        db["teams"][team_key]["emoji"] = new_emoji
+
     save_db(db)
     await backup_db_to_log_channel()
 
-    await interaction.followup.send(f"✅ **{key}** has been renamed to **{name}**.", ephemeral=True)
+    changes = []
+    if changename:
+        changes.append(f"name → **{new_name}**")
+    if changecolour:
+        changes.append(f"colour → `{normalized_colour}`")
+    if changeicon:
+        changes.append(f"icon → {new_emoji}")
+
+    message = f"✅ Updated **{team_key}**: " + ", ".join(changes)
+    if icon_warning:
+        message += f"\n⚠️ Everything else applied, but {icon_warning}."
+    await interaction.followup.send(message, ephemeral=True)
 
 
-rename.autocomplete("team")(team_name_autocomplete)
+staffchangesetting.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(
