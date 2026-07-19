@@ -175,7 +175,7 @@ def build_support_ticket_embed() -> discord.Embed:
         colour=discord.Colour.orange(),
     )
     embed.add_field(
-        name="📘 Ticket Rules",
+        name="# 📘 Ticket Rules",
         value=(
             "1️⃣ Please follow our server rules and stay respectful.\n"
             "2️⃣ Do not open a ticket to report in-game issues.\n"
@@ -185,12 +185,12 @@ def build_support_ticket_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="⏳ Response Time",
+        name="# ⏳ Response Time",
         value="If you don't respond within 48 hours, your ticket will be closed.",
         inline=False,
     )
     embed.add_field(
-        name="🤔 Need Help With Something Else?",
+        name="# 🤔 Need Help With Something Else?",
         value=(
             "<#1528007337699311740>\n"
             "<#1528009356119900210>\n"
