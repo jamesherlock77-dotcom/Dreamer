@@ -11,7 +11,6 @@ from discord.ext import commands
 CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
 TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are created in
 LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message lives here
-INVITE_LOG_CHANNEL_ID = 1528160701955313722  # invite-tracking messages go here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
@@ -32,14 +31,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------- JSON "database" helpers ----------
 def load_db() -> dict:
     if not os.path.exists(DB_FILE):
-        return {"teams": {}, "invites": {}}
+        return {"teams": {}}
     with open(DB_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     if "teams" not in data:
         # migrate old flat-format {team_name: {...}} files
-        data = {"teams": data, "invites": {}}
+        data = {"teams": data}
     data.setdefault("teams", {})
-    data.setdefault("invites", {})
     return data
 
 
@@ -51,10 +49,6 @@ def save_db(data: dict) -> None:
 # Cache of the single database message so we edit it in place instead of
 # posting a new file every time. Populated lazily by scanning channel history.
 _db_message_cache = None
-
-# Per-guild cache of invite code -> uses, used to detect which invite a new
-# member used when they join.
-invite_cache: dict = {}
 
 # User IDs with a /createteam request currently awaiting admin confirmation,
 # so the same user can't queue up multiple pending requests.
@@ -334,7 +328,7 @@ class ConfirmDeleteTeamView(discord.ui.View):
 # ---------- Admin confirmation view for /createteam ----------
 class ConfirmTeamView(discord.ui.View):
     def __init__(self, requester_id: int, team_name: str, emoji: str, colour: str, guild: discord.Guild):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.requester_id = requester_id
         self.team_name = team_name
         self.emoji = emoji
@@ -350,25 +344,13 @@ class ConfirmTeamView(discord.ui.View):
             return False
         return True
 
-    async def disable_all(self, interaction: discord.Interaction):
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
-
-    async def on_timeout(self):
-        pending_team_requests.discard(self.requester_id)
-        if self.message is not None:
-            for child in self.children:
-                child.disabled = True
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
-
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await self.disable_all(interaction)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
 
         guild = self.guild
         category = guild.get_channel(TEAM_CATEGORY_ID)
@@ -440,9 +422,13 @@ class ConfirmTeamView(discord.ui.View):
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.disable_all(interaction)
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
         pending_team_requests.discard(self.requester_id)
-        await interaction.response.send_message("Team creation denied.", ephemeral=True)
+        await interaction.followup.send("Team creation denied.", ephemeral=True)
 
 
 # ---------- Invite response view (DM'd to the invited user) ----------
@@ -1116,63 +1102,12 @@ async def on_ready():
     await restore_db_from_log_channel()
     bot.add_view(SupportPanelView())
     await bot.tree.sync()
-    for guild in bot.guilds:
-        try:
-            invites = await guild.invites()
-            invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
-        except discord.Forbidden:
-            invite_cache[guild.id] = {}
     try:
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
-
-
-@bot.event
-async def on_invite_create(invite: discord.Invite):
-    invite_cache.setdefault(invite.guild.id, {})[invite.code] = invite.uses
-
-
-@bot.event
-async def on_invite_delete(invite: discord.Invite):
-    invite_cache.get(invite.guild.id, {}).pop(invite.code, None)
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    guild = member.guild
-
-    try:
-        invites_now = await guild.invites()
-    except discord.Forbidden:
-        return  # bot lacks Manage Server permission; can't tell which invite was used
-
-    before = invite_cache.get(guild.id, {})
-    used_invite = None
-    for inv in invites_now:
-        if inv.uses is not None and inv.uses > before.get(inv.code, 0):
-            used_invite = inv
-            break
-
-    invite_cache[guild.id] = {inv.code: inv.uses for inv in invites_now}
-
-    if used_invite is None or used_invite.inviter is None:
-        return  # e.g. vanity URL invite, or the diff couldn't be determined
-
-    inviter = used_invite.inviter
-    db = load_db()
-    key = str(inviter.id)
-    db["invites"][key] = db["invites"].get(key, 0) + 1
-    count = db["invites"][key]
-    save_db(db)
-    await backup_db_to_log_channel()
-
-    log_channel = bot.get_channel(INVITE_LOG_CHANNEL_ID) or await bot.fetch_channel(INVITE_LOG_CHANNEL_ID)
-    await log_channel.send(
-        f"{member.mention} has been invited by {inviter.mention} and has now {count} invites."
-    )
 
 
 if __name__ == "__main__":
