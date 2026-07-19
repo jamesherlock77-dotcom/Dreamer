@@ -26,6 +26,7 @@ LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message live
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
+MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 
 DB_FILE = "teams.json"
@@ -555,6 +556,19 @@ class InviteResponseView(discord.ui.View):
             await interaction.edit_original_response(content="This team no longer exists.", view=self)
             return
 
+        if (
+            self.invited_user_id not in info.get("members", [])
+            and len(info.get("members", [])) >= MAX_TEAM_MEMBERS
+        ):
+            for child in self.children:
+                child.disabled = True
+            await interaction.edit_original_response(
+                content=f"**{self.team_name}** filled up to the {MAX_TEAM_MEMBERS}-member cap "
+                f"before you accepted — ask the leader to check again.",
+                view=self,
+            )
+            return
+
         guild = bot.get_guild(self.guild_id)
         member = guild.get_member(self.invited_user_id) or await guild.fetch_member(self.invited_user_id)
         role = guild.get_role(info["role_id"])
@@ -711,6 +725,14 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
         return
 
     info = db["teams"][team_key]
+
+    if len(info.get("members", [])) >= MAX_TEAM_MEMBERS:
+        await interaction.followup.send(
+            f"**{team_key}** is already at the {MAX_TEAM_MEMBERS}-member cap — remove someone first.",
+            ephemeral=True,
+        )
+        return
+
     view = InviteResponseView(team_key, user.id, interaction.guild.id)
     try:
         await user.send(
