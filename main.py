@@ -372,6 +372,57 @@ class ConfirmDeleteTeamView(discord.ui.View):
         await interaction.response.edit_message(content="Cancelled — team not deleted.", view=self)
 
 
+# ---------- Confirmation view for /cleanuporphanteams ----------
+class ConfirmCleanupView(discord.ui.View):
+    def __init__(self, invoker_id: int, orphans: list):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.orphans = orphans  # list of (channel, role_or_None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete them", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+        deleted_channels = 0
+        deleted_roles = 0
+        for channel, role in self.orphans:
+            if role is not None:
+                try:
+                    await role.delete(reason=f"Orphan team role cleanup by {interaction.user}")
+                    deleted_roles += 1
+                except discord.HTTPException:
+                    pass
+            try:
+                await channel.delete(reason=f"Orphan team channel cleanup by {interaction.user}")
+                deleted_channels += 1
+            except discord.HTTPException:
+                pass
+
+        await interaction.followup.send(
+            f"🧹 Cleanup complete — deleted {deleted_channels} channel(s) and {deleted_roles} role(s).",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send("Cleanup cancelled — nothing was deleted.", ephemeral=True)
+
+
 # ---------- Admin confirmation view for /createteam ----------
 class ConfirmTeamView(discord.ui.View):
     def __init__(self, requester_id: int, team_name: str, emoji: str, colour: str, guild: discord.Guild):
@@ -902,6 +953,62 @@ async def staffchangesetting(
 
 
 staffchangesetting.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(
+    name="cleanuporphanteams",
+    description="(Staff) Delete channels/roles in the team category that have no matching database entry",
+)
+async def cleanuporphanteams(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    category = interaction.guild.get_channel(TEAM_CATEGORY_ID)
+    if category is None or not isinstance(category, discord.CategoryChannel):
+        await interaction.followup.send("Couldn't find the team category.", ephemeral=True)
+        return
+
+    db = load_db()
+    known_channel_ids = {info["channel_id"] for info in db["teams"].values()}
+
+    orphans = []  # list of (channel, role_or_None)
+    for channel in category.channels:
+        if channel.id in known_channel_ids:
+            continue
+        linked_role = None
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Role) and target.id != interaction.guild.default_role.id:
+                allow, _deny = overwrite.pair()
+                if allow.view_channel:
+                    linked_role = target
+                    break
+        orphans.append((channel, linked_role))
+
+    if not orphans:
+        await interaction.followup.send(
+            "No orphaned team channels found — everything in the category matches the database.",
+            ephemeral=True,
+        )
+        return
+
+    preview_limit = 20
+    lines = []
+    for channel, role in orphans[:preview_limit]:
+        role_part = f" + role **{role.name}**" if role else " (no linked role found)"
+        lines.append(f"• {channel.mention}{role_part}")
+    if len(orphans) > preview_limit:
+        lines.append(f"…and {len(orphans) - preview_limit} more")
+
+    view = ConfirmCleanupView(interaction.user.id, orphans)
+    await interaction.followup.send(
+        f"Found **{len(orphans)}** channel(s) in the team category with no matching database "
+        f"entry:\n" + "\n".join(lines) + "\n\nDelete them (and their linked roles)? This can't be undone.",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
