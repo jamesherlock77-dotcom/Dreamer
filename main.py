@@ -2,10 +2,22 @@ import os
 import io
 import re
 import json
+import logging
 import emoji as emoji_lib
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# Autocomplete responses can occasionally arrive after Discord has already invalidated
+# the interaction (e.g. the user typed another character before the bot replied).
+# discord.py already handles this gracefully — it just logs a full traceback as noise.
+# Filter that specific, harmless message out so real errors aren't buried under it.
+class _SuppressAutocompleteRaceNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Ignoring exception in autocomplete" not in record.getMessage()
+
+
+logging.getLogger("discord.app_commands.tree").addFilter(_SuppressAutocompleteRaceNoise())
 
 # ---------- Config ----------
 CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
@@ -898,14 +910,18 @@ staffchangesetting.autocomplete("team")(team_name_autocomplete)
 )
 @app_commands.describe(
     colour1="Primary role colour",
+    colour1hex="Custom primary hex colour, e.g. #5865F2 — overrides colour1 if both are given",
     colour2="Secondary role colour — combined with colour1 this creates a gradient",
+    colour2hex="Custom secondary hex colour, e.g. #5865F2 — overrides colour2 if both are given",
     roleicon="Image to use as the team role's icon",
 )
 @app_commands.choices(colour1=PREMIUM_COLOUR_CHOICES, colour2=PREMIUM_COLOUR_CHOICES)
 async def premiumteamsettings(
     interaction: discord.Interaction,
     colour1: app_commands.Choice[str] = None,
+    colour1hex: str = None,
     colour2: app_commands.Choice[str] = None,
+    colour2hex: str = None,
     roleicon: discord.Attachment = None,
 ):
     await interaction.response.defer(ephemeral=True)
@@ -920,9 +936,10 @@ async def premiumteamsettings(
         await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
         return
 
-    if not any([colour1, colour2, roleicon]):
+    if not any([colour1, colour1hex, colour2, colour2hex, roleicon]):
         await interaction.followup.send(
-            "You didn't specify anything to change. Provide `colour1`, `colour2`, and/or `roleicon`.",
+            "You didn't specify anything to change. Provide a colour (dropdown or hex) and/or "
+            "`roleicon`.",
             ephemeral=True,
         )
         return
@@ -930,6 +947,34 @@ async def premiumteamsettings(
     if roleicon is not None and not (roleicon.content_type or "").startswith("image/"):
         await interaction.followup.send("`roleicon` needs to be an image file.", ephemeral=True)
         return
+
+    resolved_colour1 = None
+    colour1_label = None
+    if colour1hex:
+        resolved_colour1 = normalize_hex_colour(colour1hex)
+        if resolved_colour1 is None:
+            await interaction.followup.send(
+                "`colour1hex` isn't a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+            )
+            return
+        colour1_label = resolved_colour1
+    elif colour1:
+        resolved_colour1 = colour1.value
+        colour1_label = colour1.name
+
+    resolved_colour2 = None
+    colour2_label = None
+    if colour2hex:
+        resolved_colour2 = normalize_hex_colour(colour2hex)
+        if resolved_colour2 is None:
+            await interaction.followup.send(
+                "`colour2hex` isn't a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+            )
+            return
+        colour2_label = resolved_colour2
+    elif colour2:
+        resolved_colour2 = colour2.value
+        colour2_label = colour2.name
 
     info = db["teams"][team_key]
     role = interaction.guild.get_role(info["role_id"])
@@ -939,10 +984,10 @@ async def premiumteamsettings(
         return
 
     role_edit_kwargs = {}
-    if colour1:
-        role_edit_kwargs["colour"] = discord.Colour.from_str(colour1.value)
-    if colour2:
-        role_edit_kwargs["secondary_colour"] = discord.Colour.from_str(colour2.value)
+    if resolved_colour1:
+        role_edit_kwargs["colour"] = discord.Colour.from_str(resolved_colour1)
+    if resolved_colour2:
+        role_edit_kwargs["secondary_colour"] = discord.Colour.from_str(resolved_colour2)
 
     icon_warning = None
     if roleicon is not None:
@@ -1021,10 +1066,10 @@ async def premiumteamsettings(
     await backup_db_to_log_channel()
 
     changes = []
-    if colour1:
-        changes.append(f"colour1 → {colour1.name}")
-    if colour2:
-        changes.append(f"colour2 → {colour2.name}")
+    if colour1_label:
+        changes.append(f"colour1 → {colour1_label}")
+    if colour2_label:
+        changes.append(f"colour2 → {colour2_label}")
     if roleicon is not None and "display_icon" in role_edit_kwargs:
         changes.append("icon updated")
 
