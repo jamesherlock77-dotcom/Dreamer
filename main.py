@@ -199,9 +199,14 @@ class SupportPanelView(discord.ui.View):
     @discord.ui.select(
         placeholder="Select a category...",
         options=[
-            discord.SelectOption(label="General Support", emoji="❓"),
-            discord.SelectOption(label="Report an Issue", emoji="⚠️"),
-            discord.SelectOption(label="Other", emoji="✏️"),
+            discord.SelectOption(
+                label="Discord Issue",
+                emoji=discord.PartialEmoji(name="SilverTrophy", id=1528216893297791098),
+            ),
+            discord.SelectOption(
+                label="Report A Discord User",
+                emoji=discord.PartialEmoji(name="boombox", id=1528218480657170452),
+            ),
         ],
         custom_id="support_panel_category_select",
     )
