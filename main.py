@@ -14,8 +14,13 @@ LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message live
 INVITE_LOG_CHANNEL_ID = 1528160701955313722  # invite-tracking messages go here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
+SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 
 DB_FILE = "teams.json"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "assets", "support_banner.png")
+SUPPORT_BANNER_FILENAME = "support_banner.png"
 
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
@@ -155,6 +160,70 @@ def normalize_hex_colour(text: str):
 
 def has_staff_role(member: discord.Member) -> bool:
     return any(role.id == STAFF_ROLE_ID for role in member.roles)
+
+
+SUPPORT_PANEL_TITLE = "Discord Support System"
+
+
+def build_support_ticket_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title=SUPPORT_PANEL_TITLE,
+        description=(
+            "Welcome! Before opening a ticket, please read the rules below "
+            "carefully. Our team is here to help with server issues."
+        ),
+        colour=discord.Colour.orange(),
+    )
+    embed.add_field(
+        name="📘 Ticket Rules",
+        value=(
+            "1️⃣ Please follow our server rules and stay respectful.\n"
+            "2️⃣ Do not open a ticket to report in-game issues.\n"
+            "3️⃣ Do not spam or open multiple tickets for the same issue.\n"
+            "4️⃣ Do not use tickets to report bugs, use the proper bug report channel."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏳ Response Time",
+        value="If you don't respond within 48 hours, your ticket will be closed.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🤔 Need Help With Something Else?",
+        value=(
+            "<#1528007337699311740>\n"
+            "<#1528009356119900210>\n"
+            "<#1528230357072347146>"
+        ),
+        inline=False,
+    )
+    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+    embed.set_footer(text="Animal Company: Arena Hub")
+    return embed
+
+
+async def refresh_support_ticket_panel():
+    """Deletes any previously posted support ticket panel in the target channel and
+    posts a fresh one. Called on every bot startup so the panel never goes stale or
+    duplicates across restarts."""
+    channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == SUPPORT_PANEL_TITLE:
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+
+    if not os.path.exists(SUPPORT_BANNER_PATH):
+        print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — panel sent without image.")
+        await channel.send(embed=build_support_ticket_embed())
+        return
+
+    embed = build_support_ticket_embed()
+    file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+    await channel.send(embed=embed, file=file)
 
 
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
@@ -957,6 +1026,10 @@ async def on_ready():
             invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
         except discord.Forbidden:
             invite_cache[guild.id] = {}
+    try:
+        await refresh_support_ticket_panel()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh support ticket panel: {e}")
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
