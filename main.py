@@ -13,6 +13,7 @@ TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are crea
 LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message lives here
 INVITE_LOG_CHANNEL_ID = 1528160701955313722  # invite-tracking messages go here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
+STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 
 DB_FILE = "teams.json"
 
@@ -49,6 +50,10 @@ _db_message_cache = None
 # Per-guild cache of invite code -> uses, used to detect which invite a new
 # member used when they join.
 invite_cache: dict = {}
+
+# User IDs with a /createteam request currently awaiting admin confirmation,
+# so the same user can't queue up multiple pending requests.
+pending_team_requests: set = set()
 
 
 async def get_or_create_db_message():
@@ -148,6 +153,10 @@ def normalize_hex_colour(text: str):
     return None
 
 
+def has_staff_role(member: discord.Member) -> bool:
+    return any(role.id == STAFF_ROLE_ID for role in member.roles)
+
+
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
     """Removes a team's role, channel, and DB entry. Returns False if the team was already gone."""
     info = db["teams"].pop(team_name, None)
@@ -183,17 +192,18 @@ class DeleteTeamView(discord.ui.View):
 
     @discord.ui.button(label="Delete current team", style=discord.ButtonStyle.danger)
     async def delete_team(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         db = load_db()
         deleted = await perform_team_deletion(
             db, self.team_name, self.guild, reason=f"Team deleted by {interaction.user}"
         )
         if not deleted:
-            await interaction.response.edit_message(content="That team no longer exists.", view=None)
+            await interaction.edit_original_response(content="That team no longer exists.", view=None)
             return
 
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"🗑️ Team **{self.team_name}** deleted. You can now create a new one.",
             view=self,
         )
@@ -201,30 +211,31 @@ class DeleteTeamView(discord.ui.View):
 
 # ---------- Confirmation view for /deleteteam ----------
 class ConfirmDeleteTeamView(discord.ui.View):
-    def __init__(self, leader_id: int, team_name: str, guild: discord.Guild):
+    def __init__(self, invoker_id: int, team_name: str, guild: discord.Guild):
         super().__init__(timeout=60)
-        self.leader_id = leader_id
+        self.invoker_id = invoker_id
         self.team_name = team_name
         self.guild = guild
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.leader_id:
+        if interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         db = load_db()
         deleted = await perform_team_deletion(
-            db, self.team_name, self.guild, reason=f"Team deleted by leader {interaction.user}"
+            db, self.team_name, self.guild, reason=f"Team deleted by staff member {interaction.user}"
         )
         for child in self.children:
             child.disabled = True
         if not deleted:
-            await interaction.response.edit_message(content="That team no longer exists.", view=self)
+            await interaction.edit_original_response(content="That team no longer exists.", view=self)
             return
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"🗑️ Team **{self.team_name}** has been deleted.", view=self
         )
 
@@ -244,6 +255,7 @@ class ConfirmTeamView(discord.ui.View):
         self.emoji = emoji
         self.colour = colour
         self.guild = guild
+        self.message: discord.Message = None  # set by the caller after sending
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.user.guild_permissions.administrator:
@@ -257,6 +269,16 @@ class ConfirmTeamView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.message.edit(view=self)
+
+    async def on_timeout(self):
+        pending_team_requests.discard(self.requester_id)
+        if self.message is not None:
+            for child in self.children:
+                child.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -325,6 +347,7 @@ class ConfirmTeamView(discord.ui.View):
         }
         save_db(db)
         await backup_db_to_log_channel()
+        pending_team_requests.discard(self.requester_id)
 
         await interaction.followup.send(
             f"✅ Team **{self.team_name}** {self.emoji} created — {team_channel.mention}"
@@ -333,6 +356,7 @@ class ConfirmTeamView(discord.ui.View):
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.disable_all(interaction)
+        pending_team_requests.discard(self.requester_id)
         await interaction.response.send_message("Team creation denied.", ephemeral=True)
 
 
@@ -352,12 +376,14 @@ class InviteResponseView(discord.ui.View):
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
         db = load_db()
         info = db["teams"].get(self.team_name)
         if info is None:
             for child in self.children:
                 child.disabled = True
-            await interaction.response.edit_message(content="This team no longer exists.", view=self)
+            await interaction.edit_original_response(content="This team no longer exists.", view=self)
             return
 
         guild = bot.get_guild(self.guild_id)
@@ -377,7 +403,7 @@ class InviteResponseView(discord.ui.View):
 
         for child in self.children:
             child.disabled = True
-        await interaction.response.edit_message(content=f"You joined **{self.team_name}**! 🎉", view=self)
+        await interaction.edit_original_response(content=f"You joined **{self.team_name}**! 🎉", view=self)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -429,6 +455,16 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
         )
         return
 
+    if interaction.user.id in pending_team_requests:
+        await interaction.followup.send(
+            "You already have a team creation request awaiting admin confirmation. "
+            "Please wait for that to be approved or denied before submitting another.",
+            ephemeral=True,
+        )
+        return
+
+    pending_team_requests.add(interaction.user.id)
+
     confirm_channel = bot.get_channel(CONFIRM_CHANNEL_ID) or await bot.fetch_channel(CONFIRM_CHANNEL_ID)
     view = ConfirmTeamView(
         requester_id=interaction.user.id,
@@ -437,10 +473,11 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
         colour=normalized_colour,
         guild=interaction.guild,
     )
-    await confirm_channel.send(
+    sent = await confirm_channel.send(
         content=f"{interaction.user.mention} wants to create team **{name}** {emoji}. Admins, confirm?",
         view=view,
     )
+    view.message = sent
     await interaction.followup.send(
         f"Sent to {confirm_channel.mention} for admin confirmation ✅", ephemeral=True
     )
@@ -535,7 +572,7 @@ async def leaveteam(interaction: discord.Interaction):
     if interaction.user.id == info["leader_id"]:
         await interaction.followup.send(
             "You're the leader of this team, so you can't leave it. "
-            "Use /deleteteam if you want to delete it instead.",
+            "Ask a staff member to delete the team with /deleteteam if that's what you want.",
             ephemeral=True,
         )
         return
@@ -566,7 +603,7 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
 
     if member.id == interaction.user.id:
         await interaction.followup.send(
-            "You can't kick yourself. Use /deleteteam if you want that.",
+            "You can't kick yourself. Ask a staff member to use /deleteteam if you want that.",
             ephemeral=True,
         )
         return
@@ -586,23 +623,143 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
     await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
-@bot.tree.command(name="deleteteam", description="Delete your team (leader only)")
-async def deleteteam(interaction: discord.Interaction):
+async def team_name_autocomplete(interaction: discord.Interaction, current: str):
+    db = load_db()
+    return [
+        app_commands.Choice(name=key, value=key)
+        for key in db["teams"].keys()
+        if current.lower() in key.lower()
+    ][:25]
+
+
+@bot.tree.command(name="deleteteam", description="(Staff) Delete a team's role, channel, and database entry")
+@app_commands.describe(team="Team to delete")
+async def deleteteam(interaction: discord.Interaction, team: str):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
-    team_key = find_team_by_leader(db["teams"], interaction.user.id)
-    if not team_key:
-        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
-    view = ConfirmDeleteTeamView(interaction.user.id, team_key, interaction.guild)
+    db = load_db()
+    key = find_team_key_ci(db["teams"], team)
+    if not key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    view = ConfirmDeleteTeamView(interaction.user.id, key, interaction.guild)
     await interaction.followup.send(
-        f"Are you sure you want to delete **{team_key}**? This will remove the team's role and "
-        f"channel, and can't be undone.",
+        f"Are you sure you want to delete **{key}**? This will remove the team's role, channel, "
+        f"and database entry, and can't be undone.",
         view=view,
         ephemeral=True,
     )
+
+
+deleteteam.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(name="recolour", description="(Staff) Change a team's role colour")
+@app_commands.describe(team="Team to recolour", hex="New hex colour, e.g. #5865F2")
+async def recolour(interaction: discord.Interaction, team: str, hex: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    normalized_colour = normalize_hex_colour(hex)
+    if normalized_colour is None:
+        await interaction.followup.send(
+            "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
+        )
+        return
+
+    db = load_db()
+    key = find_team_key_ci(db["teams"], team)
+    if not key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    info = db["teams"][key]
+    role = interaction.guild.get_role(info["role_id"])
+    if role is None:
+        await interaction.followup.send("That team's role no longer exists.", ephemeral=True)
+        return
+
+    await role.edit(
+        colour=discord.Colour.from_str(normalized_colour),
+        reason=f"Colour changed by staff member {interaction.user}",
+    )
+
+    await interaction.followup.send(
+        f"✅ **{key}**'s colour is now `{normalized_colour}`.", ephemeral=True
+    )
+
+
+recolour.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(name="rename", description="(Staff) Rename a team")
+@app_commands.describe(team="Team to rename", name="New team name")
+async def rename(interaction: discord.Interaction, team: str, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    key = find_team_key_ci(db["teams"], team)
+    if not key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    if name.lower() == key.lower():
+        await interaction.followup.send("That's already this team's name.", ephemeral=True)
+        return
+
+    if find_team_key_ci(db["teams"], name):
+        await interaction.followup.send(
+            f"A team called **{name}** already exists. Pick a different name.", ephemeral=True
+        )
+        return
+
+    info = db["teams"][key]
+    role = interaction.guild.get_role(info["role_id"])
+    channel = interaction.guild.get_channel(info["channel_id"])
+
+    if role:
+        try:
+            await role.edit(name=f"{name} Team", reason=f"Team renamed by staff member {interaction.user}")
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "Couldn't rename the role — Discord rejected the new name (check length/characters).",
+                ephemeral=True,
+            )
+            return
+    if channel:
+        try:
+            await channel.edit(
+                name=f"{info['emoji']}┃{name}-Team", reason=f"Team renamed by staff member {interaction.user}"
+            )
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "Renamed the role, but Discord rejected the new channel name "
+                "(check length/characters). Team is now inconsistently named — please fix manually.",
+                ephemeral=True,
+            )
+            return
+
+    db["teams"][name] = info
+    del db["teams"][key]
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    await interaction.followup.send(f"✅ **{key}** has been renamed to **{name}**.", ephemeral=True)
+
+
+rename.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(name="changeteamcolour", description="Change your team's role colour (leader only)")
