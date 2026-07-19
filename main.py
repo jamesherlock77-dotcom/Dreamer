@@ -316,6 +316,17 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
     if channel:
         await channel.delete(reason=reason)
 
+    leader_id = info.get("leader_id")
+    if leader_id is not None:
+        leader_marker_role = guild.get_role(TEAM_LEADER_ROLE_ID)
+        if leader_marker_role is not None:
+            try:
+                leader_member = guild.get_member(leader_id) or await guild.fetch_member(leader_id)
+                if leader_marker_role in leader_member.roles:
+                    await leader_member.remove_roles(leader_marker_role, reason=reason)
+            except discord.HTTPException:
+                pass
+
     save_db(db)
     await backup_db_to_log_channel()
     return True
@@ -731,6 +742,15 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
         await interaction.followup.send(
             f"You already lead a team called **{existing}**. You can only lead one team at a time.",
             view=view,
+            ephemeral=True,
+        )
+        return
+
+    existing_membership = find_team_by_member(db["teams"], interaction.user.id)
+    if existing_membership:
+        await interaction.followup.send(
+            f"You're already a member of **{existing_membership}**. Leave that team with "
+            f"`/leaveteam` before creating a new one.",
             ephemeral=True,
         )
         return
@@ -1454,117 +1474,6 @@ async def changeteamsettings(
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
     await interaction.followup.send(message, ephemeral=True)
 
-
-@bot.tree.command(
-    name="registerteam",
-    description="(Admin) Re-link an existing role/channel/leader into the database",
-)
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(
-    name="Team name",
-    role="The team's existing role",
-    channel="The team's existing channel",
-    leader="The team leader",
-    emoji="Optional: override the emoji (auto-detected from the channel name if omitted)",
-    colour="Optional: override the hex colour (auto-detected from the role's colour if omitted)",
-    member1="Optional additional member",
-    member2="Optional additional member",
-    member3="Optional additional member",
-    member4="Optional additional member",
-    member5="Optional additional member",
-)
-async def registerteam(
-    interaction: discord.Interaction,
-    name: str,
-    role: discord.Role,
-    channel: discord.TextChannel,
-    leader: discord.Member,
-    emoji: str = None,
-    colour: str = None,
-    member1: discord.Member = None,
-    member2: discord.Member = None,
-    member3: discord.Member = None,
-    member4: discord.Member = None,
-    member5: discord.Member = None,
-):
-    await interaction.response.defer(ephemeral=True)
-
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.followup.send("Only admins can use this command.", ephemeral=True)
-        return
-
-    if emoji is None:
-        candidate = channel.name.split("┃", 1)[0] if "┃" in channel.name else None
-        if candidate and is_valid_standard_emoji(candidate):
-            emoji = candidate
-        else:
-            await interaction.followup.send(
-                "Couldn't detect an emoji from that channel's name — pass `emoji:` manually.",
-                ephemeral=True,
-            )
-            return
-    elif not is_valid_standard_emoji(emoji):
-        await interaction.followup.send(
-            "That's not a standard Discord emoji. Please use a single regular emoji.", ephemeral=True
-        )
-        return
-
-    if colour is None:
-        normalized_colour = f"#{role.colour.value:06x}"
-    else:
-        normalized_colour = normalize_hex_colour(colour)
-        if normalized_colour is None:
-            await interaction.followup.send(
-                "That's not a valid hex colour. Use a format like `#5865F2`.", ephemeral=True
-            )
-            return
-
-    db = load_db()
-    if find_team_key_ci(db["teams"], name):
-        await interaction.followup.send(
-            f"A team called **{name}** already exists in the database. "
-            f"Pick a different name or check /teammembers first.",
-            ephemeral=True,
-        )
-        return
-
-    members = [leader.id]
-    for extra in (member1, member2, member3, member4, member5):
-        if extra is not None and extra.id not in members:
-            members.append(extra.id)
-
-    leader_marker_role = interaction.guild.get_role(TEAM_LEADER_ROLE_ID)
-    if leader_marker_role is not None:
-        try:
-            await leader.add_roles(leader_marker_role, reason="Registered as existing team leader")
-        except discord.HTTPException:
-            pass
-
-    try:
-        await channel.set_permissions(
-            leader,
-            overwrite=team_leader_channel_overwrite(),
-            reason="Registered as existing team leader",
-        )
-    except discord.HTTPException:
-        pass
-
-    db["teams"][name] = {
-        "emoji": emoji,
-        "leader_id": leader.id,
-        "role_id": role.id,
-        "channel_id": channel.id,
-        "members": members,
-    }
-    save_db(db)
-    await backup_db_to_log_channel()
-
-    await interaction.followup.send(
-        f"✅ Registered **{name}** {emoji} — role {role.mention}, channel {channel.mention}, "
-        f"leader {leader.mention}, {len(members)} member(s) total. This is now saved and will "
-        f"survive redeploys.",
-        ephemeral=True,
-    )
 
 
 @bot.event
