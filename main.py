@@ -13,6 +13,7 @@ TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are crea
 LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message lives here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
+PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 
 DB_FILE = "teams.json"
@@ -154,6 +155,40 @@ def normalize_hex_colour(text: str):
 
 def has_staff_role(member: discord.Member) -> bool:
     return any(role.id == STAFF_ROLE_ID for role in member.roles)
+
+
+def has_premium_access(member: discord.Member) -> bool:
+    return any(role.id in (PREMIUM_ROLE_ID, STAFF_ROLE_ID) for role in member.roles)
+
+
+# Preset palette offered in /premiumteamsettings' colour1/colour2 dropdowns (Discord caps choices at 25).
+PREMIUM_COLOUR_CHOICES = [
+    app_commands.Choice(name="Red", value="#ED4245"),
+    app_commands.Choice(name="Crimson", value="#DC143C"),
+    app_commands.Choice(name="Maroon", value="#800000"),
+    app_commands.Choice(name="Orange", value="#E67E22"),
+    app_commands.Choice(name="Coral", value="#FF7F50"),
+    app_commands.Choice(name="Gold", value="#F1C40F"),
+    app_commands.Choice(name="Yellow", value="#FEE75C"),
+    app_commands.Choice(name="Lime", value="#32CD32"),
+    app_commands.Choice(name="Green", value="#57F287"),
+    app_commands.Choice(name="Teal", value="#1ABC9C"),
+    app_commands.Choice(name="Turquoise", value="#40E0D0"),
+    app_commands.Choice(name="Cyan", value="#00FFFF"),
+    app_commands.Choice(name="Sky Blue", value="#3498DB"),
+    app_commands.Choice(name="Blue", value="#5865F2"),
+    app_commands.Choice(name="Navy", value="#2C3E50"),
+    app_commands.Choice(name="Indigo", value="#6F2DA8"),
+    app_commands.Choice(name="Purple", value="#9B59B6"),
+    app_commands.Choice(name="Violet", value="#8F00FF"),
+    app_commands.Choice(name="Magenta", value="#FF00FF"),
+    app_commands.Choice(name="Pink", value="#EB459E"),
+    app_commands.Choice(name="Hot Pink", value="#FF69B4"),
+    app_commands.Choice(name="Brown", value="#8B4513"),
+    app_commands.Choice(name="Silver", value="#C0C0C0"),
+    app_commands.Choice(name="Black", value="#23272A"),
+    app_commands.Choice(name="White", value="#FFFFFF"),
+]
 
 
 SUPPORT_PANEL_TITLE = "Discord Support System"
@@ -855,6 +890,154 @@ async def staffchangesetting(
 
 
 staffchangesetting.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(
+    name="premiumteamsettings",
+    description="(Premium) Apply gradient role colours or a custom role icon to your team",
+)
+@app_commands.describe(
+    colour1="Primary role colour",
+    colour2="Secondary role colour — combined with colour1 this creates a gradient",
+    roleicon="Image to use as the team role's icon",
+)
+@app_commands.choices(colour1=PREMIUM_COLOUR_CHOICES, colour2=PREMIUM_COLOUR_CHOICES)
+async def premiumteamsettings(
+    interaction: discord.Interaction,
+    colour1: app_commands.Choice[str] = None,
+    colour2: app_commands.Choice[str] = None,
+    roleicon: discord.Attachment = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_premium_access(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    if not team_key:
+        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+        return
+
+    if not any([colour1, colour2, roleicon]):
+        await interaction.followup.send(
+            "You didn't specify anything to change. Provide `colour1`, `colour2`, and/or `roleicon`.",
+            ephemeral=True,
+        )
+        return
+
+    if roleicon is not None and not (roleicon.content_type or "").startswith("image/"):
+        await interaction.followup.send("`roleicon` needs to be an image file.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+    role = interaction.guild.get_role(info["role_id"])
+    channel = interaction.guild.get_channel(info["channel_id"])
+    if role is None:
+        await interaction.followup.send("That team's role no longer exists.", ephemeral=True)
+        return
+
+    role_edit_kwargs = {}
+    if colour1:
+        role_edit_kwargs["colour"] = discord.Colour.from_str(colour1.value)
+    if colour2:
+        role_edit_kwargs["secondary_colour"] = discord.Colour.from_str(colour2.value)
+
+    icon_warning = None
+    if roleicon is not None:
+        temp_emoji = None
+        try:
+            image_bytes = await roleicon.read()
+            safe_name = re.sub(r"[^A-Za-z0-9_]", "", team_key)[:20] or "team"
+            temp_emoji = await interaction.guild.create_custom_emoji(
+                name=f"tmp_{safe_name}"[:32],
+                image=image_bytes,
+                reason="Temporary emoji used to process a premium role icon",
+            )
+            processed_bytes = await temp_emoji.read()
+            role_edit_kwargs["display_icon"] = processed_bytes
+        except discord.HTTPException:
+            icon_warning = "couldn't process the role icon image"
+        finally:
+            if temp_emoji is not None:
+                try:
+                    await temp_emoji.delete(reason="Cleanup after setting premium role icon")
+                except discord.HTTPException:
+                    pass
+
+    gradient_warning = None
+    if role_edit_kwargs:
+        try:
+            await role.edit(reason=f"Premium settings changed by {interaction.user}", **role_edit_kwargs)
+        except discord.HTTPException:
+            # Gradients and role icons need a certain server boost level; fall back to just the
+            # primary colour rather than losing the whole update.
+            fallback_kwargs = {}
+            if "colour" in role_edit_kwargs:
+                fallback_kwargs["colour"] = role_edit_kwargs["colour"]
+            if fallback_kwargs:
+                try:
+                    await role.edit(
+                        reason=f"Premium settings changed by {interaction.user}", **fallback_kwargs
+                    )
+                    gradient_warning = (
+                        "some of those changes need a higher server boost level and weren't applied"
+                    )
+                except discord.HTTPException:
+                    await interaction.followup.send(
+                        "Couldn't apply those changes — Discord rejected the request.", ephemeral=True
+                    )
+                    return
+            else:
+                await interaction.followup.send(
+                    "Couldn't apply those changes — Discord rejected the request.", ephemeral=True
+                )
+                return
+
+    first_activation = not info.get("premium", False)
+    if first_activation:
+        info["premium"] = True
+        if channel:
+            try:
+                await channel.send(
+                    "<:Camera:1528219214345666621> **Premium Activated!** "
+                    "<:CompanyCoins:1528218837030535394>"
+                )
+            except discord.HTTPException:
+                pass
+
+    premium_marker_role = interaction.guild.get_role(PREMIUM_ROLE_ID)
+    if premium_marker_role is not None:
+        try:
+            await role.edit(
+                position=premium_marker_role.position + 1,
+                reason="Keep premium team role above the premium marker role",
+            )
+        except discord.HTTPException:
+            pass
+
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    changes = []
+    if colour1:
+        changes.append(f"colour1 → {colour1.name}")
+    if colour2:
+        changes.append(f"colour2 → {colour2.name}")
+    if roleicon is not None and "display_icon" in role_edit_kwargs:
+        changes.append("icon updated")
+
+    message = (
+        f"✨ Updated **{team_key}**'s premium styling: " + ", ".join(changes)
+        if changes
+        else f"✨ Premium settings applied for **{team_key}**."
+    )
+    if icon_warning:
+        message += f"\n⚠️ {icon_warning.capitalize()}."
+    if gradient_warning:
+        message += f"\n⚠️ {gradient_warning.capitalize()}."
+    await interaction.followup.send(message, ephemeral=True)
 
 
 @bot.tree.command(
