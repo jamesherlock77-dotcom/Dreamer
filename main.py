@@ -488,18 +488,43 @@ class TournamentSubmissionModal(discord.ui.Modal):
         )
 
 
-class TournamentTeamSelectView(discord.ui.View):
-    """The dropdown panel itself. Discord caps select menus at 25 options, so only the
-    first 25 teams (alphabetically) are listed if there are more than that."""
+TOURNAMENT_TEAMS_PER_PAGE = 25
+_TOURNAMENT_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
 
-    def __init__(self, team_names: list = None):
+
+class TournamentTeamSelectView(discord.ui.View):
+    """The dropdown panel itself. Discord caps select menus at 25 options, so teams are
+    split across pages of 25 with Prev/Next buttons once there are more than that.
+
+    Current page isn't kept on the view instance — it's read back from the live message's
+    select placeholder (e.g. "... (page 2/3)") whenever Prev/Next is pressed, since a
+    persistent view's registered instance is shared across every message using it and
+    can't hold per-message state that survives a restart."""
+
+    def __init__(self, team_names: list = None, page: int = 0, keep_nav_buttons: bool = False):
         super().__init__(timeout=None)
-        options = [
-            discord.SelectOption(label=name[:100], value=name[:100]) for name in (team_names or [])
-        ][:25]
+        all_names = list(team_names or [])
+        total_pages = max(1, -(-len(all_names) // TOURNAMENT_TEAMS_PER_PAGE)) if all_names else 1
+        page = max(0, min(page, total_pages - 1))
+        start = page * TOURNAMENT_TEAMS_PER_PAGE
+        page_names = all_names[start:start + TOURNAMENT_TEAMS_PER_PAGE]
+
+        options = [discord.SelectOption(label=name[:100], value=name[:100]) for name in page_names]
         if not options:
             options = [discord.SelectOption(label="No teams yet", value="__none__")]
         self.team_select.options = options
+
+        placeholder = "Select a team..."
+        if total_pages > 1:
+            placeholder += f" (page {page + 1}/{total_pages})"
+        self.team_select.placeholder = placeholder
+
+        if total_pages <= 1 and not keep_nav_buttons:
+            self.remove_item(self.prev_page)
+            self.remove_item(self.next_page)
+        else:
+            self.prev_page.disabled = page <= 0
+            self.next_page.disabled = page >= total_pages - 1
 
     @discord.ui.select(
         placeholder="Select a team...",
@@ -521,6 +546,28 @@ class TournamentTeamSelectView(discord.ui.View):
 
         await interaction.response.send_modal(TournamentSubmissionModal(team_name))
 
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="tournament_team_prev_page", row=1)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, -1)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="tournament_team_next_page", row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, 1)
+
+    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
+        current_page = 0
+        for row in interaction.message.components:
+            for component in row.children:
+                if getattr(component, "custom_id", None) == "tournament_team_select":
+                    match = _TOURNAMENT_PAGE_RE.search(component.placeholder or "")
+                    if match:
+                        current_page = int(match.group(1)) - 1
+
+        db = load_db()
+        team_names = sorted(db["teams"].keys())
+        new_view = TournamentTeamSelectView(team_names, page=current_page + delta)
+        await interaction.response.edit_message(view=new_view)
+
 
 async def refresh_tournament_panel():
     """Deletes any previously posted tournament panel in the target channel and posts a
@@ -537,12 +584,13 @@ async def refresh_tournament_panel():
 
     db = load_db()
     team_names = sorted(db["teams"].keys())
-    if len(team_names) > 25:
-        print(f"Tournament panel: {len(team_names)} teams exist but only 25 fit in the dropdown.")
 
     embed = discord.Embed(
         title=TOURNAMENT_PANEL_TITLE,
-        description="Select your team below to submit your competitors and backups for the tournament.",
+        description=(
+            "Select your team below to submit your competitors and backups for the tournament.\n"
+            "Use Prev/Next to page through teams if there are more than 25."
+        ),
         colour=discord.Colour.gold(),
     )
     await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
@@ -1726,7 +1774,7 @@ async def changeteamsettings(
 async def on_ready():
     await restore_db_from_log_channel()
     bot.add_view(SupportPanelView())
-    bot.add_view(TournamentTeamSelectView())
+    bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
     await bot.tree.sync()
     try:
