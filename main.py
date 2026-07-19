@@ -30,6 +30,7 @@ CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-ex
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
+TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 
 DB_FILE = "teams.json"
 
@@ -300,6 +301,251 @@ async def refresh_support_ticket_panel():
     embed = build_support_ticket_embed()
     file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
     await channel.send(embed=embed, file=file, view=view)
+
+
+# ---------- Tournament submission panel ----------
+TOURNAMENT_PANEL_TITLE = "Tournament Submissions"
+TOURNAMENT_COMPETITOR_EMOJI = "<:SilverTrophy:1528216893297791098>"
+TOURNAMENT_SUB_EMOJI = "<:Revolver:1528216974973210747>"
+
+# Matches a slot line like "`1.` " (empty) or "`1.` <@123456789012345678>" (filled)
+_TOURNAMENT_SLOT_LINE_RE = re.compile(r"^`(\d+)\.`\s*(?:<@!?(\d+)>)?\s*$")
+
+
+def build_tournament_submission_content(
+    competitor_count: int, sub_count: int, competitors: list = None, subs: list = None
+) -> str:
+    """Builds the '**Tournament Submission**' message body. `competitors`/`subs` are lists of
+    user IDs (or None for an empty slot); if omitted, all slots start empty."""
+    competitors = list(competitors) if competitors is not None else [None] * competitor_count
+    subs = list(subs) if subs is not None else [None] * sub_count
+
+    lines = ["**Tournament Submission**", f"{TOURNAMENT_COMPETITOR_EMOJI} Competitors :"]
+    for i in range(competitor_count):
+        filler = f"<@{competitors[i]}>" if i < len(competitors) and competitors[i] else ""
+        lines.append(f"`{i + 1}.` {filler}".rstrip())
+
+    lines.append(f"{TOURNAMENT_SUB_EMOJI}  Subs :")
+    for i in range(sub_count):
+        filler = f"<@{subs[i]}>" if i < len(subs) and subs[i] else ""
+        lines.append(f"`{i + 1}.` {filler}".rstrip())
+
+    return "\n".join(lines)
+
+
+def parse_tournament_submission_content(content: str):
+    """Reads a tournament submission message back into (competitor_ids, sub_ids) lists,
+    where each entry is a user ID or None for an empty slot."""
+    competitors, subs = [], []
+    section = None
+    for line in content.split("\n"):
+        if line.startswith(TOURNAMENT_COMPETITOR_EMOJI):
+            section = "competitors"
+            continue
+        if line.startswith(TOURNAMENT_SUB_EMOJI):
+            section = "subs"
+            continue
+        match = _TOURNAMENT_SLOT_LINE_RE.match(line)
+        if not match:
+            continue
+        user_id = int(match.group(2)) if match.group(2) else None
+        if section == "competitors":
+            competitors.append(user_id)
+        elif section == "subs":
+            subs.append(user_id)
+    return competitors, subs
+
+
+class TournamentSubmissionView(discord.ui.View):
+    """Attached to each '**Tournament Submission**' message. Reads/writes its state straight
+    from the message content, so it works for any number of these messages with one
+    persistent, restart-proof view."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _update_signup(self, interaction: discord.Interaction, target: str):
+        message = interaction.message
+        competitors, subs = parse_tournament_submission_content(message.content)
+        user_id = interaction.user.id
+        in_competitors = user_id in competitors
+        in_subs = user_id in subs
+
+        if target == "remove":
+            if not in_competitors and not in_subs:
+                await interaction.response.send_message(
+                    "You're not currently signed up on this sheet.", ephemeral=True
+                )
+                return
+            if in_competitors:
+                competitors[competitors.index(user_id)] = None
+            if in_subs:
+                subs[subs.index(user_id)] = None
+        else:
+            target_list = competitors if target == "competitors" else subs
+            label = "competitor" if target == "competitors" else "sub"
+
+            if user_id in target_list:
+                await interaction.response.send_message(
+                    f"You're already signed up as a {label}.", ephemeral=True
+                )
+                return
+            if None not in target_list:
+                await interaction.response.send_message(
+                    f"There are no open {label} slots.", ephemeral=True
+                )
+                return
+
+            # moving from the other list, if they were on it
+            if in_competitors:
+                competitors[competitors.index(user_id)] = None
+            if in_subs:
+                subs[subs.index(user_id)] = None
+
+            target_list[target_list.index(None)] = user_id
+
+        new_content = build_tournament_submission_content(len(competitors), len(subs), competitors, subs)
+        await interaction.response.edit_message(content=new_content)
+
+    @discord.ui.button(
+        label="Competitors", style=discord.ButtonStyle.primary, custom_id="tournament_submission_competitors"
+    )
+    async def competitors_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update_signup(interaction, "competitors")
+
+    @discord.ui.button(
+        label="Subs", style=discord.ButtonStyle.primary, custom_id="tournament_submission_subs"
+    )
+    async def subs_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update_signup(interaction, "subs")
+
+    @discord.ui.button(
+        label="Remove", style=discord.ButtonStyle.danger, custom_id="tournament_submission_remove"
+    )
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update_signup(interaction, "remove")
+
+    @discord.ui.button(
+        label="Submit", style=discord.ButtonStyle.success, custom_id="tournament_submission_submit"
+    )
+    async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Not wired up to anything yet.
+        await interaction.response.defer()
+
+
+class TournamentSubmissionModal(discord.ui.Modal):
+    def __init__(self, team_name: str):
+        super().__init__(title=f"Tournament Submission — {team_name}"[:45])
+        self.team_name = team_name
+        self.competitors_input = discord.ui.TextInput(
+            label="How much competitors?", placeholder="e.g. 5", max_length=3
+        )
+        self.backups_input = discord.ui.TextInput(
+            label="How much backups?", placeholder="e.g. 2", max_length=3
+        )
+        self.add_item(self.competitors_input)
+        self.add_item(self.backups_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        competitors_raw = self.competitors_input.value.strip()
+        backups_raw = self.backups_input.value.strip()
+
+        if not competitors_raw.isdigit() or not backups_raw.isdigit():
+            await interaction.response.send_message(
+                "Both fields need to be whole numbers.", ephemeral=True
+            )
+            return
+
+        competitor_count = int(competitors_raw)
+        backup_count = int(backups_raw)
+
+        if not (1 <= competitor_count <= 50) or not (0 <= backup_count <= 50):
+            await interaction.response.send_message(
+                "Use a competitor count between 1–50 and a backup count between 0–50.", ephemeral=True
+            )
+            return
+
+        db = load_db()
+        info = db["teams"].get(self.team_name)
+        if info is None:
+            await interaction.response.send_message(
+                "That team no longer exists — the panel may be out of date.", ephemeral=True
+            )
+            return
+
+        channel = interaction.guild.get_channel(info["channel_id"])
+        if channel is None:
+            await interaction.response.send_message(
+                "That team's channel no longer exists.", ephemeral=True
+            )
+            return
+
+        content = build_tournament_submission_content(competitor_count, backup_count)
+        await channel.send(content=content, view=TournamentSubmissionView())
+
+        await interaction.response.send_message(
+            f"Tournament submission sheet posted in {channel.mention}.", ephemeral=True
+        )
+
+
+class TournamentTeamSelectView(discord.ui.View):
+    """The dropdown panel itself. Discord caps select menus at 25 options, so only the
+    first 25 teams (alphabetically) are listed if there are more than that."""
+
+    def __init__(self, team_names: list = None):
+        super().__init__(timeout=None)
+        options = [
+            discord.SelectOption(label=name[:100], value=name[:100]) for name in (team_names or [])
+        ][:25]
+        if not options:
+            options = [discord.SelectOption(label="No teams yet", value="__none__")]
+        self.team_select.options = options
+
+    @discord.ui.select(
+        placeholder="Select a team...",
+        custom_id="tournament_team_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        team_name = select.values[0]
+        if team_name == "__none__":
+            await interaction.response.send_message("There are no teams yet.", ephemeral=True)
+            return
+
+        db = load_db()
+        if team_name not in db["teams"]:
+            await interaction.response.send_message(
+                "That team no longer exists — the panel may be out of date.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(TournamentSubmissionModal(team_name))
+
+
+async def refresh_tournament_panel():
+    """Deletes any previously posted tournament panel in the target channel and posts a
+    fresh one listing the current teams. Called on every bot startup so the panel never
+    goes stale or duplicates across restarts."""
+    channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+
+    db = load_db()
+    team_names = sorted(db["teams"].keys())
+    if len(team_names) > 25:
+        print(f"Tournament panel: {len(team_names)} teams exist but only 25 fit in the dropdown.")
+
+    embed = discord.Embed(
+        title=TOURNAMENT_PANEL_TITLE,
+        description="Select your team below to submit your competitors and backups for the tournament.",
+        colour=discord.Colour.gold(),
+    )
+    await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
 
 
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
@@ -1480,6 +1726,8 @@ async def changeteamsettings(
 async def on_ready():
     await restore_db_from_log_channel()
     bot.add_view(SupportPanelView())
+    bot.add_view(TournamentTeamSelectView())
+    bot.add_view(TournamentSubmissionView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
@@ -1489,6 +1737,10 @@ async def on_ready():
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
+    try:
+        await refresh_tournament_panel()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh tournament panel: {e}")
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
