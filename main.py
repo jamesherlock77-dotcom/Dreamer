@@ -121,21 +121,20 @@ def _extract_oculus_display_version(entry: dict):
     return entry.get("version") or entry.get("versionCode")
 
 
-def _format_release_timestamp(entry: dict) -> str:
-    """Builds a human-readable 'Time of Live Release' string from the entry's upload or release date.
-    Falls back to the current time if no timestamp is found."""
+def _extract_release_timestamp(entry: dict):
+    """Returns a Unix epoch int from the entry's release/upload date, or the current time."""
     from datetime import datetime, timezone
     ts = entry.get("uploadDate") or entry.get("lastPublishedDate") or entry.get("created")
     if ts:
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return dt.strftime("%A, %d %B %Y at %H:%M")
+            return int(dt.timestamp())
         except (ValueError, TypeError):
             pass
-    return datetime.now(timezone.utc).strftime("%A, %d %B %Y at %H:%M")
+    return int(datetime.now(timezone.utc).timestamp())
 
 
-def _build_update_embed(display_version, version_code, previous_version=None, release_time=None):
+def _build_update_embed(display_version, version_code, previous_version=None, release_ts=None):
     """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style."""
     embed = discord.Embed(
         title="AC: Arena Hub",
@@ -159,11 +158,11 @@ def _build_update_embed(display_version, version_code, previous_version=None, re
             inline=False,
         )
 
-    # Time of release
-    if release_time:
+    # Time of release — Discord timestamp renders per-user timezone
+    if release_ts:
         embed.add_field(
             name="⏰ Time of Live Release:",
-            value=release_time,
+            value=f"<t:{release_ts}:F>\n(<t:{release_ts}:R>)",
             inline=False,
         )
 
@@ -222,7 +221,7 @@ async def check_oculus_updates():
     ) if state.get("previous_version_code") else None
 
     display_version = _extract_oculus_display_version(latest_entry)
-    release_time = _format_release_timestamp(latest_entry)
+    release_ts = _extract_release_timestamp(latest_entry)
 
     # Build the "previous version" display string from what we know
     prev_display = state.get("previous_version_code") or str(last_seen)
@@ -238,7 +237,7 @@ async def check_oculus_updates():
         display_version=display_version,
         version_code=latest_version_code,
         previous_version=prev_display,
-        release_time=release_time,
+        release_ts=release_ts,
     )
 
     # Send with support banner image if available
@@ -2192,7 +2191,7 @@ async def testupdate(interaction: discord.Interaction):
 
     display_version = _extract_oculus_display_version(latest_entry)
     version_code = _extract_oculus_version_code(latest_entry)
-    release_time = _format_release_timestamp(latest_entry)
+    release_ts = _extract_release_timestamp(latest_entry)
 
     state = load_oculus_version_state()
     previous_display = state.get("previous_version_code") or "Unknown"
@@ -2201,7 +2200,7 @@ async def testupdate(interaction: discord.Interaction):
         display_version=display_version,
         version_code=version_code,
         previous_version=previous_display,
-        release_time=release_time,
+        release_ts=release_ts,
     )
 
     file = None
