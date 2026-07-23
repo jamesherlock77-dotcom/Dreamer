@@ -47,6 +47,7 @@ OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update an
 OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
 OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_ID}?onlydownloadable=true"
 OCULUS_VERSION_FILE = "oculus_version.json"  # tracks the last version we've already announced
+META_UPDATE_EMOJI = "<:Meta:1528228318510452786>"
 
 DB_FILE = "teams.json"
 
@@ -382,27 +383,32 @@ def save_db(data: dict) -> None:
 
 # ---------- Meta Quest Store update tracker (Animal Company, via OculusDB's public API) ----------
 def load_oculus_version_state() -> dict:
-    """Load persisted version state. Returns {"current_version_code": ..., "previous_version_code": ...}.
-    Backward-compatible: if the file only has the old flat format, current is used and previous is None."""
+    """Load persisted version state. Returns {"current_version_code": ..., "previous_display_version": ...}.
+    Backward-compatible with older files that stored "last_version_code" or "previous_version_code"."""
     if not os.path.exists(OCULUS_VERSION_FILE):
-        return {"current_version_code": None, "previous_version_code": None}
+        return {"current_version_code": None, "previous_display_version": None}
     try:
         with open(OCULUS_VERSION_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return {
-                "current_version_code": data.get("last_version_code") or data.get("current_version_code"),
-                "previous_version_code": data.get("previous_version_code"),
+                "current_version_code": data.get("current_version_code") or data.get("last_version_code"),
+                "previous_display_version": data.get("previous_display_version")
+                or data.get("previous_version_code")
+                or data.get("last_display_version"),
             }
-        return {"current_version_code": None, "previous_version_code": None}
+        return {"current_version_code": None, "previous_display_version": None}
     except (json.JSONDecodeError, OSError):
-        return {"current_version_code": None, "previous_version_code": None}
+        return {"current_version_code": None, "previous_display_version": None}
 
 
-def save_oculus_version_state(current_version_code, previous_version_code=None) -> None:
+def save_oculus_version_state(current_version_code, previous_display_version=None) -> None:
     with open(OCULUS_VERSION_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"current_version_code": current_version_code, "previous_version_code": previous_version_code},
+            {
+                "current_version_code": current_version_code,
+                "previous_display_version": previous_display_version,
+            },
             f,
         )
 
@@ -445,43 +451,43 @@ def _extract_release_timestamp(entry: dict):
     return int(datetime.now(timezone.utc).timestamp())
 
 
-def _build_update_embed(display_version, version_code, previous_version=None, release_ts=None):
-    """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style."""
+def _build_update_embed(display_version, previous_version=None, release_ts=None):
+    """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style:
+    title, a Meta-emoji header, updated/last-logged version blocks, time of release,
+    and the support banner image — with a live "Checked at ... UTC" footer/timestamp."""
+    from datetime import datetime, timezone
+
     embed = discord.Embed(
         title="AC: Arena Hub",
+        description=f"{META_UPDATE_EMOJI} **Meta Update Detected**",
         colour=discord.Colour.orange(),
     )
-    embed.add_field(name="<:Meta:1528228318510452786> Meta Update Detected", value="", inline=False)
-    embed.add_field(name="LIVE Build", value="", inline=False)
 
-    # Green dot — updated version
     embed.add_field(
         name="🟢 Updated Version:",
         value=f"```\n{display_version}\n```",
         inline=False,
     )
 
-    # Red dot — last logged
-    if previous_version:
-        embed.add_field(
-            name="🔴 Last Logged:",
-            value=f"```\n{previous_version}\n```",
-            inline=False,
-        )
+    embed.add_field(
+        name="🔴 Last Logged:",
+        value=f"```\n{previous_version if previous_version else 'N/A'}\n```",
+        inline=False,
+    )
 
-    # Time of release — Discord timestamp renders per-user timezone
     if release_ts:
         embed.add_field(
-            name="⏰ Time of Live Release:",
+            name="🕒 Time of Live Release:",
             value=f"<t:{release_ts}:F>\n(<t:{release_ts}:R>)",
             inline=False,
         )
 
-    # Support banner as image
     if os.path.exists(SUPPORT_BANNER_PATH):
         embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
 
-    embed.set_footer(text="Animal Company: Arena Hub")
+    checked_at = datetime.now(timezone.utc)
+    embed.timestamp = checked_at
+    embed.set_footer(text=f"Checked at {checked_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     return embed
 
 
@@ -514,44 +520,29 @@ async def check_oculus_updates():
         return
 
     state = load_oculus_version_state()
-    last_seen = state["current_version_code"]
+    last_seen_code = state["current_version_code"]
 
-    if last_seen is None:
-        # First run — record baseline without announcing
-        save_oculus_version_state(latest_version_code)
+    if last_seen_code is None:
+        # First run — record baseline without announcing, so a restart never looks like a
+        # fake "update".
+        display_version = _extract_oculus_display_version(latest_entry)
+        save_oculus_version_state(latest_version_code, display_version)
         return
 
-    if str(latest_version_code) == str(last_seen):
+    if str(latest_version_code) == str(last_seen_code):
         return  # no change
-
-    # New version detected — build the announcement
-    previous_version = _extract_oculus_display_version(
-        # We don't have the full previous entry, so use the stored display version if available,
-        # otherwise show the raw code
-        {"version": state.get("previous_version_code") or last_seen}
-    ) if state.get("previous_version_code") else None
 
     display_version = _extract_oculus_display_version(latest_entry)
     release_ts = _extract_release_timestamp(latest_entry)
-
-    # Build the "previous version" display string from what we know
-    prev_display = state.get("previous_version_code") or str(last_seen)
-    # If previous_version_code was stored as a display string, use it; otherwise use the code
-    if state.get("previous_version_code"):
-        prev_display = state["previous_version_code"]
-    else:
-        prev_display = str(last_seen)
+    previous_display = state.get("previous_display_version") or str(last_seen_code)
 
     channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
-
     embed = _build_update_embed(
         display_version=display_version,
-        version_code=latest_version_code,
-        previous_version=prev_display,
+        previous_version=previous_display,
         release_ts=release_ts,
     )
 
-    # Send with support banner image if available
     file = None
     if os.path.exists(SUPPORT_BANNER_PATH):
         file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
@@ -561,10 +552,10 @@ async def check_oculus_updates():
     else:
         await channel.send(embed=embed)
 
-    # Save new state
+    # The new display version becomes "previous" the next time an update fires.
     save_oculus_version_state(
         current_version_code=latest_version_code,
-        previous_version_code=display_version,
+        previous_display_version=display_version,
     )
 
 
@@ -1377,7 +1368,34 @@ class BracketPanelView(discord.ui.View):
         custom_id="bracket_add_participant", row=0,
     )
     async def add_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BracketAddModal())
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
+            return
+
+        if "N/A" not in bracket.participants:
+            await interaction.response.send_message("All 8 slots are full.", ephemeral=True)
+            return
+
+        # Offer a dropdown of registered teams that aren't already in the bracket, rather
+        # than free-text entry — keeps bracket entries tied to real teams and avoids typos.
+        already_in = {p.lower() for p in bracket.participants if p != "N/A"}
+        available_teams = sorted(
+            name for name in db["teams"].keys() if name.lower() not in already_in
+        )
+
+        if not available_teams:
+            await interaction.response.send_message(
+                "Every registered team is already in the bracket (or there are no teams yet).",
+                ephemeral=True,
+            )
+            return
+
+        view = BracketAddSelectView(available_teams)
+        await interaction.response.send_message(
+            "Select a team to add to the bracket:", view=view, ephemeral=True,
+        )
 
     @discord.ui.button(
         label="Remove Participant", style=discord.ButtonStyle.danger,
@@ -1479,32 +1497,34 @@ class BracketPanelView(discord.ui.View):
         )
 
 
-class BracketAddModal(discord.ui.Modal):
-    """Modal to add a team to the bracket."""
-    def __init__(self):
-        super().__init__(title="Add Team to Bracket")
-        self.team_name_input = discord.ui.TextInput(
-            label="Team name", placeholder="e.g. Squad Alpha", max_length=100,
-        )
-        self.add_item(self.team_name_input)
+class BracketAddSelectView(discord.ui.View):
+    """Ephemeral dropdown listing registered teams that aren't in the bracket yet.
+    Discord caps selects at 25 options; if there are more teams than that, only the
+    first 25 (alphabetically) are shown — same convention as the other pickers here."""
 
-    async def on_submit(self, interaction: discord.Interaction):
-        team_name = self.team_name_input.value.strip()
-        if not team_name:
-            await interaction.response.send_message("Team name can't be empty.", ephemeral=True)
-            return
+    def __init__(self, available_teams: list):
+        super().__init__(timeout=60)
+        options = [discord.SelectOption(label=name[:100], value=name) for name in available_teams[:25]]
+        self.add_select.options = options
+
+    @discord.ui.select(
+        placeholder="Select a team…",
+        custom_id="bracket_add_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def add_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        team_name = select.values[0]
 
         db = load_db()
         bracket = load_bracket(db)
         if not bracket:
-            await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
+            await interaction.response.send_message("No bracket exists.", ephemeral=True)
             return
 
         if team_name.lower() in [p.lower() for p in bracket.participants if p != "N/A"]:
             await interaction.response.send_message(f"**{team_name}** is already in the bracket.", ephemeral=True)
             return
 
-        # Find first empty slot
         slot = None
         for i, p in enumerate(bracket.participants):
             if p == "N/A":
@@ -1519,13 +1539,17 @@ class BracketAddModal(discord.ui.Modal):
         save_bracket(db, bracket)
         save_db(db)
 
-        # Refresh both channels
+        await interaction.response.defer(ephemeral=True)
+
         await _refresh_bracket_panel(interaction.guild, bracket)
-        # Generate a preview image for the confirmation
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+
         file = discord.File(BRACKET_IMAGE_PATH, filename=BRACKET_IMAGE_FILENAME)
-        await interaction.response.send_message(
-            f"✅ Added **{team_name}** to slot {slot + 1}.", file=file, ephemeral=True,
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(
+            content=f"✅ Added **{team_name}** to slot {slot + 1}.", view=self, attachments=[file],
         )
 
 
@@ -2812,7 +2836,7 @@ async def changeteamsettings(
     await interaction.followup.send(message, ephemeral=True)
 
 
-# ---------- /test command (admin-only — posts the real update embed in the update channel) ----------
+# ---------- /test command (admin-only — posts the update embed in the update channel) ----------
 @bot.tree.command(name="testupdate", description="(Admin) Post a test update embed in the update channel")
 @app_commands.default_permissions(administrator=True)
 async def testupdate(interaction: discord.Interaction):
@@ -2850,15 +2874,13 @@ async def testupdate(interaction: discord.Interaction):
         return
 
     display_version = _extract_oculus_display_version(latest_entry)
-    version_code = _extract_oculus_version_code(latest_entry)
     release_ts = _extract_release_timestamp(latest_entry)
 
     state = load_oculus_version_state()
-    previous_display = state.get("previous_version_code") or "Unknown"
+    previous_display = state.get("previous_display_version") or "N/A"
 
     embed = _build_update_embed(
         display_version=display_version,
-        version_code=version_code,
         previous_version=previous_display,
         release_ts=release_ts,
     )
