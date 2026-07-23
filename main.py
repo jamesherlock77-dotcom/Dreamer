@@ -70,19 +70,30 @@ def save_db(data: dict) -> None:
 
 
 # ---------- Meta Quest Store update tracker (Animal Company, via OculusDB's public API) ----------
-def load_last_seen_oculus_version():
+def load_oculus_version_state() -> dict:
+    """Load persisted version state. Returns {"current_version_code": ..., "previous_version_code": ...}.
+    Backward-compatible: if the file only has the old flat format, current is used and previous is None."""
     if not os.path.exists(OCULUS_VERSION_FILE):
-        return None
+        return {"current_version_code": None, "previous_version_code": None}
     try:
         with open(OCULUS_VERSION_FILE, "r", encoding="utf-8") as f:
-            return json.load(f).get("last_version_code")
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {
+                "current_version_code": data.get("last_version_code") or data.get("current_version_code"),
+                "previous_version_code": data.get("previous_version_code"),
+            }
+        return {"current_version_code": None, "previous_version_code": None}
     except (json.JSONDecodeError, OSError):
-        return None
+        return {"current_version_code": None, "previous_version_code": None}
 
 
-def save_last_seen_oculus_version(version_code) -> None:
+def save_oculus_version_state(current_version_code, previous_version_code=None) -> None:
     with open(OCULUS_VERSION_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_version_code": version_code}, f)
+        json.dump(
+            {"current_version_code": current_version_code, "previous_version_code": previous_version_code},
+            f,
+        )
 
 
 def _extract_latest_oculus_version_entry(payload):
@@ -108,6 +119,60 @@ def _extract_oculus_display_version(entry: dict):
     """version (e.g. "1.82.2.3211") is the human-readable string shown in the announcement.
     Falls back to the version code if it's ever missing."""
     return entry.get("version") or entry.get("versionCode")
+
+
+def _format_release_timestamp(entry: dict) -> str:
+    """Builds a human-readable 'Time of Live Release' string from the entry's upload or release date.
+    Falls back to the current time if no timestamp is found."""
+    from datetime import datetime, timezone
+    ts = entry.get("uploadDate") or entry.get("lastPublishedDate") or entry.get("created")
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.strftime("%A, %d %B %Y at %H:%M")
+        except (ValueError, TypeError):
+            pass
+    return datetime.now(timezone.utc).strftime("%A, %d %B %Y at %H:%M")
+
+
+def _build_update_embed(display_version, version_code, previous_version=None, release_time=None):
+    """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style."""
+    embed = discord.Embed(
+        title="AC: Arena Hub",
+        colour=discord.Colour.orange(),
+    )
+    embed.add_field(name="<:Meta:1528228318510452786> Meta Update Detected", value="", inline=False)
+    embed.add_field(name="LIVE Build", value="", inline=False)
+
+    # Green dot — updated version
+    embed.add_field(
+        name="🟢 Updated Version:",
+        value=f"```\n{display_version}\n```",
+        inline=False,
+    )
+
+    # Red dot — last logged
+    if previous_version:
+        embed.add_field(
+            name="🔴 Last Logged:",
+            value=f"```\n{previous_version}\n```",
+            inline=False,
+        )
+
+    # Time of release
+    if release_time:
+        embed.add_field(
+            name="⏰ Time of Live Release:",
+            value=release_time,
+            inline=False,
+        )
+
+    # Support banner as image
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+
+    embed.set_footer(text="Animal Company: Arena Hub")
+    return embed
 
 
 @tasks.loop(hours=1)
@@ -138,27 +203,59 @@ async def check_oculus_updates():
         print(f"Oculus update check: couldn't find versionCode in entry: {latest_entry}")
         return
 
-    last_seen = load_last_seen_oculus_version()
+    state = load_oculus_version_state()
+    last_seen = state["current_version_code"]
+
     if last_seen is None:
-        # First run (or first run after a redeploy without a persisted value) — just record
-        # the baseline instead of announcing, so a restart never looks like a fake "update".
-        save_last_seen_oculus_version(latest_version_code)
+        # First run — record baseline without announcing
+        save_oculus_version_state(latest_version_code)
         return
 
     if str(latest_version_code) == str(last_seen):
         return  # no change
 
-    save_last_seen_oculus_version(latest_version_code)
+    # New version detected — build the announcement
+    previous_version = _extract_oculus_display_version(
+        # We don't have the full previous entry, so use the stored display version if available,
+        # otherwise show the raw code
+        {"version": state.get("previous_version_code") or last_seen}
+    ) if state.get("previous_version_code") else None
 
     display_version = _extract_oculus_display_version(latest_entry)
+    release_time = _format_release_timestamp(latest_entry)
+
+    # Build the "previous version" display string from what we know
+    prev_display = state.get("previous_version_code") or str(last_seen)
+    # If previous_version_code was stored as a display string, use it; otherwise use the code
+    if state.get("previous_version_code"):
+        prev_display = state["previous_version_code"]
+    else:
+        prev_display = str(last_seen)
+
     channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
-    embed = discord.Embed(
-        title="🦴 Animal Company updated!",
-        description=f"New version detected: **{display_version}** (build {latest_version_code})",
-        colour=discord.Colour.blurple(),
+
+    embed = _build_update_embed(
+        display_version=display_version,
+        version_code=latest_version_code,
+        previous_version=prev_display,
+        release_time=release_time,
     )
-    embed.set_footer(text="Source: OculusDB (unofficial, community-run)")
-    await channel.send(embed=embed)
+
+    # Send with support banner image if available
+    file = None
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+
+    if file:
+        await channel.send(embed=embed, file=file)
+    else:
+        await channel.send(embed=embed)
+
+    # Save new state
+    save_oculus_version_state(
+        current_version_code=latest_version_code,
+        previous_version_code=display_version,
+    )
 
 
 @check_oculus_updates.before_loop
@@ -2004,7 +2101,8 @@ async def changeteamsettings(
                 if role_edit_kwargs:
                     try:
                         await role.edit(
-                            reason=f"Team settings changed by {interaction.user}", **role_edit_kwargs
+                            reason=f"Team settings changed by {interaction.user}",
+                            **role_edit_kwargs,
                         )
                     except discord.HTTPException:
                         await interaction.followup.send(
@@ -2054,6 +2152,40 @@ async def changeteamsettings(
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
     await interaction.followup.send(message, ephemeral=True)
 
+
+# ---------- /test command (admin-only preview of the update embed) ----------
+@bot.tree.command(name="testupdate", description="(Admin) Preview the latest Animal Company update embed")
+@app_commands.default_permissions(administrator=True)
+async def testupdate(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Only admins can use this command.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    state = load_oculus_version_state()
+    current_code = state.get("current_version_code")
+    previous_display = state.get("previous_version_code") or "Unknown"
+
+    display_version = str(current_code) if current_code else "Unknown"
+
+    embed = _build_update_embed(
+        display_version=display_version,
+        version_code=current_code,
+        previous_version=previous_display,
+        release_time="Preview — not a real update",
+    )
+
+    file = None
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+
+    if file:
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.event
