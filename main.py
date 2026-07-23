@@ -175,7 +175,7 @@ def _build_update_embed(display_version, version_code, previous_version=None, re
     return embed
 
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=10)
 async def check_oculus_updates():
     if not OCULUS_UPDATE_CHANNEL_ID:
         return  # not configured yet
@@ -2153,8 +2153,8 @@ async def changeteamsettings(
     await interaction.followup.send(message, ephemeral=True)
 
 
-# ---------- /test command (admin-only preview of the update embed) ----------
-@bot.tree.command(name="testupdate", description="(Admin) Preview the latest Animal Company update embed")
+# ---------- /test command (admin-only — posts the real update embed in the update channel) ----------
+@bot.tree.command(name="testupdate", description="(Admin) Post a test update embed in the update channel")
 @app_commands.default_permissions(administrator=True)
 async def testupdate(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -2165,27 +2165,59 @@ async def testupdate(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    state = load_oculus_version_state()
-    current_code = state.get("current_version_code")
-    previous_display = state.get("previous_version_code") or "Unknown"
+    # Hit the live API so the embed shows real, current data
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                OCULUS_VERSIONS_URL, timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status != 200:
+                    await interaction.followup.send(
+                        f"API request failed (HTTP {response.status}).", ephemeral=True
+                    )
+                    return
+                payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        await interaction.followup.send(
+            f"API request failed: {e}", ephemeral=True
+        )
+        return
 
-    display_version = str(current_code) if current_code else "Unknown"
+    latest_entry = _extract_latest_oculus_version_entry(payload)
+    if latest_entry is None:
+        await interaction.followup.send(
+            "No version entries found in the API response.", ephemeral=True
+        )
+        return
+
+    display_version = _extract_oculus_display_version(latest_entry)
+    version_code = _extract_oculus_version_code(latest_entry)
+    release_time = _format_release_timestamp(latest_entry)
+
+    state = load_oculus_version_state()
+    previous_display = state.get("previous_version_code") or "Unknown"
 
     embed = _build_update_embed(
         display_version=display_version,
-        version_code=current_code,
+        version_code=version_code,
         previous_version=previous_display,
-        release_time="Preview — not a real update",
+        release_time=release_time,
     )
 
     file = None
     if os.path.exists(SUPPORT_BANNER_PATH):
         file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
 
+    channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
+
     if file:
-        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+        await channel.send(embed=embed, file=file)
     else:
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await channel.send(embed=embed)
+
+    await interaction.followup.send(
+        f"Test update posted in {channel.mention}.", ephemeral=True
+    )
 
 
 @bot.event
