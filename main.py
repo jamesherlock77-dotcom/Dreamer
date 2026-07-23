@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 import os
 import io
 import re
 import json
 import logging
+import math as _math
+import textwrap as _textwrap
+from dataclasses import dataclass, field as _field
+from typing import Optional as _Optional
+
 import aiohttp
 import emoji as emoji_lib
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from PIL import Image, ImageDraw, ImageFont
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
 # the interaction (e.g. the user typed another character before the bot replied).
@@ -33,6 +41,8 @@ TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, curre
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
+BRACKET_PANEL_CHANNEL_ID = 1529840551049040025   # the bracket control panel lives here
+BRACKET_PUBLIC_CHANNEL_ID = 1529826078787637320  # the public bracket image is posted/edited here
 OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
 OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
 OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_ID}?onlydownloadable=true"
@@ -43,6 +53,307 @@ DB_FILE = "teams.json"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
+BRACKET_IMAGE_PATH = os.path.join(BASE_DIR, "bracket.png")
+BRACKET_IMAGE_FILENAME = "bracket.png"
+
+
+# ============================================================
+# BRACKET — State, image generation, and DB helpers
+# ============================================================
+
+BRACKET_TOTAL_SLOTS = 8
+BRACKET_ROUNDS = 3  # round1 (4 matches) → round2 (2) → finals (1)
+
+# Bracket image layout
+IMG_PAD_LEFT = 40
+IMG_PAD_TOP = 60
+IMG_PAD_BOTTOM = 40
+IMG_PAD_RIGHT = 60
+BOX_W = 180
+BOX_H = 40
+BOX_GAP = 10
+ROUND_GAP = 300
+LABEL_H = 22
+ROUND_LABEL_H = 30
+
+# Bracket colours (RGB)
+COL_BG = (30, 30, 40)
+COL_ROUND_LABEL = (120, 130, 150)
+COL_MATCH_LABEL = (90, 100, 115)
+COL_SLOT_EMPTY_BG = (50, 52, 60)
+COL_SLOT_TEAM_BG = (55, 60, 75)
+COL_SLOT_BORDER = (75, 80, 95)
+COL_WINNER_BG = (45, 120, 65)
+COL_WINNER_BORDER = (70, 180, 95)
+COL_TEXT_EMPTY = (100, 105, 115)
+COL_TEXT_TEAM = (220, 225, 235)
+COL_TEXT_WINNER = (255, 255, 255)
+COL_TEXT_PLACEHOLDER = (90, 95, 110)
+COL_LINE = (70, 75, 90)
+
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+]
+
+_font_cache: dict = {}
+
+
+def _get_font(size: int, bold: bool = True):
+    key = ("bold" if bold else "regular", size)
+    if key in _font_cache:
+        return _font_cache[key]
+    for path in FONT_PATHS:
+        if os.path.exists(path):
+            font = ImageFont.truetype(path, size)
+            _font_cache[key] = font
+            return font
+    font = ImageFont.load_default()
+    _font_cache[key] = font
+    return font
+
+
+def _truncate(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+@dataclass
+class BracketState:
+    """Holds the full state of a single-elimination bracket (8 slots, 3 rounds)."""
+    title: str = "Tournament Bracket"
+    participants: list = _field(default_factory=lambda: ["N/A"] * BRACKET_TOTAL_SLOTS)
+    matches: list = _field(default_factory=lambda: [
+        [{"winner": None} for _ in range(4)],
+        [{"winner": None} for _ in range(2)],
+        [{"winner": None}],
+    ])
+
+    def _matches_in_round(self, r: int) -> int:
+        return 4 >> r
+
+    def _team_in_match(self, r: int, m: int, slot: int) -> str:
+        if r == 0:
+            idx = m * 2 + slot
+            return self.participants[idx] if idx < len(self.participants) else "N/A"
+        prev = self.matches[r - 1][m * 2 + slot]
+        winner = prev.get("winner")
+        if winner is not None:
+            return self.participants[winner] if winner < len(self.participants) else "N/A"
+        return "TBD"
+
+    def match_label(self, r: int, m: int) -> str:
+        if r == 2:
+            return "Final"
+        return f"Match {m + 1}/{self._matches_in_round(r)}"
+
+    def current_round(self) -> int:
+        for r in range(BRACKET_ROUNDS):
+            for match in self.matches[r]:
+                if match.get("winner") is None:
+                    return r
+        return BRACKET_ROUNDS - 1
+
+    def playable_matches(self) -> list:
+        r = self.current_round()
+        out = []
+        for m in range(self._matches_in_round(r)):
+            match = self.matches[r][m]
+            if match.get("winner") is not None:
+                continue
+            team_a = self._team_in_match(r, m, 0)
+            team_b = self._team_in_match(r, m, 1)
+            if team_a not in ("N/A", "TBD") and team_b not in ("N/A", "TBD"):
+                out.append((r, m))
+        return out
+
+    def set_winner(self, r: int, m: int, winner_slot: int) -> bool:
+        if r < 0 or r >= BRACKET_ROUNDS:
+            return False
+        if m < 0 or m >= self._matches_in_round(r):
+            return False
+        match = self.matches[r][m]
+        if match.get("winner") is not None:
+            return False
+        if winner_slot not in (0, 1):
+            return False
+        team_a = self._team_in_match(r, m, 0)
+        team_b = self._team_in_match(r, m, 1)
+        if team_a in ("N/A", "TBD") or team_b in ("N/A", "TBD"):
+            return False
+
+        if r == 0:
+            winner_idx = m * 2 + winner_slot
+        else:
+            chain_match = m * 2 + winner_slot
+            prev_winner = self.matches[r - 1][chain_match].get("winner")
+            if prev_winner is None:
+                return False
+            winner_idx = prev_winner
+
+        match["winner"] = winner_idx
+        if r + 1 < BRACKET_ROUNDS:
+            next_match = m // 2
+            self.matches[r + 1][next_match] = {"winner": None}
+        return True
+
+    def clear_after(self, slot: int) -> list:
+        cleared = []
+        m0 = slot // 2
+        if self.matches[0][m0].get("winner") is not None:
+            self.matches[0][m0] = {"winner": None}
+            cleared.append((0, m0))
+        m1 = m0 // 2
+        if self.matches[1][m1].get("winner") is not None:
+            self.matches[1][m1] = {"winner": None}
+            cleared.append((1, m1))
+        if self.matches[2][0].get("winner") is not None:
+            self.matches[2][0] = {"winner": None}
+            cleared.append((2, 0))
+        return cleared
+
+    def clear_all(self):
+        self.participants = ["N/A"] * BRACKET_TOTAL_SLOTS
+        self.matches = [
+            [{"winner": None} for _ in range(4)],
+            [{"winner": None} for _ in range(2)],
+            [{"winner": None}],
+        ]
+
+
+def _draw_bracket_image(state: BracketState) -> Image.Image:
+    max_per_round = max(state._matches_in_round(r) for r in range(BRACKET_ROUNDS))
+    img_w = IMG_PAD_LEFT + BRACKET_ROUNDS * BOX_W + (BRACKET_ROUNDS - 1) * ROUND_GAP + IMG_PAD_RIGHT
+    img_h = IMG_PAD_TOP + max_per_round * (2 * BOX_H + BOX_GAP + LABEL_H) + IMG_PAD_BOTTOM + ROUND_LABEL_H
+
+    img = Image.new("RGB", (img_w, img_h), COL_BG)
+    draw = ImageDraw.Draw(img)
+
+    font_label = _get_font(12, bold=False)
+    font_team = _get_font(14, bold=True)
+    font_empty = _get_font(13, bold=False)
+    font_round = _get_font(16, bold=True)
+
+    for r in range(BRACKET_ROUNDS):
+        x = IMG_PAD_LEFT + r * (BOX_W + ROUND_GAP)
+        round_names = {0: "Round 1", 1: "Round 2", 2: "Finals"}
+        draw.text(
+            (x + BOX_W // 2, IMG_PAD_TOP - 15),
+            round_names[r], fill=COL_ROUND_LABEL, font=font_round, anchor="mm",
+        )
+
+    positions = []
+
+    for r in range(BRACKET_ROUNDS):
+        n = state._matches_in_round(r)
+        total_h = n * (2 * BOX_H + BOX_GAP + LABEL_H)
+        y_offset = IMG_PAD_TOP + ROUND_LABEL_H
+        round_positions = []
+
+        for m in range(n):
+            x = IMG_PAD_LEFT + r * (BOX_W + ROUND_GAP)
+            y = y_offset + m * (2 * BOX_H + BOX_GAP + LABEL_H)
+
+            draw.text(
+                (x + BOX_W // 2, y + 4),
+                state.match_label(r, m), fill=COL_MATCH_LABEL, font=font_label, anchor="mm",
+            )
+
+            team_a = state._team_in_match(r, m, 0)
+            team_b = state._team_in_match(r, m, 1)
+            winner = state.matches[r][m].get("winner")
+
+            for slot, (team, box_y) in enumerate([(team_a, y + LABEL_H), (team_b, y + LABEL_H + BOX_H + BOX_GAP)]):
+                is_empty = team == "N/A"
+                is_tbd = team == "TBD"
+                is_winner = winner is not None and (
+                    winner < len(state.participants) and state.participants[winner] == team
+                )
+
+                if is_winner:
+                    bg, border, text_col = COL_WINNER_BG, COL_WINNER_BORDER, COL_TEXT_WINNER
+                elif is_empty or is_tbd:
+                    bg, border, text_col = COL_SLOT_EMPTY_BG, COL_SLOT_BORDER, COL_TEXT_PLACEHOLDER if is_tbd else COL_TEXT_EMPTY
+                else:
+                    bg, border, text_col = COL_SLOT_TEAM_BG, COL_SLOT_BORDER, COL_TEXT_TEAM
+
+                draw.rounded_rectangle(
+                    [x, box_y, x + BOX_W, box_y + BOX_H],
+                    radius=6, fill=bg, outline=border, width=1,
+                )
+
+                display = "N/A" if is_empty else ("TBD" if is_tbd else _truncate(team, 18))
+                font_use = font_empty if (is_empty or is_tbd) else font_team
+
+                text_bbox = draw.textbbox((0, 0), display, font=font_use)
+                text_h = text_bbox[3] - text_bbox[1]
+                ty = box_y + (BOX_H - text_h) / 2
+                draw.text((x + 10, ty), display, fill=text_col, font=font_use)
+
+            round_positions.append((x, y, BOX_W, total_h))
+        positions.append(round_positions)
+
+    for r in range(BRACKET_ROUNDS - 1):
+        n = state._matches_in_round(r)
+        for m in range(n):
+            x, y, w, _ = positions[r][m]
+            team_a = state._team_in_match(r, m, 0)
+            team_b = state._team_in_match(r, m, 1)
+            a_playable = team_a not in ("N/A", "TBD")
+            b_playable = team_b not in ("N/A", "TBD")
+            if not a_playable and not b_playable:
+                continue
+
+            box_bottom_a = y + LABEL_H + BOX_H
+            box_bottom_b = y + LABEL_H + BOX_H + BOX_GAP + BOX_H
+            mid_y = (box_bottom_a + box_bottom_b) / 2
+
+            nx, ny, _, _ = positions[r + 1][m // 2]
+            next_box_y = ny + LABEL_H + (BOX_H if (m % 2 == 1) else 0) + BOX_GAP * (m % 2)
+            next_mid_y = next_box_y + BOX_H / 2
+
+            if a_playable:
+                draw.line([(x + w, box_bottom_a), (x + w + 30, box_bottom_a)], fill=COL_LINE, width=2)
+            if b_playable:
+                draw.line([(x + w, box_bottom_b), (x + w + 30, box_bottom_b)], fill=COL_LINE, width=2)
+            if a_playable or b_playable:
+                draw.line([(x + w + 30, mid_y), (x + w + 30, next_mid_y)], fill=COL_LINE, width=2)
+                draw.line([(x + w + 30, next_mid_y), (nx, next_mid_y)], fill=COL_LINE, width=2)
+
+    return img
+
+
+def generate_bracket_image(state: BracketState, path: str) -> str:
+    img = _draw_bracket_image(state)
+    img.save(path, "PNG")
+    return path
+
+
+def load_bracket(db: dict):
+    b = db.get("bracket")
+    if not b:
+        return None
+    return BracketState(
+        title=b.get("title", "Tournament Bracket"),
+        participants=b.get("participants", ["N/A"] * BRACKET_TOTAL_SLOTS),
+        matches=b.get("matches", [
+            [{"winner": None} for _ in range(4)],
+            [{"winner": None} for _ in range(2)],
+            [{"winner": None}],
+        ]),
+    )
+
+
+def save_bracket(db: dict, state: BracketState) -> None:
+    db["bracket"] = {
+        "title": state.title,
+        "participants": state.participants,
+        "matches": state.matches,
+    }
+
 
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
@@ -976,6 +1287,355 @@ async def refresh_tournament_panel():
         colour=discord.Colour.gold(),
     )
     await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
+
+
+# ============================================================
+# BRACKET — Interactive panel, image generation, and commands
+# ============================================================
+
+BRACKET_PANEL_TITLE = "Tournament Bracket"
+
+
+def build_bracket_panel_embed(bracket: BracketState = None) -> discord.Embed:
+    """Build the bracket control panel embed."""
+    embed = discord.Embed(
+        title="🏆 " + BRACKET_PANEL_TITLE,
+        description=(
+            "Use the buttons below to manage the tournament bracket.\n"
+            "**Add** teams → **Generate** the bracket → **Pick winners** → Champion!"
+        ),
+        colour=discord.Colour.gold(),
+    )
+    if bracket:
+        slots_filled = sum(1 for p in bracket.participants if p != "N/A")
+        embed.add_field(
+            name="Status",
+            value=f"**{slots_filled}/8** teams registered",
+            inline=True,
+        )
+        playable = bracket.playable_matches()
+        if playable:
+            embed.add_field(
+                name="Ready",
+                value=f"**{len(playable)}** match(es) to resolve",
+                inline=True,
+            )
+    return embed
+
+
+async def _refresh_bracket_panel(guild: discord.Guild, bracket: BracketState = None):
+    """Delete old bracket panels in the panel channel and post a fresh one."""
+    channel = guild.get_channel(BRACKET_PANEL_CHANNEL_ID) or await guild.fetch_channel(BRACKET_PANEL_CHANNEL_ID)
+
+    async for msg in channel.history(limit=30):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == "🏆 " + BRACKET_PANEL_TITLE:
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+
+    embed = build_bracket_panel_embed(bracket)
+    view = BracketPanelView()
+    await channel.send(embed=embed, view=view)
+
+
+async def _refresh_bracket_public(guild: discord.Guild, bracket: BracketState):
+    """Post or edit the bracket image in the public channel."""
+    channel = guild.get_channel(BRACKET_PUBLIC_CHANNEL_ID) or await guild.fetch_channel(BRACKET_PUBLIC_CHANNEL_ID)
+
+    # Generate image
+    generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+    file = discord.File(BRACKET_IMAGE_PATH, filename=BRACKET_IMAGE_FILENAME)
+
+    embed = discord.Embed(
+        title="🏆 " + bracket.title,
+        colour=discord.Colour.gold(),
+    )
+    embed.set_image(url=f"attachment://{BRACKET_IMAGE_FILENAME}")
+
+    # Find and edit existing bracket message, or send a new one
+    async for msg in channel.history(limit=30):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == "🏆 " + bracket.title:
+            try:
+                await msg.edit(embed=embed, attachments=[file])
+                return
+            except discord.HTTPException:
+                pass
+
+    await channel.send(embed=embed, file=file)
+
+
+# --- Bracket views (persistent) ---
+
+class BracketPanelView(discord.ui.View):
+    """Persistent view for the bracket control panel."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Add Participant", style=discord.ButtonStyle.success,
+        custom_id="bracket_add_participant", row=0,
+    )
+    async def add_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BracketAddModal())
+
+    @discord.ui.button(
+        label="Remove Participant", style=discord.ButtonStyle.danger,
+        custom_id="bracket_remove_participant", row=0,
+    )
+    async def remove_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
+            return
+
+        filled = [(i, p) for i, p in enumerate(bracket.participants) if p != "N/A"]
+        if not filled:
+            await interaction.response.send_message("No participants to remove.", ephemeral=True)
+            return
+
+        view = BracketRemoveSelectView(filled)
+        await interaction.response.send_message(
+            "Select a participant to remove:", view=view, ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Generate / Update", style=discord.ButtonStyle.primary,
+        custom_id="bracket_generate", row=1,
+    )
+    async def generate_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.followup.send("No bracket exists. Create one first.", ephemeral=True)
+            return
+
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await interaction.followup.send("Bracket updated in the public channel.", ephemeral=True)
+
+    @discord.ui.button(
+        label="Clear Bracket", style=discord.ButtonStyle.danger,
+        custom_id="bracket_clear", row=1,
+    )
+    async def clear_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.followup.send("No bracket to clear.", ephemeral=True)
+            return
+
+        bracket.clear_all()
+        save_bracket(db, bracket)
+        save_db(db)
+
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await _refresh_bracket_panel(interaction.guild, bracket)
+        await interaction.followup.send("Bracket cleared.", ephemeral=True)
+
+    @discord.ui.select(
+        placeholder="Select a match to pick a winner…",
+        custom_id="bracket_winner_select",
+        options=[discord.SelectOption(label="Refresh to see matches", value="__placeholder__")],
+    )
+    async def winner_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = select.values[0]
+        if value == "__placeholder__":
+            await interaction.response.send_message(
+                "Click **Generate / Update** first to refresh the match list.",
+                ephemeral=True,
+            )
+            return
+
+        # Parse "r{round}m{match}"
+        try:
+            r = int(value[1:value.index("m")])
+            m = int(value[value.index("m") + 1:])
+        except (ValueError, IndexError):
+            await interaction.response.send_message("Invalid match reference.", ephemeral=True)
+            return
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.response.send_message("No bracket exists.", ephemeral=True)
+            return
+
+        team_a = bracket._team_in_match(r, m, 0)
+        team_b = bracket._team_in_match(r, m, 1)
+
+        if team_a in ("N/A", "TBD") or team_b in ("N/A", "TBD"):
+            await interaction.response.send_message("This match isn't ready yet.", ephemeral=True)
+            return
+
+        view = BracketWinnerConfirmView(r, m, team_a, team_b)
+        await interaction.response.send_message(
+            f"**{bracket.match_label(r, m)}**\nPick the winner:", view=view, ephemeral=True,
+        )
+
+
+class BracketAddModal(discord.ui.Modal):
+    """Modal to add a team to the bracket."""
+    def __init__(self):
+        super().__init__(title="Add Team to Bracket")
+        self.team_name_input = discord.ui.TextInput(
+            label="Team name", placeholder="e.g. Squad Alpha", max_length=100,
+        )
+        self.add_item(self.team_name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        team_name = self.team_name_input.value.strip()
+        if not team_name:
+            await interaction.response.send_message("Team name can't be empty.", ephemeral=True)
+            return
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
+            return
+
+        if team_name.lower() in [p.lower() for p in bracket.participants if p != "N/A"]:
+            await interaction.response.send_message(f"**{team_name}** is already in the bracket.", ephemeral=True)
+            return
+
+        # Find first empty slot
+        slot = None
+        for i, p in enumerate(bracket.participants):
+            if p == "N/A":
+                slot = i
+                break
+
+        if slot is None:
+            await interaction.response.send_message("All 8 slots are full.", ephemeral=True)
+            return
+
+        bracket.participants[slot] = team_name
+        save_bracket(db, bracket)
+        save_db(db)
+
+        # Refresh both channels
+        await _refresh_bracket_panel(interaction.guild, bracket)
+        # Generate a preview image for the confirmation
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        file = discord.File(BRACKET_IMAGE_PATH, filename=BRACKET_IMAGE_FILENAME)
+        await interaction.response.send_message(
+            f"✅ Added **{team_name}** to slot {slot + 1}.", file=file, ephemeral=True,
+        )
+
+
+class BracketRemoveSelectView(discord.ui.View):
+    """Ephemeral dropdown listing filled slots for removal."""
+    def __init__(self, filled: list[tuple[int, str]]):
+        super().__init__(timeout=60)
+        options = [
+            discord.SelectOption(label=name[:100], value=str(idx), description=f"Slot {idx + 1}")
+            for idx, name in filled
+        ]
+        self.remove_select.options = options[:25]
+
+    @discord.ui.select(
+        placeholder="Select a team to remove…",
+        custom_id="bracket_remove_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def remove_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        slot = int(select.values[0])
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.response.send_message("No bracket exists.", ephemeral=True)
+            return
+
+        removed_name = bracket.participants[slot]
+        bracket.participants[slot] = "N/A"
+        bracket.clear_after(slot)
+        save_bracket(db, bracket)
+        save_db(db)
+
+        await _refresh_bracket_panel(interaction.guild, bracket)
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await interaction.response.send_message(f"Removed **{removed_name}** from slot {slot + 1}.", ephemeral=True)
+
+
+class BracketWinnerConfirmView(discord.ui.View):
+    """Ephemeral confirm for picking a winner between two teams."""
+    def __init__(self, r: int, m: int, team_a: str, team_b: str):
+        super().__init__(timeout=60)
+        self.r = r
+        self.m = m
+        self.team_a = team_a
+        self.team_b = team_b
+
+    @discord.ui.button(label="A", style=discord.ButtonStyle.success, custom_id="bracket_winner_a")
+    async def pick_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, 0, self.team_a)
+
+    @discord.ui.button(label="B", style=discord.ButtonStyle.success, custom_id="bracket_winner_b")
+    async def pick_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, 1, self.team_b)
+
+    async def _pick(self, interaction: discord.Interaction, slot: int, winner_name: str):
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.followup.send("No bracket exists.", ephemeral=True)
+            return
+
+        if not bracket.set_winner(self.r, self.m, slot):
+            await interaction.followup.send("Can't set that winner — match may no longer be playable.", ephemeral=True)
+            return
+
+        save_bracket(db, bracket)
+        save_db(db)
+
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await _refresh_bracket_panel(interaction.guild, bracket)
+
+        # Check for champion
+        final_match = bracket.matches[2][0]
+        champion = None
+        if final_match.get("winner") is not None:
+            champion = bracket.participants[final_match["winner"]]
+
+        msg = f"✅ **{winner_name}** advances!"
+        if champion:
+            msg += f"\n\n🏆 **Champion: {champion}!**"
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+# --- Bracket sync on startup ---
+
+async def sync_bracket(guild: discord.Guild):
+    """On startup: refresh both bracket channels if a bracket exists."""
+    db = load_db()
+    bracket = load_bracket(db)
+    if bracket is None:
+        return
+
+    try:
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(guild, bracket)
+    except discord.HTTPException as e:
+        print(f"Failed to refresh bracket public channel: {e}")
+
+    try:
+        await _refresh_bracket_panel(guild, bracket)
+    except discord.HTTPException as e:
+        print(f"Failed to refresh bracket panel: {e}")
 
 
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
@@ -2219,6 +2879,35 @@ async def testupdate(interaction: discord.Interaction):
     )
 
 
+# ---------- Bracket slash command ----------
+@bot.tree.command(name="bracket", description="Create a new tournament bracket (8 teams, single elimination)")
+async def bracket_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+    existing = load_bracket(db)
+    if existing:
+        await interaction.followup.send(
+            "A bracket already exists. Use the panel buttons to manage it, or ask staff to clear it first.",
+            ephemeral=True,
+        )
+        return
+
+    new_bracket = BracketState()
+    save_bracket(db, new_bracket)
+    save_db(db)
+
+    await _refresh_bracket_panel(interaction.guild, new_bracket)
+
+    generate_bracket_image(new_bracket, BRACKET_IMAGE_PATH)
+    await _refresh_bracket_public(interaction.guild, new_bracket)
+
+    await interaction.followup.send(
+        "✅ Bracket created! Use the panel in the bracket channel to add participants.",
+        ephemeral=True,
+    )
+
+
 @bot.event
 async def on_ready():
     await restore_db_from_log_channel()
@@ -2226,6 +2915,7 @@ async def on_ready():
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
     bot.add_view(CodeRecipientSelectView([], keep_nav_buttons=True))
+    bot.add_view(BracketPanelView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
@@ -2239,6 +2929,18 @@ async def on_ready():
         await refresh_tournament_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
+    try:
+        # Sync bracket channels — fetches the guild from any available channel
+        _guild = None
+        try:
+            ch = bot.get_channel(BRACKET_PANEL_CHANNEL_ID) or await bot.fetch_channel(BRACKET_PANEL_CHANNEL_ID)
+            _guild = ch.guild
+        except discord.HTTPException:
+            pass
+        if _guild:
+            await sync_bracket(_guild)
+    except discord.HTTPException as e:
+        print(f"Failed to sync bracket: {e}")
     if not check_oculus_updates.is_running():
         check_oculus_updates.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
