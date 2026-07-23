@@ -544,13 +544,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ---------- JSON "database" helpers ----------
 def load_db() -> dict:
     if not os.path.exists(DB_FILE):
-        return {"teams": {}}
+        return {"teams": {}, "giveaways": {}}
     with open(DB_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     if "teams" not in data:
         # migrate old flat-format {team_name: {...}} files
         data = {"teams": data}
     data.setdefault("teams", {})
+    data.setdefault("giveaways", {})
     return data
 
 
@@ -2400,6 +2401,212 @@ class InviteResponseView(discord.ui.View):
         await interaction.response.edit_message(content="Invite declined.", view=self)
 
 
+# ============================================================
+# GIVEAWAYS — state, embed, join button, and background ender
+# ============================================================
+
+GIVEAWAY_JOIN_EMOJI = "🎉"
+
+# Matches durations like "10m", "2h", "1d", "1d12h", "1w" — one or more (amount, unit) pairs.
+_DURATION_RE = re.compile(r"(\d+)\s*(w|d|h|m|s)", re.IGNORECASE)
+_DURATION_UNIT_SECONDS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+def parse_duration(text: str):
+    """Parses a duration string like '10m', '2h', or '1d12h' into a timedelta.
+    Returns None if nothing valid could be parsed."""
+    from datetime import timedelta
+
+    total_seconds = 0
+    matched_any = False
+    for amount, unit in _DURATION_RE.findall(text.strip()):
+        total_seconds += int(amount) * _DURATION_UNIT_SECONDS[unit.lower()]
+        matched_any = True
+
+    if not matched_any or total_seconds <= 0:
+        return None
+    return timedelta(seconds=total_seconds)
+
+
+def build_giveaway_embed(
+    prize: str,
+    winners_count: int,
+    host_id: int,
+    end_ts: int,
+    entries_count: int,
+    winner_ids: list = None,
+) -> discord.Embed:
+    """Mirrors the AC: Arena Hub giveaway style: orange embed, a timestamp for when it
+    ends (or ended), the host, a live entry count, and — once it's over — the winners."""
+    ended = winner_ids is not None
+
+    embed = discord.Embed(
+        title=f"{GIVEAWAY_JOIN_EMOJI} {prize}",
+        colour=discord.Colour.orange(),
+    )
+
+    if ended:
+        embed.add_field(name="Ended", value=f"<t:{end_ts}:F>", inline=False)
+    else:
+        embed.add_field(name="Ends", value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)", inline=False)
+
+    embed.add_field(name="Hosted by", value=f"<@{host_id}>", inline=False)
+    embed.add_field(name="Entries", value=f"**{entries_count}**", inline=False)
+
+    if ended:
+        winners_value = (
+            ", ".join(f"<@{uid}>" for uid in winner_ids) if winner_ids else "No valid entries"
+        )
+        embed.add_field(name="Winners" if len(winner_ids) != 1 else "Winner", value=winners_value, inline=False)
+    else:
+        embed.set_footer(
+            text=f"{winners_count} winner(s) • Click {GIVEAWAY_JOIN_EMOJI} Join below to enter!"
+        )
+
+    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+    return embed
+
+
+class GiveawayJoinView(discord.ui.View):
+    """Persistent green 'Join' button attached to every giveaway message. Entries are kept
+    in the database keyed by message ID (not on the view instance, since one registered
+    view instance backs every giveaway message and must survive restarts)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Join", emoji=GIVEAWAY_JOIN_EMOJI, style=discord.ButtonStyle.success,
+        custom_id="giveaway_join_button",
+    )
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db = load_db()
+        giveaways = db.setdefault("giveaways", {})
+        key = str(interaction.message.id)
+        info = giveaways.get(key)
+
+        if info is None:
+            await interaction.response.send_message("This giveaway no longer exists.", ephemeral=True)
+            return
+        if info.get("ended"):
+            await interaction.response.send_message("This giveaway has already ended.", ephemeral=True)
+            return
+
+        entries = info.setdefault("entries", [])
+        user_id = interaction.user.id
+        if user_id in entries:
+            entries.remove(user_id)
+            joined = False
+        else:
+            entries.append(user_id)
+            joined = True
+
+        save_db(db)
+
+        embed = build_giveaway_embed(
+            prize=info["prize"],
+            winners_count=info["winners"],
+            host_id=info["host_id"],
+            end_ts=info["end_ts"],
+            entries_count=len(entries),
+        )
+        try:
+            await interaction.response.edit_message(embed=embed)
+        except discord.HTTPException:
+            pass
+
+        if joined:
+            await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} You're in — good luck!", ephemeral=True)
+        else:
+            await interaction.followup.send("You left the giveaway.", ephemeral=True)
+
+
+async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
+    """Picks winners, edits the giveaway message to its final state, and announces the
+    result in the same channel."""
+    import random
+
+    entries = info.get("entries", [])
+    winners_count = min(info.get("winners", 1), len(entries))
+    winner_ids = random.sample(entries, winners_count) if winners_count > 0 else []
+
+    info["ended"] = True
+    info["winner_ids"] = winner_ids
+
+    channel = guild.get_channel(info["channel_id"]) or bot.get_channel(info["channel_id"])
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(info["channel_id"])
+        except discord.HTTPException:
+            return
+
+    embed = build_giveaway_embed(
+        prize=info["prize"],
+        winners_count=info["winners"],
+        host_id=info["host_id"],
+        end_ts=info["end_ts"],
+        entries_count=len(entries),
+        winner_ids=winner_ids,
+    )
+
+    ended_view = GiveawayJoinView()
+    for child in ended_view.children:
+        child.disabled = True
+
+    try:
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(embed=embed, view=ended_view)
+    except discord.HTTPException:
+        pass
+
+    if winner_ids:
+        mentions = ", ".join(f"<@{uid}>" for uid in winner_ids)
+        try:
+            await channel.send(f"{GIVEAWAY_JOIN_EMOJI} Congratulations {mentions} — you won **{info['prize']}**!")
+        except discord.HTTPException:
+            pass
+    else:
+        try:
+            await channel.send(f"{GIVEAWAY_JOIN_EMOJI} The giveaway for **{info['prize']}** ended with no entries.")
+        except discord.HTTPException:
+            pass
+
+
+@tasks.loop(seconds=30)
+async def check_giveaways():
+    db = load_db()
+    giveaways = db.get("giveaways", {})
+    if not giveaways:
+        return
+
+    now_ts = int(discord.utils.utcnow().timestamp())
+    changed = False
+
+    for message_id, info in list(giveaways.items()):
+        if info.get("ended") or info.get("end_ts", 0) > now_ts:
+            continue
+
+        guild = bot.get_guild(info.get("guild_id")) if info.get("guild_id") else None
+        if guild is None:
+            # fall back to the first guild the bot can see the channel in
+            channel = bot.get_channel(info["channel_id"])
+            guild = channel.guild if channel else None
+        if guild is None:
+            continue
+
+        await _end_giveaway(guild, message_id, info)
+        changed = True
+
+    if changed:
+        save_db(db)
+        await backup_db_to_log_channel()
+
+
+@check_giveaways.before_loop
+async def before_check_giveaways():
+    await bot.wait_until_ready()
+
+
 # ---------- Slash commands ----------
 @bot.tree.command(name="createteam", description="Create a new team")
 @app_commands.describe(
@@ -3179,6 +3386,68 @@ async def changeteamsettings(
     await interaction.followup.send(message, ephemeral=True)
 
 
+# ---------- Giveaway slash command ----------
+@bot.tree.command(name="startgiveaway", description="(Staff) Start a giveaway in this channel")
+@app_commands.describe(
+    winners="How many winners will be picked",
+    prize="What's being given away",
+    ends="How long the giveaway runs, e.g. 10m, 2h, 1d, 1d12h",
+    hosted="Who's hosting the giveaway (defaults to you)",
+)
+async def startgiveaway(
+    interaction: discord.Interaction,
+    winners: app_commands.Range[int, 1, 50],
+    prize: str,
+    ends: str,
+    hosted: discord.Member = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    duration = parse_duration(ends)
+    if duration is None:
+        await interaction.followup.send(
+            "Couldn't parse `ends` — use something like `10m`, `2h`, `1d`, or `1d12h`.", ephemeral=True
+        )
+        return
+
+    host = hosted or interaction.user
+    end_dt = discord.utils.utcnow() + duration
+    end_ts = int(end_dt.timestamp())
+
+    embed = build_giveaway_embed(
+        prize=prize, winners_count=winners, host_id=host.id, end_ts=end_ts, entries_count=0,
+    )
+    view = GiveawayJoinView()
+
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+        sent = await interaction.channel.send(embed=embed, view=view, file=file)
+    else:
+        embed.set_image(url=None)
+        sent = await interaction.channel.send(embed=embed, view=view)
+
+    db = load_db()
+    db.setdefault("giveaways", {})
+    db["giveaways"][str(sent.id)] = {
+        "guild_id": interaction.guild.id,
+        "channel_id": sent.channel.id,
+        "prize": prize,
+        "winners": winners,
+        "host_id": host.id,
+        "end_ts": end_ts,
+        "entries": [],
+        "ended": False,
+    }
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} Giveaway started in {sent.channel.mention}!", ephemeral=True)
+
+
 # ---------- /test command (admin-only — posts the update embed in the update channel) ----------
 @bot.tree.command(name="testupdate", description="(Admin) Post a test update embed in the update channel")
 @app_commands.default_permissions(administrator=True)
@@ -3281,6 +3550,7 @@ async def on_ready():
     bot.add_view(TournamentSubmissionView())
     bot.add_view(CodeRecipientSelectView([], keep_nav_buttons=True))
     bot.add_view(BracketPanelView())
+    bot.add_view(GiveawayJoinView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
@@ -3308,6 +3578,8 @@ async def on_ready():
         print(f"Failed to sync bracket: {e}")
     if not check_oculus_updates.is_running():
         check_oculus_updates.start()
+    if not check_giveaways.is_running():
+        check_giveaways.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
