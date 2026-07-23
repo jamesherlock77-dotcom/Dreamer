@@ -3,10 +3,11 @@ import io
 import re
 import json
 import logging
+import aiohttp
 import emoji as emoji_lib
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
 # the interaction (e.g. the user typed another character before the bot replied).
@@ -32,6 +33,10 @@ TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, curre
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
+OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
+OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
+OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_ID}?onlydownloadable=true"
+OCULUS_VERSION_FILE = "oculus_version.json"  # tracks the last version we've already announced
 
 DB_FILE = "teams.json"
 
@@ -62,6 +67,103 @@ def load_db() -> dict:
 def save_db(data: dict) -> None:
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+# ---------- Meta Quest Store update tracker (Animal Company, via OculusDB's public API) ----------
+def load_last_seen_oculus_version():
+    if not os.path.exists(OCULUS_VERSION_FILE):
+        return None
+    try:
+        with open(OCULUS_VERSION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("last_version_code")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_last_seen_oculus_version(version_code) -> None:
+    with open(OCULUS_VERSION_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last_version_code": version_code}, f)
+
+
+def _extract_latest_oculus_version_entry(payload):
+    """Confirmed against a live response: OculusDB's /api/v1/versions endpoint returns a bare
+    JSON list of version objects, newest first. Still guards against an empty list or an
+    unexpected wrapper dict in case the API shape ever changes."""
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        entries = payload.get("versions") or payload.get("data") or payload.get("items") or []
+    else:
+        entries = []
+    return entries[0] if entries else None
+
+
+def _extract_oculus_version_code(entry: dict):
+    """versionCode (e.g. 3211) is the reliable field for detecting an actual new build —
+    confirmed present on every entry in a live response."""
+    return entry.get("versionCode")
+
+
+def _extract_oculus_display_version(entry: dict):
+    """version (e.g. "1.82.2.3211") is the human-readable string shown in the announcement.
+    Falls back to the version code if it's ever missing."""
+    return entry.get("version") or entry.get("versionCode")
+
+
+@tasks.loop(hours=1)
+async def check_oculus_updates():
+    if not OCULUS_UPDATE_CHANNEL_ID:
+        return  # not configured yet
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                OCULUS_VERSIONS_URL, timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status != 200:
+                    print(f"Oculus update check failed: HTTP {response.status}")
+                    return
+                payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError) as e:
+        print(f"Oculus update check failed: {e}")
+        return
+
+    latest_entry = _extract_latest_oculus_version_entry(payload)
+    if latest_entry is None:
+        print("Oculus update check: no version entries found in the response — API shape may have changed.")
+        return
+
+    latest_version_code = _extract_oculus_version_code(latest_entry)
+    if latest_version_code is None:
+        print(f"Oculus update check: couldn't find versionCode in entry: {latest_entry}")
+        return
+
+    last_seen = load_last_seen_oculus_version()
+    if last_seen is None:
+        # First run (or first run after a redeploy without a persisted value) — just record
+        # the baseline instead of announcing, so a restart never looks like a fake "update".
+        save_last_seen_oculus_version(latest_version_code)
+        return
+
+    if str(latest_version_code) == str(last_seen):
+        return  # no change
+
+    save_last_seen_oculus_version(latest_version_code)
+
+    display_version = _extract_oculus_display_version(latest_entry)
+    channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
+    embed = discord.Embed(
+        title="🦴 Animal Company updated!",
+        description=f"New version detected: **{display_version}** (build {latest_version_code})",
+        colour=discord.Colour.blurple(),
+    )
+    embed.set_footer(text="Source: OculusDB (unofficial, community-run)")
+    await channel.send(embed=embed)
+
+
+@check_oculus_updates.before_loop
+async def before_check_oculus_updates():
+    await bot.wait_until_ready()
 
 
 # Cache of the single database message so we edit it in place instead of
@@ -1974,6 +2076,8 @@ async def on_ready():
         await refresh_tournament_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
+    if not check_oculus_updates.is_running():
+        check_oculus_updates.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
