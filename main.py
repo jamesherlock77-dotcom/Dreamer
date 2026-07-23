@@ -26,6 +26,7 @@ LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message live
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
+PREMIUM_ROLE_ID_2 = 1529805001088569384    # a second role that also grants premium access
 CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-existing teams are grandfathered in)
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 20                      # includes the leader
@@ -181,7 +182,7 @@ def has_staff_role(member: discord.Member) -> bool:
 
 
 def has_premium_access(member: discord.Member) -> bool:
-    return any(role.id in (PREMIUM_ROLE_ID, STAFF_ROLE_ID) for role in member.roles)
+    return any(role.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2, STAFF_ROLE_ID) for role in member.roles)
 
 
 def has_create_team_access(member: discord.Member) -> bool:
