@@ -147,6 +147,13 @@ def find_team_by_member(db: dict, user_id: int):
     return None
 
 
+def find_team_by_channel(db: dict, channel_id: int):
+    for name, info in db.items():
+        if info.get("channel_id") == channel_id:
+            return name
+    return None
+
+
 def find_team_key_ci(db: dict, name: str):
     name_lower = name.lower()
     for key in db:
@@ -429,8 +436,43 @@ class TournamentSubmissionView(discord.ui.View):
         label="Submit", style=discord.ButtonStyle.success, custom_id="tournament_submission_submit"
     )
     async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Not wired up to anything yet.
-        await interaction.response.defer()
+        db = load_db()
+        team_key = find_team_by_channel(db["teams"], interaction.channel_id)
+        if not team_key:
+            await interaction.response.send_message(
+                "Couldn't figure out which team this submission sheet belongs to.", ephemeral=True
+            )
+            return
+
+        info = db["teams"][team_key]
+        if interaction.user.id != info.get("leader_id"):
+            await interaction.response.send_message(
+                "Only the team leader can submit this.", ephemeral=True
+            )
+            return
+
+        competitors, subs = parse_tournament_submission_content(interaction.message.content)
+        recipient_ids = [uid for uid in (competitors + subs) if uid is not None]
+        if not recipient_ids:
+            await interaction.response.send_message(
+                "Nobody has signed up yet — nothing to submit.", ephemeral=True
+            )
+            return
+
+        panel_channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(
+            TOURNAMENT_PANEL_CHANNEL_ID
+        )
+
+        content = (
+            f"**{team_key}** submission\n\n"
+            + build_tournament_submission_content(len(competitors), len(subs), competitors, subs)
+        )
+        recipient_view = await build_code_recipient_view(interaction.guild, recipient_ids)
+        await panel_channel.send(content=content, view=recipient_view)
+
+        await interaction.response.send_message(
+            f"Submitted — posted in {panel_channel.mention}.", ephemeral=True
+        )
 
 
 class TournamentSubmissionModal(discord.ui.Modal):
@@ -486,6 +528,147 @@ class TournamentSubmissionModal(discord.ui.Modal):
         await interaction.response.send_message(
             f"Tournament submission sheet posted in {channel.mention}.", ephemeral=True
         )
+
+
+TOURNAMENT_CODE_RECIPIENTS_PER_PAGE = 25
+_TOURNAMENT_CODE_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def extract_mentions_in_order(content: str) -> list:
+    """Pulls every user-mention ID out of a message's content, in order, deduplicated."""
+    seen = set()
+    ids = []
+    for match in _MENTION_RE.finditer(content):
+        user_id = int(match.group(1))
+        if user_id not in seen:
+            seen.add(user_id)
+            ids.append(user_id)
+    return ids
+
+
+class CodeModal(discord.ui.Modal):
+    def __init__(self, recipient_id: int):
+        super().__init__(title="Send Code")
+        self.recipient_id = recipient_id
+        self.code_input = discord.ui.TextInput(
+            label="What's the code?", placeholder="e.g. ABCD-1234", max_length=200
+        )
+        self.add_item(self.code_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        code = self.code_input.value.strip()
+        if not code:
+            await interaction.response.send_message("The code can't be empty.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        member = guild.get_member(self.recipient_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(self.recipient_id)
+            except discord.HTTPException:
+                member = None
+
+        if member is None:
+            await interaction.response.send_message(
+                "Couldn't find that member in the server anymore.", ephemeral=True
+            )
+            return
+
+        try:
+            await member.send(f"Your tournament code: `{code}`")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"Couldn't DM {member.mention} — they may have DMs off.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(f"Code sent to {member.mention} ✅", ephemeral=True)
+
+
+class CodeRecipientSelectView(discord.ui.View):
+    """Posted alongside a submitted team's sheet in the panel channel. Lets a staff member
+    pick a person and DM them a code. Like the team-select panel, current page is read
+    back from the message's own select placeholder rather than stored on the view, and the
+    full recipient list is re-derived from the message's mentions — so it survives restarts."""
+
+    def __init__(self, options: list, page: int = 0, total_pages: int = 1, keep_nav_buttons: bool = False):
+        super().__init__(timeout=None)
+        if not options:
+            options = [discord.SelectOption(label="No one signed up", value="__none__")]
+        self.recipient_select.options = options[:25]
+
+        placeholder = "Select a person..."
+        if total_pages > 1:
+            placeholder += f" (page {page + 1}/{total_pages})"
+        self.recipient_select.placeholder = placeholder
+
+        if total_pages <= 1 and not keep_nav_buttons:
+            self.remove_item(self.prev_page)
+            self.remove_item(self.next_page)
+        else:
+            self.prev_page.disabled = page <= 0
+            self.next_page.disabled = page >= total_pages - 1
+
+    @discord.ui.select(
+        placeholder="Select a person...",
+        custom_id="tournament_code_recipient_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def recipient_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = select.values[0]
+        if value == "__none__":
+            await interaction.response.send_message("There's no one to send a code to.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CodeModal(int(value)))
+
+    @discord.ui.button(
+        label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="tournament_code_prev_page", row=1
+    )
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, -1)
+
+    @discord.ui.button(
+        label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="tournament_code_next_page", row=1
+    )
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, 1)
+
+    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
+        current_page = 0
+        for row in interaction.message.components:
+            for component in row.children:
+                if getattr(component, "custom_id", None) == "tournament_code_recipient_select":
+                    match = _TOURNAMENT_CODE_PAGE_RE.search(component.placeholder or "")
+                    if match:
+                        current_page = int(match.group(1)) - 1
+
+        recipient_ids = extract_mentions_in_order(interaction.message.content)
+        new_view = await build_code_recipient_view(interaction.guild, recipient_ids, page=current_page + delta)
+        await interaction.response.edit_message(view=new_view)
+
+
+async def build_code_recipient_view(guild: discord.Guild, recipient_ids: list, page: int = 0) -> CodeRecipientSelectView:
+    total_pages = (
+        max(1, -(-len(recipient_ids) // TOURNAMENT_CODE_RECIPIENTS_PER_PAGE)) if recipient_ids else 1
+    )
+    page = max(0, min(page, total_pages - 1))
+    start = page * TOURNAMENT_CODE_RECIPIENTS_PER_PAGE
+    page_ids = recipient_ids[start:start + TOURNAMENT_CODE_RECIPIENTS_PER_PAGE]
+
+    options = []
+    for user_id in page_ids:
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.HTTPException:
+                member = None
+        label = member.display_name if member else f"Unknown user ({user_id})"
+        options.append(discord.SelectOption(label=label[:100], value=str(user_id)))
+
+    return CodeRecipientSelectView(options, page=page, total_pages=total_pages)
 
 
 TOURNAMENT_TEAMS_PER_PAGE = 25
@@ -1776,6 +1959,7 @@ async def on_ready():
     bot.add_view(SupportPanelView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
+    bot.add_view(CodeRecipientSelectView([], keep_nav_buttons=True))
     await bot.tree.sync()
     try:
         await sync_existing_teams()
