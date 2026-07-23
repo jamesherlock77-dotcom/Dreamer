@@ -66,31 +66,44 @@ BRACKET_TOTAL_SLOTS = 8
 BRACKET_ROUNDS = 3  # round1 (4 matches) → round2 (2) → finals (1)
 
 # Bracket image layout
-IMG_PAD_LEFT = 40
-IMG_PAD_TOP = 60
-IMG_PAD_BOTTOM = 40
-IMG_PAD_RIGHT = 60
-BOX_W = 180
-BOX_H = 40
-BOX_GAP = 10
+IMG_PAD_LEFT = 50
+IMG_PAD_TOP = 110
+IMG_PAD_BOTTOM = 50
+IMG_PAD_RIGHT = 70
+SEED_BADGE_D = 24     # diameter of the little seed-number circle to the left of round-1 boxes
+BOX_W = 190
+BOX_H = 42
+BOX_GAP = 12
 ROUND_GAP = 300
-LABEL_H = 22
-ROUND_LABEL_H = 30
+LABEL_H = 24
+ROUND_LABEL_H = 34
 
-# Bracket colours (RGB)
-COL_BG = (30, 30, 40)
-COL_ROUND_LABEL = (120, 130, 150)
-COL_MATCH_LABEL = (90, 100, 115)
-COL_SLOT_EMPTY_BG = (50, 52, 60)
-COL_SLOT_TEAM_BG = (55, 60, 75)
-COL_SLOT_BORDER = (75, 80, 95)
-COL_WINNER_BG = (45, 120, 65)
-COL_WINNER_BORDER = (70, 180, 95)
-COL_TEXT_EMPTY = (100, 105, 115)
-COL_TEXT_TEAM = (220, 225, 235)
+# Bracket colours (RGB) — layered dark theme with a gold accent for anything "live" or won
+COL_BG_TOP = (21, 20, 34)
+COL_BG_BOTTOM = (13, 13, 22)
+COL_VIGNETTE = (0, 0, 0)
+COL_ROUND_LABEL = (200, 190, 230)
+COL_ROUND_PILL = (46, 40, 72)
+COL_ROUND_PILL_BORDER = (90, 80, 130)
+COL_MATCH_LABEL = (130, 128, 155)
+COL_SLOT_EMPTY_BG = (35, 34, 48)
+COL_SLOT_TEAM_BG = (46, 45, 68)
+COL_SLOT_BORDER = (70, 68, 98)
+COL_READY_BG = (54, 48, 40)
+COL_READY_BORDER = (240, 185, 70)
+COL_WINNER_BG_TOP = (44, 150, 92)
+COL_WINNER_BG_BOTTOM = (28, 105, 66)
+COL_WINNER_BORDER = (120, 235, 165)
+COL_CHAMPION_BORDER = (255, 205, 60)
+COL_TEXT_EMPTY = (95, 93, 112)
+COL_TEXT_TEAM = (232, 230, 245)
 COL_TEXT_WINNER = (255, 255, 255)
-COL_TEXT_PLACEHOLDER = (90, 95, 110)
-COL_LINE = (70, 75, 90)
+COL_TEXT_PLACEHOLDER = (110, 108, 135)
+COL_LINE = (95, 92, 125)
+COL_LINE_WON = (245, 195, 80)
+COL_SEED_BG = (60, 58, 88)
+COL_SEED_TEXT = (200, 198, 225)
+COL_SHADOW = (5, 5, 10)
 
 FONT_PATHS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -100,6 +113,14 @@ FONT_PATHS = [
 ]
 
 _font_cache: dict = {}
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
+def _lerp_colour(c1: tuple, c2: tuple, t: float) -> tuple:
+    return tuple(int(_lerp(c1[i], c2[i], t)) for i in range(3))
 
 
 def _get_font(size: int, bold: bool = True):
@@ -132,6 +153,9 @@ class BracketState:
         [{"winner": None} for _ in range(2)],
         [{"winner": None}],
     ])
+    # Ordered list of [round, match] entries recording every winner ever set, so the most
+    # recent result can be popped off and reverted with "Undo Last Result".
+    history: list = _field(default_factory=list)
 
     def _matches_in_round(self, r: int) -> int:
         return 4 >> r
@@ -199,7 +223,30 @@ class BracketState:
         if r + 1 < BRACKET_ROUNDS:
             next_match = m // 2
             self.matches[r + 1][next_match] = {"winner": None}
+        self.history.append([r, m])
         return True
+
+    def undo_last(self):
+        """Reverts the most recently set winner. Also clears any later-round match that had
+        already cascaded from it (e.g. undoing a semi-final result also clears the final if
+        it had already been decided using that semi's winner). Returns the (round, match)
+        that was undone, or None if there was nothing to undo."""
+        if not self.history:
+            return None
+        r, m = self.history.pop()
+        self.matches[r][m] = {"winner": None}
+
+        cur_r, cur_m = r, m
+        while cur_r + 1 < BRACKET_ROUNDS:
+            next_r = cur_r + 1
+            next_m = cur_m // 2
+            if self.matches[next_r][next_m].get("winner") is not None:
+                self.matches[next_r][next_m] = {"winner": None}
+                self.history = [entry for entry in self.history if entry != [next_r, next_m]]
+                cur_r, cur_m = next_r, next_m
+            else:
+                break
+        return (r, m)
 
     def clear_after(self, slot: int) -> list:
         cleared = []
@@ -223,28 +270,95 @@ class BracketState:
             [{"winner": None} for _ in range(2)],
             [{"winner": None}],
         ]
+        self.history = []
+
+
+def _draw_gradient_background(img: Image.Image, top: tuple, bottom: tuple) -> None:
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / max(1, h - 1)
+        draw.line([(0, y), (w, y)], fill=_lerp_colour(top, bottom, t))
+
+
+def _draw_shadowed_rounded_rect(draw, box, radius, fill, outline, width, shadow_offset=(0, 3)):
+    sx, sy = shadow_offset
+    shadow_box = [box[0] + sx, box[1] + sy, box[2] + sx, box[3] + sy]
+    draw.rounded_rectangle(shadow_box, radius=radius, fill=COL_SHADOW)
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def _draw_confetti(draw, w, h, count, rng):
+    palette = [
+        (255, 205, 60), (240, 90, 90), (90, 200, 255), (140, 230, 140), (220, 130, 255),
+    ]
+    for _ in range(count):
+        x = rng.uniform(0, w)
+        y = rng.uniform(0, h)
+        size = rng.uniform(3, 7)
+        colour = palette[int(rng.uniform(0, len(palette)))]
+        if rng.random() < 0.5:
+            draw.ellipse([x, y, x + size, y + size], fill=colour)
+        else:
+            draw.rectangle([x, y, x + size, y + size * 0.6], fill=colour)
 
 
 def _draw_bracket_image(state: BracketState) -> Image.Image:
+    import random
+
     max_per_round = max(state._matches_in_round(r) for r in range(BRACKET_ROUNDS))
-    img_w = IMG_PAD_LEFT + BRACKET_ROUNDS * BOX_W + (BRACKET_ROUNDS - 1) * ROUND_GAP + IMG_PAD_RIGHT
+    img_w = IMG_PAD_LEFT + BRACKET_ROUNDS * BOX_W + (BRACKET_ROUNDS - 1) * ROUND_GAP + IMG_PAD_RIGHT + SEED_BADGE_D
     img_h = IMG_PAD_TOP + max_per_round * (2 * BOX_H + BOX_GAP + LABEL_H) + IMG_PAD_BOTTOM + ROUND_LABEL_H
 
-    img = Image.new("RGB", (img_w, img_h), COL_BG)
+    champion = None
+    final_match = state.matches[2][0]
+    if final_match.get("winner") is not None:
+        idx = final_match["winner"]
+        if idx < len(state.participants):
+            champion = state.participants[idx]
+
+    img = Image.new("RGB", (img_w, img_h), COL_BG_BOTTOM)
+    _draw_gradient_background(img, COL_BG_TOP, COL_BG_BOTTOM)
     draw = ImageDraw.Draw(img)
 
     font_label = _get_font(12, bold=False)
-    font_team = _get_font(14, bold=True)
+    font_team = _get_font(15, bold=True)
     font_empty = _get_font(13, bold=False)
-    font_round = _get_font(16, bold=True)
+    font_round = _get_font(15, bold=True)
+    font_title = _get_font(26, bold=True)
+    font_seed = _get_font(11, bold=True)
+    font_champion = _get_font(30, bold=True)
 
-    for r in range(BRACKET_ROUNDS):
-        x = IMG_PAD_LEFT + r * (BOX_W + ROUND_GAP)
-        round_names = {0: "Round 1", 1: "Round 2", 2: "Finals"}
+    # --- Title banner ---
+    title_y = 30 if not champion else 26
+    draw.text((img_w / 2, title_y), state.title, fill=(245, 244, 250), font=font_title, anchor="mm")
+
+    if champion:
+        rng = random.Random(hash(champion) & 0xFFFFFFFF)
+        _draw_confetti(draw, img_w, img_h, 90, rng)
+        band_h = 30
+        band_y = 58
+        draw.rectangle([0, band_y, img_w, band_y + band_h], fill=(40, 32, 10))
         draw.text(
-            (x + BOX_W // 2, IMG_PAD_TOP - 15),
-            round_names[r], fill=COL_ROUND_LABEL, font=font_round, anchor="mm",
+            (img_w / 2, band_y + band_h / 2),
+            f"🏆  CHAMPION — {champion}  🏆",
+            fill=COL_CHAMPION_BORDER, font=font_champion if img_w > 500 else font_round, anchor="mm",
         )
+
+    # --- Round headers as pills ---
+    round_names = {0: "Round 1", 1: "Round 2", 2: "Finals"}
+    for r in range(BRACKET_ROUNDS):
+        x = IMG_PAD_LEFT + SEED_BADGE_D + r * (BOX_W + ROUND_GAP)
+        label = round_names[r]
+        bbox = draw.textbbox((0, 0), label, font=font_round)
+        pill_w = (bbox[2] - bbox[0]) + 36
+        pill_x = x + BOX_W / 2 - pill_w / 2
+        pill_y = IMG_PAD_TOP - ROUND_LABEL_H + 4
+        draw.rounded_rectangle(
+            [pill_x, pill_y, pill_x + pill_w, pill_y + 24],
+            radius=12, fill=COL_ROUND_PILL, outline=COL_ROUND_PILL_BORDER, width=1,
+        )
+        draw.text((x + BOX_W / 2, pill_y + 12), label, fill=COL_ROUND_LABEL, font=font_round, anchor="mm")
 
     positions = []
 
@@ -255,17 +369,20 @@ def _draw_bracket_image(state: BracketState) -> Image.Image:
         round_positions = []
 
         for m in range(n):
-            x = IMG_PAD_LEFT + r * (BOX_W + ROUND_GAP)
+            x = IMG_PAD_LEFT + SEED_BADGE_D + r * (BOX_W + ROUND_GAP)
             y = y_offset + m * (2 * BOX_H + BOX_GAP + LABEL_H)
 
             draw.text(
-                (x + BOX_W // 2, y + 4),
-                state.match_label(r, m), fill=COL_MATCH_LABEL, font=font_label, anchor="mm",
+                (x + BOX_W // 2, y + 6),
+                state.match_label(r, m).upper(), fill=COL_MATCH_LABEL, font=font_label, anchor="mm",
             )
 
             team_a = state._team_in_match(r, m, 0)
             team_b = state._team_in_match(r, m, 1)
             winner = state.matches[r][m].get("winner")
+            match_ready = (
+                winner is None and team_a not in ("N/A", "TBD") and team_b not in ("N/A", "TBD")
+            )
 
             for slot, (team, box_y) in enumerate([(team_a, y + LABEL_H), (team_b, y + LABEL_H + BOX_H + BOX_GAP)]):
                 is_empty = team == "N/A"
@@ -273,18 +390,58 @@ def _draw_bracket_image(state: BracketState) -> Image.Image:
                 is_winner = winner is not None and (
                     winner < len(state.participants) and state.participants[winner] == team
                 )
+                is_champion_box = is_winner and r == 2
 
                 if is_winner:
-                    bg, border, text_col = COL_WINNER_BG, COL_WINNER_BORDER, COL_TEXT_WINNER
+                    # Vertical mini-gradient fill for winner boxes for a bit of shine
+                    grad = Image.new("RGB", (BOX_W, BOX_H))
+                    _draw_gradient_background(grad, COL_WINNER_BG_TOP, COL_WINNER_BG_BOTTOM)
+                    mask = Image.new("L", (BOX_W, BOX_H), 0)
+                    mdraw = ImageDraw.Draw(mask)
+                    mdraw.rounded_rectangle([0, 0, BOX_W, BOX_H], radius=8, fill=255)
+                    draw.rounded_rectangle(
+                        [x + 2, box_y + 5, x + BOX_W + 2, box_y + BOX_H + 5], radius=8, fill=COL_SHADOW,
+                    )
+                    img.paste(grad, (int(x), int(box_y)), mask)
+                    border = COL_CHAMPION_BORDER if is_champion_box else COL_WINNER_BORDER
+                    draw.rounded_rectangle(
+                        [x, box_y, x + BOX_W, box_y + BOX_H], radius=8, outline=border,
+                        width=3 if is_champion_box else 2,
+                    )
+                    text_col = COL_TEXT_WINNER
+                elif match_ready:
+                    _draw_shadowed_rounded_rect(
+                        draw, [x, box_y, x + BOX_W, box_y + BOX_H], 8,
+                        COL_READY_BG, COL_READY_BORDER, 2,
+                    )
+                    text_col = COL_TEXT_TEAM
                 elif is_empty or is_tbd:
-                    bg, border, text_col = COL_SLOT_EMPTY_BG, COL_SLOT_BORDER, COL_TEXT_PLACEHOLDER if is_tbd else COL_TEXT_EMPTY
+                    _draw_shadowed_rounded_rect(
+                        draw, [x, box_y, x + BOX_W, box_y + BOX_H], 8,
+                        COL_SLOT_EMPTY_BG, COL_SLOT_BORDER, 1,
+                    )
+                    text_col = COL_TEXT_PLACEHOLDER if is_tbd else COL_TEXT_EMPTY
                 else:
-                    bg, border, text_col = COL_SLOT_TEAM_BG, COL_SLOT_BORDER, COL_TEXT_TEAM
+                    _draw_shadowed_rounded_rect(
+                        draw, [x, box_y, x + BOX_W, box_y + BOX_H], 8,
+                        COL_SLOT_TEAM_BG, COL_SLOT_BORDER, 1,
+                    )
+                    text_col = COL_TEXT_TEAM
 
-                draw.rounded_rectangle(
-                    [x, box_y, x + BOX_W, box_y + BOX_H],
-                    radius=6, fill=bg, outline=border, width=1,
-                )
+                # Seed badge for round 1 boxes with a real team in them
+                text_x = x + 12
+                if r == 0 and not is_empty and not is_tbd:
+                    seed_no = m * 2 + slot + 1
+                    bx = x - SEED_BADGE_D - 6
+                    by = box_y + (BOX_H - SEED_BADGE_D) / 2
+                    draw.ellipse(
+                        [bx, by, bx + SEED_BADGE_D, by + SEED_BADGE_D],
+                        fill=COL_SEED_BG, outline=COL_SLOT_BORDER, width=1,
+                    )
+                    draw.text(
+                        (bx + SEED_BADGE_D / 2, by + SEED_BADGE_D / 2),
+                        str(seed_no), fill=COL_SEED_TEXT, font=font_seed, anchor="mm",
+                    )
 
                 display = "N/A" if is_empty else ("TBD" if is_tbd else _truncate(team, 18))
                 font_use = font_empty if (is_empty or is_tbd) else font_team
@@ -292,7 +449,15 @@ def _draw_bracket_image(state: BracketState) -> Image.Image:
                 text_bbox = draw.textbbox((0, 0), display, font=font_use)
                 text_h = text_bbox[3] - text_bbox[1]
                 ty = box_y + (BOX_H - text_h) / 2
-                draw.text((x + 10, ty), display, fill=text_col, font=font_use)
+                draw.text((text_x, ty), display, fill=text_col, font=font_use)
+
+                if is_winner:
+                    trophy = "🏆" if is_champion_box else "✓"
+                    draw.text(
+                        (x + BOX_W - 20, box_y + BOX_H / 2), trophy,
+                        fill=COL_CHAMPION_BORDER if is_champion_box else COL_TEXT_WINNER,
+                        font=font_team, anchor="mm",
+                    )
 
             round_positions.append((x, y, BOX_W, total_h))
         positions.append(round_positions)
@@ -308,6 +473,10 @@ def _draw_bracket_image(state: BracketState) -> Image.Image:
             if not a_playable and not b_playable:
                 continue
 
+            winner = state.matches[r][m].get("winner")
+            line_col = COL_LINE_WON if winner is not None else COL_LINE
+            line_w = 3 if winner is not None else 2
+
             box_bottom_a = y + LABEL_H + BOX_H
             box_bottom_b = y + LABEL_H + BOX_H + BOX_GAP + BOX_H
             mid_y = (box_bottom_a + box_bottom_b) / 2
@@ -316,13 +485,20 @@ def _draw_bracket_image(state: BracketState) -> Image.Image:
             next_box_y = ny + LABEL_H + (BOX_H if (m % 2 == 1) else 0) + BOX_GAP * (m % 2)
             next_mid_y = next_box_y + BOX_H / 2
 
+            elbow_x = x + w + 30
+            joint_r = 3
+
             if a_playable:
-                draw.line([(x + w, box_bottom_a), (x + w + 30, box_bottom_a)], fill=COL_LINE, width=2)
+                draw.line([(x + w, box_bottom_a), (elbow_x, box_bottom_a)], fill=line_col, width=line_w)
             if b_playable:
-                draw.line([(x + w, box_bottom_b), (x + w + 30, box_bottom_b)], fill=COL_LINE, width=2)
+                draw.line([(x + w, box_bottom_b), (elbow_x, box_bottom_b)], fill=line_col, width=line_w)
             if a_playable or b_playable:
-                draw.line([(x + w + 30, mid_y), (x + w + 30, next_mid_y)], fill=COL_LINE, width=2)
-                draw.line([(x + w + 30, next_mid_y), (nx, next_mid_y)], fill=COL_LINE, width=2)
+                draw.line([(elbow_x, mid_y), (elbow_x, next_mid_y)], fill=line_col, width=line_w)
+                draw.line([(elbow_x, next_mid_y), (nx, next_mid_y)], fill=line_col, width=line_w)
+                draw.ellipse(
+                    [elbow_x - joint_r, next_mid_y - joint_r, elbow_x + joint_r, next_mid_y + joint_r],
+                    fill=line_col,
+                )
 
     return img
 
@@ -345,6 +521,7 @@ def load_bracket(db: dict):
             [{"winner": None} for _ in range(2)],
             [{"winner": None}],
         ]),
+        history=[list(entry) for entry in b.get("history", [])],
     )
 
 
@@ -353,6 +530,7 @@ def save_bracket(db: dict, state: BracketState) -> None:
         "title": state.title,
         "participants": state.participants,
         "matches": state.matches,
+        "history": state.history,
     }
 
 
@@ -1460,8 +1638,79 @@ class BracketPanelView(discord.ui.View):
         await interaction.followup.send("Bracket updated — match list refreshed.", ephemeral=True)
 
     @discord.ui.button(
+        label="Randomize Seeds", style=discord.ButtonStyle.secondary,
+        emoji="🎲", custom_id="bracket_randomize", row=1,
+    )
+    async def randomize_seeds(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.followup.send("No bracket exists.", ephemeral=True)
+            return
+
+        any_winner_set = any(
+            match.get("winner") is not None for rnd in bracket.matches for match in rnd
+        )
+        if any_winner_set:
+            await interaction.followup.send(
+                "Can't reshuffle seeds once matches have been played — clear the bracket first "
+                "if you want a fresh draw.",
+                ephemeral=True,
+            )
+            return
+
+        filled = [p for p in bracket.participants if p != "N/A"]
+        if len(filled) < 2:
+            await interaction.followup.send("Add at least 2 teams before randomizing.", ephemeral=True)
+            return
+
+        import random
+        random.shuffle(filled)
+        bracket.participants = filled + ["N/A"] * (BRACKET_TOTAL_SLOTS - len(filled))
+        bracket.history = []
+        save_bracket(db, bracket)
+        save_db(db)
+
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await _refresh_bracket_panel(interaction.guild, bracket)
+        await interaction.followup.send("🎲 Seeds shuffled — the draw has been re-rolled.", ephemeral=True)
+
+    @discord.ui.button(
+        label="Undo Last Result", style=discord.ButtonStyle.secondary,
+        emoji="↩️", custom_id="bracket_undo", row=1,
+    )
+    async def undo_last(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        bracket = load_bracket(db)
+        if not bracket:
+            await interaction.followup.send("No bracket exists.", ephemeral=True)
+            return
+
+        undone = bracket.undo_last()
+        if undone is None:
+            await interaction.followup.send("Nothing to undo yet.", ephemeral=True)
+            return
+
+        save_bracket(db, bracket)
+        save_db(db)
+
+        generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
+        await _refresh_bracket_public(interaction.guild, bracket)
+        await _refresh_bracket_panel(interaction.guild, bracket)
+
+        r, m = undone
+        await interaction.followup.send(
+            f"↩️ Undid the result of **{bracket.match_label(r, m)}**.", ephemeral=True
+        )
+
+    @discord.ui.button(
         label="Clear Bracket", style=discord.ButtonStyle.danger,
-        custom_id="bracket_clear", row=1,
+        custom_id="bracket_clear", row=2,
     )
     async def clear_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
@@ -1560,6 +1809,8 @@ class BracketAddSelectView(discord.ui.View):
             await interaction.response.send_message("All 8 slots are full.", ephemeral=True)
             return
 
+        playable_before = set(bracket.playable_matches())
+
         bracket.participants[slot] = team_name
         save_bracket(db, bracket)
         save_db(db)
@@ -1569,6 +1820,10 @@ class BracketAddSelectView(discord.ui.View):
         await _refresh_bracket_panel(interaction.guild, bracket)
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
         await _refresh_bracket_public(interaction.guild, bracket)
+
+        newly_ready = [rm for rm in bracket.playable_matches() if rm not in playable_before]
+        if newly_ready:
+            await _announce_ready_matches(interaction.guild, db, bracket, newly_ready)
 
         file = discord.File(BRACKET_IMAGE_PATH, filename=BRACKET_IMAGE_FILENAME)
         for child in self.children:
@@ -1640,6 +1895,8 @@ class BracketWinnerConfirmView(discord.ui.View):
             await interaction.followup.send("No bracket exists.", ephemeral=True)
             return
 
+        playable_before = set(bracket.playable_matches())
+
         if not bracket.set_winner(self.r, self.m, slot):
             await interaction.followup.send("Can't set that winner — match may no longer be playable.", ephemeral=True)
             return
@@ -1664,6 +1921,67 @@ class BracketWinnerConfirmView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.followup.send(msg, ephemeral=True)
+
+        if champion:
+            await _announce_champion(interaction.guild, db, bracket, champion)
+        else:
+            newly_ready = [rm for rm in bracket.playable_matches() if rm not in playable_before]
+            if newly_ready:
+                await _announce_ready_matches(interaction.guild, db, bracket, newly_ready)
+
+
+async def _team_leader_mention(guild: discord.Guild, db: dict, team_name: str) -> str:
+    """Best-effort mention for a team's leader, falling back to the plain team name if the
+    team isn't in the database or the leader can no longer be resolved."""
+    info = db["teams"].get(team_name)
+    if not info:
+        return f"**{team_name}**"
+    leader_id = info.get("leader_id")
+    if leader_id is None:
+        return f"**{team_name}**"
+    member = guild.get_member(leader_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(leader_id)
+        except discord.HTTPException:
+            return f"**{team_name}**"
+    return f"{member.mention} (**{team_name}**)"
+
+
+async def _announce_ready_matches(guild: discord.Guild, db: dict, bracket: BracketState, matches: list):
+    """Pings both teams' leaders in the public bracket channel whenever a match becomes
+    playable (both sides now known), so nobody has to keep refreshing the bracket image
+    to find out who's up next."""
+    channel = guild.get_channel(BRACKET_PUBLIC_CHANNEL_ID) or await guild.fetch_channel(BRACKET_PUBLIC_CHANNEL_ID)
+    for r, m in matches:
+        team_a = bracket._team_in_match(r, m, 0)
+        team_b = bracket._team_in_match(r, m, 1)
+        mention_a = await _team_leader_mention(guild, db, team_a)
+        mention_b = await _team_leader_mention(guild, db, team_b)
+        try:
+            await channel.send(
+                f"⚔️ **{bracket.match_label(r, m)} is ready!** {mention_a} vs {mention_b} — good luck!"
+            )
+        except discord.HTTPException:
+            pass
+
+
+async def _announce_champion(guild: discord.Guild, db: dict, bracket: BracketState, champion: str):
+    """Posts a celebratory embed once the final has a winner."""
+    channel = guild.get_channel(BRACKET_PUBLIC_CHANNEL_ID) or await guild.fetch_channel(BRACKET_PUBLIC_CHANNEL_ID)
+    mention = await _team_leader_mention(guild, db, champion)
+
+    embed = discord.Embed(
+        title="🏆🎉 WE HAVE A CHAMPION! 🎉🏆",
+        description=f"# {champion}\n\nCongratulations {mention} — undefeated champions of **{bracket.title}**!",
+        colour=discord.Colour.gold(),
+    )
+    if os.path.exists(BRACKET_IMAGE_PATH):
+        embed.set_image(url=f"attachment://{BRACKET_IMAGE_FILENAME}")
+        file = discord.File(BRACKET_IMAGE_PATH, filename=BRACKET_IMAGE_FILENAME)
+        await channel.send(content="🎊🎊🎊", embed=embed, file=file)
+    else:
+        await channel.send(content="🎊🎊🎊", embed=embed)
 
 
 # --- Bracket sync on startup ---
