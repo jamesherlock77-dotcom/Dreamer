@@ -1326,7 +1326,7 @@ async def _refresh_bracket_panel(guild: discord.Guild, bracket: BracketState = N
                 pass
 
     embed = build_bracket_panel_embed(bracket)
-    view = BracketPanelView()
+    view = BracketPanelView(bracket)
     await channel.send(embed=embed, view=view)
 
 
@@ -1360,8 +1360,32 @@ async def _refresh_bracket_public(guild: discord.Guild, bracket: BracketState):
 
 class BracketPanelView(discord.ui.View):
     """Persistent view for the bracket control panel."""
-    def __init__(self):
+    def __init__(self, bracket: BracketState = None):
         super().__init__(timeout=None)
+        self._populate_winner_select(bracket)
+
+    def _populate_winner_select(self, bracket: BracketState = None):
+        """Fill the winner-select dropdown with the bracket's currently playable matches
+        (both teams known, no winner picked yet). Without this the select only ever showed
+        a hardcoded placeholder and could never actually be used to pick a winner."""
+        options = []
+        if bracket is not None:
+            for r, m in bracket.playable_matches():
+                team_a = bracket._team_in_match(r, m, 0)
+                team_b = bracket._team_in_match(r, m, 1)
+                label = f"{bracket.match_label(r, m)}: {team_a} vs {team_b}"
+                options.append(discord.SelectOption(label=label[:100], value=f"r{r}m{m}"))
+
+        if options:
+            self.winner_select.options = options[:25]
+            self.winner_select.placeholder = "Select a match to pick a winner…"
+            self.winner_select.disabled = False
+        else:
+            self.winner_select.options = [
+                discord.SelectOption(label="No matches ready yet", value="__placeholder__")
+            ]
+            self.winner_select.placeholder = "No matches ready — add teams first"
+            self.winner_select.disabled = True
 
     @discord.ui.button(
         label="Add Participant", style=discord.ButtonStyle.success,
@@ -1432,7 +1456,8 @@ class BracketPanelView(discord.ui.View):
             return
 
         await _refresh_bracket_public(interaction.guild, bracket)
-        await interaction.followup.send("Bracket updated in the public channel.", ephemeral=True)
+        await _refresh_bracket_panel(interaction.guild, bracket)
+        await interaction.followup.send("Bracket updated — match list refreshed.", ephemeral=True)
 
     @discord.ui.button(
         label="Clear Bracket", style=discord.ButtonStyle.danger,
@@ -1465,7 +1490,7 @@ class BracketPanelView(discord.ui.View):
         value = select.values[0]
         if value == "__placeholder__":
             await interaction.response.send_message(
-                "Click **Generate / Update** first to refresh the match list.",
+                "No matches are ready yet — add participants until both slots of a match are filled.",
                 ephemeral=True,
             )
             return
