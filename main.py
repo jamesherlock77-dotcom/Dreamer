@@ -7,6 +7,7 @@ import json
 import logging
 import math as _math
 import textwrap as _textwrap
+from datetime import datetime, timezone
 from dataclasses import dataclass, field as _field
 from typing import Optional as _Optional
 
@@ -31,7 +32,8 @@ logging.getLogger("discord.app_commands.tree").addFilter(_SuppressAutocompleteRa
 # ---------- Config ----------
 CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
 TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are created in
-LOG_CHANNEL_ID = 1528147225799037008       # single JSON "database" message lives here
+TEAMS_LOG_CHANNEL_ID = 1530008905663512626 # Teams JSON "database" message lives here
+GIVEAWAYS_LOG_CHANNEL_ID = 1530009058294370476 # Giveaways JSON "database" message lives here
 REFERENCE_ROLE_ID = 1528009686509420616    # team roles are kept positioned just above this role
 STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use staff team-management commands
 PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
@@ -49,7 +51,8 @@ OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_
 OCULUS_VERSION_FILE = "oculus_version.json"  # tracks the last version we've already announced
 META_UPDATE_EMOJI = "<:Meta:1528228318510452786>"
 
-DB_FILE = "teams.json"
+TEAMS_DB_FILE = "teams.json"
+GIVEAWAYS_DB_FILE = "giveaways.json"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
@@ -542,21 +545,33 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 # ---------- JSON "database" helpers ----------
-def load_db() -> dict:
-    if not os.path.exists(DB_FILE):
-        return {"teams": {}, "giveaways": {}}
-    with open(DB_FILE, "r", encoding="utf-8") as f:
+def load_teams_db() -> dict:
+    if not os.path.exists(TEAMS_DB_FILE):
+        return {"teams": {}, "bracket": {}}
+    with open(TEAMS_DB_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    if "teams" not in data:
-        # migrate old flat-format {team_name: {...}} files
-        data = {"teams": data}
     data.setdefault("teams", {})
+    return data
+
+
+def save_teams_db(data: dict) -> None:
+    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    with open(TEAMS_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_giveaways_db() -> dict:
+    if not os.path.exists(GIVEAWAYS_DB_FILE):
+        return {"giveaways": {}}
+    with open(GIVEAWAYS_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
     data.setdefault("giveaways", {})
     return data
 
 
-def save_db(data: dict) -> None:
-    with open(DB_FILE, "w", encoding="utf-8") as f:
+def save_giveaways_db(data: dict) -> None:
+    data["last_updated"] = datetime.now(timezone.utc).isoformat()
+    with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
@@ -619,7 +634,6 @@ def _extract_oculus_display_version(entry: dict):
 
 def _extract_release_timestamp(entry: dict):
     """Returns a Unix epoch int from the entry's release/upload date, or the current time."""
-    from datetime import datetime, timezone
     ts = entry.get("uploadDate") or entry.get("lastPublishedDate") or entry.get("created")
     if ts:
         try:
@@ -634,7 +648,6 @@ def _build_update_embed(display_version, previous_version=None, release_ts=None)
     """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style:
     title, a Meta-emoji header, updated/last-logged version blocks, time of release,
     and the support banner image — with a live "Checked at ... UTC" footer/timestamp."""
-    from datetime import datetime, timezone
 
     embed = discord.Embed(
         title="AC: Arena Hub",
@@ -743,74 +756,128 @@ async def before_check_oculus_updates():
     await bot.wait_until_ready()
 
 
-# Cache of the single database message so we edit it in place instead of
+# Cache of the single database messages so we edit them in place instead of
 # posting a new file every time. Populated lazily by scanning channel history.
-_db_message_cache = None
+_teams_msg_cache = None
+_giveaways_msg_cache = None
 
 # User IDs with a /createteam request currently awaiting admin confirmation,
 # so the same user can't queue up multiple pending requests.
 pending_team_requests: set = set()
 
 
-async def get_or_create_db_message():
-    global _db_message_cache
-    if _db_message_cache is not None:
-        return _db_message_cache
+async def get_or_create_teams_db_message():
+    global _teams_msg_cache
+    if _teams_msg_cache is not None:
+        return _teams_msg_cache
 
-    channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+    channel = bot.get_channel(TEAMS_LOG_CHANNEL_ID) or await bot.fetch_channel(TEAMS_LOG_CHANNEL_ID)
     async for msg in channel.history(limit=50):
-        if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == DB_FILE:
-            _db_message_cache = msg
+        if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == TEAMS_DB_FILE:
+            _teams_msg_cache = msg
             return msg
     return None
 
 
-async def backup_db_to_log_channel():
-    """Keeps a single message in the log channel updated with the current database,
-    editing it in place rather than posting a new file every time."""
-    global _db_message_cache
+async def get_or_create_giveaways_db_message():
+    global _giveaways_msg_cache
+    if _giveaways_msg_cache is not None:
+        return _giveaways_msg_cache
 
-    channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
-    with open(DB_FILE, "rb") as f:
+    channel = bot.get_channel(GIVEAWAYS_LOG_CHANNEL_ID) or await bot.fetch_channel(GIVEAWAYS_LOG_CHANNEL_ID)
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == GIVEAWAYS_DB_FILE:
+            _giveaways_msg_cache = msg
+            return msg
+    return None
+
+
+async def backup_teams_db():
+    """Keeps a single message in the teams log channel updated with the current teams database."""
+    global _teams_msg_cache
+
+    channel = bot.get_channel(TEAMS_LOG_CHANNEL_ID) or await bot.fetch_channel(TEAMS_LOG_CHANNEL_ID)
+    with open(TEAMS_DB_FILE, "rb") as f:
         file_bytes = f.read()
-    new_file = discord.File(io.BytesIO(file_bytes), filename=DB_FILE)
+    new_file = discord.File(io.BytesIO(file_bytes), filename=TEAMS_DB_FILE)
 
-    msg = await get_or_create_db_message()
+    msg = await get_or_create_teams_db_message()
     if msg is not None:
         try:
-            edited = await msg.edit(content="📦 Database (auto-updated):", attachments=[new_file])
-            _db_message_cache = edited
+            edited = await msg.edit(content="📦 Teams Database (auto-updated):", attachments=[new_file])
+            _teams_msg_cache = edited
             return
         except discord.HTTPException:
             pass  # message may have been deleted; fall through and send a fresh one
 
-    sent = await channel.send(content="📦 Database (auto-updated):", file=new_file)
-    _db_message_cache = sent
+    sent = await channel.send(content="📦 Teams Database (auto-updated):", file=new_file)
+    _teams_msg_cache = sent
 
 
-async def restore_db_from_log_channel():
-    """Pulls the last known database backup from the log channel into local storage.
-    Critical because Railway wipes the container's disk on every redeploy — without this,
-    every restart would silently start from an empty database even though a good backup
-    is sitting in Discord."""
-    global _db_message_cache
+async def backup_giveaways_db():
+    """Keeps a single message in the giveaways log channel updated with the current giveaways database."""
+    global _giveaways_msg_cache
 
-    if os.path.exists(DB_FILE):
+    channel = bot.get_channel(GIVEAWAYS_LOG_CHANNEL_ID) or await bot.fetch_channel(GIVEAWAYS_LOG_CHANNEL_ID)
+    with open(GIVEAWAYS_DB_FILE, "rb") as f:
+        file_bytes = f.read()
+    new_file = discord.File(io.BytesIO(file_bytes), filename=GIVEAWAYS_DB_FILE)
+
+    msg = await get_or_create_giveaways_db_message()
+    if msg is not None:
+        try:
+            edited = await msg.edit(content="📦 Giveaways Database (auto-updated):", attachments=[new_file])
+            _giveaways_msg_cache = edited
+            return
+        except discord.HTTPException:
+            pass  # message may have been deleted; fall through and send a fresh one
+
+    sent = await channel.send(content="📦 Giveaways Database (auto-updated):", file=new_file)
+    _giveaways_msg_cache = sent
+
+
+async def restore_teams_db():
+    """Pulls the last known teams database backup from the log channel into local storage."""
+    global _teams_msg_cache
+
+    if os.path.exists(TEAMS_DB_FILE):
         return  # local data already present (e.g. a crash-restart, not a fresh container)
 
     try:
-        channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
+        channel = bot.get_channel(TEAMS_LOG_CHANNEL_ID) or await bot.fetch_channel(TEAMS_LOG_CHANNEL_ID)
         async for msg in channel.history(limit=50):
-            if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == DB_FILE:
+            if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == TEAMS_DB_FILE:
                 data = await msg.attachments[0].read()
-                with open(DB_FILE, "wb") as f:
+                with open(TEAMS_DB_FILE, "wb") as f:
                     f.write(data)
-                _db_message_cache = msg
-                print("Restored database from log channel backup.")
+                _teams_msg_cache = msg
+                print("Restored teams database from log channel backup.")
                 return
-        print("No existing database backup found in log channel — starting fresh.")
+        print("No existing teams database backup found in log channel — starting fresh.")
     except discord.HTTPException as e:
-        print(f"Failed to restore database from log channel: {e}")
+        print(f"Failed to restore teams database from log channel: {e}")
+
+
+async def restore_giveaways_db():
+    """Pulls the last known giveaways database backup from the log channel into local storage."""
+    global _giveaways_msg_cache
+
+    if os.path.exists(GIVEAWAYS_DB_FILE):
+        return  # local data already present (e.g. a crash-restart, not a fresh container)
+
+    try:
+        channel = bot.get_channel(GIVEAWAYS_LOG_CHANNEL_ID) or await bot.fetch_channel(GIVEAWAYS_LOG_CHANNEL_ID)
+        async for msg in channel.history(limit=50):
+            if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == GIVEAWAYS_DB_FILE:
+                data = await msg.attachments[0].read()
+                with open(GIVEAWAYS_DB_FILE, "wb") as f:
+                    f.write(data)
+                _giveaways_msg_cache = msg
+                print("Restored giveaways database from log channel backup.")
+                return
+        print("No existing giveaways database backup found in log channel — starting fresh.")
+    except discord.HTTPException as e:
+        print(f"Failed to restore giveaways database from log channel: {e}")
 
 
 def find_team_by_leader(db: dict, user_id: int):
@@ -1116,7 +1183,7 @@ class TournamentSubmissionView(discord.ui.View):
         label="Submit", style=discord.ButtonStyle.success, custom_id="tournament_submission_submit"
     )
     async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = load_db()
+        db = load_teams_db()
         team_key = find_team_by_channel(db["teams"], interaction.channel_id)
         if not team_key:
             await interaction.response.send_message(
@@ -1187,7 +1254,7 @@ class TournamentSubmissionModal(discord.ui.Modal):
             )
             return
 
-        db = load_db()
+        db = load_teams_db()
         info = db["teams"].get(self.team_name)
         if info is None:
             await interaction.response.send_message(
@@ -1400,7 +1467,7 @@ class TournamentTeamSelectView(discord.ui.View):
             await interaction.response.send_message("There are no teams yet.", ephemeral=True)
             return
 
-        db = load_db()
+        db = load_teams_db()
         if team_name not in db["teams"]:
             await interaction.response.send_message(
                 "That team no longer exists — the panel may be out of date.", ephemeral=True
@@ -1426,7 +1493,7 @@ class TournamentTeamSelectView(discord.ui.View):
                     if match:
                         current_page = int(match.group(1)) - 1
 
-        db = load_db()
+        db = load_teams_db()
         team_names = sorted(db["teams"].keys())
         new_view = TournamentTeamSelectView(team_names, page=current_page + delta)
         await interaction.response.edit_message(view=new_view)
@@ -1445,7 +1512,7 @@ async def refresh_tournament_panel():
             except discord.HTTPException:
                 pass
 
-    db = load_db()
+    db = load_teams_db()
     team_names = sorted(db["teams"].keys())
 
     embed = discord.Embed(
@@ -1571,7 +1638,7 @@ class BracketPanelView(discord.ui.View):
         custom_id="bracket_add_participant", row=0,
     )
     async def add_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
@@ -1605,7 +1672,7 @@ class BracketPanelView(discord.ui.View):
         custom_id="bracket_remove_participant", row=0,
     )
     async def remove_participant(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.response.send_message("No bracket exists. Create one first.", ephemeral=True)
@@ -1628,7 +1695,7 @@ class BracketPanelView(discord.ui.View):
     async def generate_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.followup.send("No bracket exists. Create one first.", ephemeral=True)
@@ -1645,7 +1712,7 @@ class BracketPanelView(discord.ui.View):
     async def randomize_seeds(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.followup.send("No bracket exists.", ephemeral=True)
@@ -1672,7 +1739,7 @@ class BracketPanelView(discord.ui.View):
         bracket.participants = filled + ["N/A"] * (BRACKET_TOTAL_SLOTS - len(filled))
         bracket.history = []
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
         await _refresh_bracket_public(interaction.guild, bracket)
@@ -1686,7 +1753,7 @@ class BracketPanelView(discord.ui.View):
     async def undo_last(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.followup.send("No bracket exists.", ephemeral=True)
@@ -1698,7 +1765,7 @@ class BracketPanelView(discord.ui.View):
             return
 
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
         await _refresh_bracket_public(interaction.guild, bracket)
@@ -1716,7 +1783,7 @@ class BracketPanelView(discord.ui.View):
     async def clear_bracket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.followup.send("No bracket to clear.", ephemeral=True)
@@ -1724,7 +1791,7 @@ class BracketPanelView(discord.ui.View):
 
         bracket.clear_all()
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
         await _refresh_bracket_public(interaction.guild, bracket)
@@ -1753,7 +1820,7 @@ class BracketPanelView(discord.ui.View):
             await interaction.response.send_message("Invalid match reference.", ephemeral=True)
             return
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.response.send_message("No bracket exists.", ephemeral=True)
@@ -1790,7 +1857,7 @@ class BracketAddSelectView(discord.ui.View):
     async def add_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         team_name = select.values[0]
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.response.send_message("No bracket exists.", ephemeral=True)
@@ -1814,7 +1881,7 @@ class BracketAddSelectView(discord.ui.View):
 
         bracket.participants[slot] = team_name
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         await interaction.response.defer(ephemeral=True)
 
@@ -1852,7 +1919,7 @@ class BracketRemoveSelectView(discord.ui.View):
     async def remove_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         slot = int(select.values[0])
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.response.send_message("No bracket exists.", ephemeral=True)
@@ -1862,7 +1929,7 @@ class BracketRemoveSelectView(discord.ui.View):
         bracket.participants[slot] = "N/A"
         bracket.clear_after(slot)
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         await _refresh_bracket_panel(interaction.guild, bracket)
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
@@ -1890,7 +1957,7 @@ class BracketWinnerConfirmView(discord.ui.View):
     async def _pick(self, interaction: discord.Interaction, slot: int, winner_name: str):
         await interaction.response.defer(ephemeral=True)
 
-        db = load_db()
+        db = load_teams_db()
         bracket = load_bracket(db)
         if not bracket:
             await interaction.followup.send("No bracket exists.", ephemeral=True)
@@ -1903,7 +1970,7 @@ class BracketWinnerConfirmView(discord.ui.View):
             return
 
         save_bracket(db, bracket)
-        save_db(db)
+        save_teams_db(db)
 
         generate_bracket_image(bracket, BRACKET_IMAGE_PATH)
         await _refresh_bracket_public(interaction.guild, bracket)
@@ -1989,7 +2056,7 @@ async def _announce_champion(guild: discord.Guild, db: dict, bracket: BracketSta
 
 async def sync_bracket(guild: discord.Guild):
     """On startup: refresh both bracket channels if a bracket exists."""
-    db = load_db()
+    db = load_teams_db()
     bracket = load_bracket(db)
     if bracket is None:
         return
@@ -2031,8 +2098,8 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
             except discord.HTTPException:
                 pass
 
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
     return True
 
 
@@ -2042,7 +2109,7 @@ async def sync_existing_teams():
     own team channel (so they can ping the team, delete messages, and pin messages).
     Idempotent — cheap after the first run, and self-heals if a permission or role is
     ever reverted manually."""
-    db = load_db()
+    db = load_teams_db()
     if not db["teams"]:
         return
 
@@ -2115,7 +2182,7 @@ class DeleteTeamView(discord.ui.View):
     @discord.ui.button(label="Delete current team", style=discord.ButtonStyle.danger)
     async def delete_team(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        db = load_db()
+        db = load_teams_db()
         deleted = await perform_team_deletion(
             db, self.team_name, self.guild, reason=f"Team deleted by {interaction.user}"
         )
@@ -2148,7 +2215,7 @@ class ConfirmDeleteTeamView(discord.ui.View):
     @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        db = load_db()
+        db = load_teams_db()
         deleted = await perform_team_deletion(
             db, self.team_name, self.guild, reason=f"Team deleted by staff member {interaction.user}"
         )
@@ -2309,7 +2376,7 @@ class ConfirmTeamView(discord.ui.View):
         except discord.Forbidden:
             pass
 
-        db = load_db()
+        db = load_teams_db()
         db["teams"][self.team_name] = {
             "emoji": self.emoji,
             "leader_id": self.requester_id,
@@ -2317,8 +2384,8 @@ class ConfirmTeamView(discord.ui.View):
             "channel_id": team_channel.id,
             "members": [self.requester_id],
         }
-        save_db(db)
-        await backup_db_to_log_channel()
+        save_teams_db(db)
+        await backup_teams_db()
         pending_team_requests.discard(self.requester_id)
 
         await interaction.followup.send(
@@ -2354,7 +2421,7 @@ class InviteResponseView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
 
-        db = load_db()
+        db = load_teams_db()
         info = db["teams"].get(self.team_name)
         if info is None:
             for child in self.children:
@@ -2383,8 +2450,8 @@ class InviteResponseView(discord.ui.View):
 
         if self.invited_user_id not in info["members"]:
             info["members"].append(self.invited_user_id)
-        save_db(db)
-        await backup_db_to_log_channel()
+        save_teams_db(db)
+        await backup_teams_db()
 
         channel = guild.get_channel(info["channel_id"])
         if channel:
@@ -2480,7 +2547,7 @@ class GiveawayJoinView(discord.ui.View):
         custom_id="giveaway_join_button",
     )
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = load_db()
+        db = load_giveaways_db()
         giveaways = db.setdefault("giveaways", {})
         key = str(interaction.message.id)
         info = giveaways.get(key)
@@ -2501,11 +2568,11 @@ class GiveawayJoinView(discord.ui.View):
             entries.append(user_id)
             joined = True
 
-        save_db(db)
+        save_giveaways_db(db)
         # Persist every entry/leave to the log-channel backup immediately, not just when a
         # giveaway ends — otherwise entries collected since the last backup would be lost
         # if the bot restarts (Railway wipes the container disk on every redeploy).
-        await backup_db_to_log_channel()
+        await backup_giveaways_db()
 
         embed = build_giveaway_embed(
             prize=info["prize"],
@@ -2578,7 +2645,7 @@ async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
 
 @tasks.loop(seconds=30)
 async def check_giveaways():
-    db = load_db()
+    db = load_giveaways_db()
     giveaways = db.get("giveaways", {})
     if not giveaways:
         return
@@ -2602,8 +2669,8 @@ async def check_giveaways():
         changed = True
 
     if changed:
-        save_db(db)
-        await backup_db_to_log_channel()
+        save_giveaways_db(db)
+        await backup_giveaways_db()
 
 
 @check_giveaways.before_loop
@@ -2642,7 +2709,7 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
         )
         return
 
-    db = load_db()
+    db = load_teams_db()
 
     if find_team_key_ci(db["teams"], name):
         await interaction.followup.send(
@@ -2702,7 +2769,7 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
 async def teammembers(interaction: discord.Interaction, team: str):
     await interaction.response.defer()
 
-    db = load_db()
+    db = load_teams_db()
     key = find_team_key_ci(db["teams"], team)
     if not key:
         await interaction.followup.send("No team found with that name.", ephemeral=True)
@@ -2728,7 +2795,7 @@ async def teammembers(interaction: discord.Interaction, team: str):
 
 @teammembers.autocomplete("team")
 async def teammembers_team_autocomplete(interaction: discord.Interaction, current: str):
-    db = load_db()
+    db = load_teams_db()
     return [
         app_commands.Choice(name=key, value=key)
         for key in db["teams"].keys()
@@ -2741,7 +2808,7 @@ async def teammembers_team_autocomplete(interaction: discord.Interaction, curren
 async def invite(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_by_leader(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You must be a team leader to invite people.", ephemeral=True)
@@ -2784,7 +2851,7 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
 async def leaveteam(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_by_member(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You're not in a team.", ephemeral=True)
@@ -2804,8 +2871,8 @@ async def leaveteam(interaction: discord.Interaction):
         await interaction.user.remove_roles(role, reason="Left the team")
 
     info["members"] = [uid for uid in info["members"] if uid != interaction.user.id]
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
 
     await interaction.followup.send(f"You left **{team_key}**.", ephemeral=True)
 
@@ -2815,7 +2882,7 @@ async def leaveteam(interaction: discord.Interaction):
 async def kickteammember(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_by_leader(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
@@ -2839,14 +2906,14 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
         await member.remove_roles(role, reason=f"Kicked from team by {interaction.user}")
 
     info["members"] = [uid for uid in info["members"] if uid != member.id]
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
 
     await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
 async def team_name_autocomplete(interaction: discord.Interaction, current: str):
-    db = load_db()
+    db = load_teams_db()
     return [
         app_commands.Choice(name=key, value=key)
         for key in db["teams"].keys()
@@ -2879,7 +2946,7 @@ async def staffchangesetting(
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_key_ci(db["teams"], team)
     if not team_key:
         await interaction.followup.send("No team found with that name.", ephemeral=True)
@@ -2988,8 +3055,8 @@ async def staffchangesetting(
     if changeicon:
         db["teams"][team_key]["emoji"] = new_emoji
 
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
 
     changes = []
     if changename:
@@ -3024,7 +3091,7 @@ async def cleanuporphanteams(interaction: discord.Interaction):
         await interaction.followup.send("Couldn't find the team category.", ephemeral=True)
         return
 
-    db = load_db()
+    db = load_teams_db()
     known_channel_ids = {info["channel_id"] for info in db["teams"].values()}
 
     orphans = []  # list of (channel, role_or_None)
@@ -3090,7 +3157,7 @@ async def premiumteamsettings(
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_by_leader(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
@@ -3222,8 +3289,8 @@ async def premiumteamsettings(
         except discord.HTTPException:
             pass
 
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
 
     changes = []
     if colour1_label:
@@ -3264,7 +3331,7 @@ async def changeteamsettings(
 ):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
+    db = load_teams_db()
     team_key = find_team_by_leader(db["teams"], interaction.user.id)
     if not team_key:
         await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
@@ -3373,8 +3440,8 @@ async def changeteamsettings(
     if changeicon:
         db["teams"][team_key]["emoji"] = new_emoji
 
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_teams_db(db)
+    await backup_teams_db()
 
     changes = []
     if changename:
@@ -3434,7 +3501,7 @@ async def startgiveaway(
         embed.set_image(url=None)
         sent = await interaction.channel.send(embed=embed, view=view)
 
-    db = load_db()
+    db = load_giveaways_db()
     db.setdefault("giveaways", {})
     db["giveaways"][str(sent.id)] = {
         "guild_id": interaction.guild.id,
@@ -3446,8 +3513,8 @@ async def startgiveaway(
         "entries": [],
         "ended": False,
     }
-    save_db(db)
-    await backup_db_to_log_channel()
+    save_giveaways_db(db)
+    await backup_giveaways_db()
 
     await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} Giveaway started in {sent.channel.mention}!", ephemeral=True)
 
@@ -3522,7 +3589,7 @@ async def testupdate(interaction: discord.Interaction):
 async def bracket_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
-    db = load_db()
+    db = load_teams_db()
     existing = load_bracket(db)
     if existing:
         await interaction.followup.send(
@@ -3533,7 +3600,7 @@ async def bracket_cmd(interaction: discord.Interaction):
 
     new_bracket = BracketState()
     save_bracket(db, new_bracket)
-    save_db(db)
+    save_teams_db(db)
 
     await _refresh_bracket_panel(interaction.guild, new_bracket)
 
@@ -3548,7 +3615,8 @@ async def bracket_cmd(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    await restore_db_from_log_channel()
+    await restore_teams_db()
+    await restore_giveaways_db()
     bot.add_view(SupportPanelView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
