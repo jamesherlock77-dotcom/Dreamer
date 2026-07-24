@@ -2502,6 +2502,10 @@ class GiveawayJoinView(discord.ui.View):
             joined = True
 
         save_db(db)
+        # Persist every entry/leave to the log-channel backup immediately, not just when a
+        # giveaway ends — otherwise entries collected since the last backup would be lost
+        # if the bot restarts (Railway wipes the container disk on every redeploy).
+        await backup_db_to_log_channel()
 
         embed = build_giveaway_embed(
             prize=info["prize"],
