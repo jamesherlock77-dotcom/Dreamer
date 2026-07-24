@@ -86,10 +86,11 @@ def load_db() -> dict:
 
 
 def save_db(data: dict) -> None:
+    now = discord.utils.utcnow().isoformat()
     with open(TEAMS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump({"teams": data.get("teams", {})}, f, indent=2)
+        json.dump({"teams": data.get("teams", {}), "last_updated": now}, f, indent=2)
     with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump({"giveaways": data.get("giveaways", {})}, f, indent=2)
+        json.dump({"giveaways": data.get("giveaways", {}), "last_updated": now}, f, indent=2)
 
 
 # ---------- Meta Quest Store update tracker (Animal Company, via OculusDB's public API) ----------
@@ -119,6 +120,7 @@ def save_oculus_version_state(current_version_code, previous_display_version=Non
             {
                 "current_version_code": current_version_code,
                 "previous_display_version": previous_display_version,
+                "last_updated": discord.utils.utcnow().isoformat(),
             },
             f,
         )
@@ -387,13 +389,15 @@ async def restore_db_from_log_channel():
     if "teams" not in legacy:
         legacy = {"teams": legacy}  # migrate very old flat-format files too
 
+    migrated_at = discord.utils.utcnow().isoformat()
+
     if not have_teams:
         with open(TEAMS_DB_FILE, "w", encoding="utf-8") as f:
-            json.dump({"teams": legacy.get("teams", {})}, f, indent=2)
+            json.dump({"teams": legacy.get("teams", {}), "last_updated": migrated_at}, f, indent=2)
         print("Migrated teams data from the legacy combined log channel.")
     if not have_giveaways:
         with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
-            json.dump({"giveaways": legacy.get("giveaways", {})}, f, indent=2)
+            json.dump({"giveaways": legacy.get("giveaways", {}), "last_updated": migrated_at}, f, indent=2)
         print("Migrated giveaways data from the legacy combined log channel.")
 
     # Push the split data into the two new dedicated channels right away, rather than
