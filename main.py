@@ -413,6 +413,13 @@ async def restore_db_from_log_channel():
 # current week and all-time. The counts live in MESSAGES_DB_FILE and are backed up as an
 # auto-updated message in MESSAGE_LOG_CHANNEL_ID (reusing the generic backup/restore
 # helpers above), the same way teams and giveaways are.
+#
+# Backups are debounced rather than sent on every single message (to stay well clear of
+# Discord's edit rate limits on busy servers): each tracked message just flips a "dirty"
+# flag, and a short-interval loop below pushes a fresh backup only when something changed.
+_message_stats_dirty = False
+
+
 def load_message_stats() -> dict:
     if not os.path.exists(MESSAGES_DB_FILE):
         return {"users": {}}
@@ -436,6 +443,7 @@ def _current_week_start() -> str:
 
 
 def record_tracked_message(user_id: int) -> None:
+    global _message_stats_dirty
     data = load_message_stats()
     week_start = _current_week_start()
     key = str(user_id)
@@ -447,17 +455,31 @@ def record_tracked_message(user_id: int) -> None:
     entry["weekly"] = entry.get("weekly", 0) + 1
     entry["overall"] = entry.get("overall", 0) + 1
     save_message_stats(data)
+    _message_stats_dirty = True
 
 
 async def backup_message_stats_to_log_channel():
-    if os.path.exists(MESSAGES_DB_FILE):
+    if not os.path.exists(MESSAGES_DB_FILE):
+        return
+    try:
         await _backup_file_to_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up message stats to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the loop
+        print(f"Unexpected error backing up message stats: {e}")
 
 
 async def restore_message_stats_from_log_channel():
     if os.path.exists(MESSAGES_DB_FILE):
-        return  # local data already present (e.g. a crash-restart, not a fresh container)
-    found = await _restore_file_from_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
+        # Local data already present (e.g. a crash-restart, not a fresh container) — push
+        # it straight to the log channel so the backup there is confirmed up to date.
+        await backup_message_stats_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore message stats from log channel: {e}")
+        return
     if found:
         print("Restored message stats from log channel backup.")
     else:
@@ -473,8 +495,12 @@ async def on_message(message: discord.Message):
     record_tracked_message(message.author.id)
 
 
-@tasks.loop(minutes=5)
+@tasks.loop(seconds=30)
 async def backup_message_stats():
+    global _message_stats_dirty
+    if not _message_stats_dirty:
+        return
+    _message_stats_dirty = False
     await backup_message_stats_to_log_channel()
 
 
