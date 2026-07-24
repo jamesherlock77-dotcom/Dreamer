@@ -5,6 +5,7 @@ import io
 import re
 import json
 import logging
+from datetime import timedelta
 
 import aiohttp
 import emoji as emoji_lib
@@ -39,6 +40,7 @@ TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, curre
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
+MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
 OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
 OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
 OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_ID}?onlydownloadable=true"
@@ -47,6 +49,7 @@ META_UPDATE_EMOJI = "<:Meta:1528228318510452786>"
 
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
+MESSAGES_DB_FILE = "messages_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -403,6 +406,81 @@ async def restore_db_from_log_channel():
     # Push the split data into the two new dedicated channels right away, rather than
     # waiting for the next command that happens to save.
     await backup_db_to_log_channel()
+
+
+# ---------- Message tracking (weekly + overall) ----------
+# Every non-bot message sent anywhere in the server is counted per-user, both for the
+# current week and all-time. The counts live in MESSAGES_DB_FILE and are backed up as an
+# auto-updated message in MESSAGE_LOG_CHANNEL_ID (reusing the generic backup/restore
+# helpers above), the same way teams and giveaways are.
+def load_message_stats() -> dict:
+    if not os.path.exists(MESSAGES_DB_FILE):
+        return {"users": {}}
+    with open(MESSAGES_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("users", {})
+    return data
+
+
+def save_message_stats(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(MESSAGES_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _current_week_start() -> str:
+    """Returns the ISO date (YYYY-MM-DD) of the Monday 00:00 UTC that starts the current week."""
+    now = discord.utils.utcnow()
+    monday = now - timedelta(days=now.weekday())
+    return monday.date().isoformat()
+
+
+def record_tracked_message(user_id: int) -> None:
+    data = load_message_stats()
+    week_start = _current_week_start()
+    key = str(user_id)
+    entry = data["users"].setdefault(key, {"overall": 0, "weekly": 0, "week_start": week_start})
+    if entry.get("week_start") != week_start:
+        # A new week has started since this user's last tracked message — reset the weekly count.
+        entry["weekly"] = 0
+        entry["week_start"] = week_start
+    entry["weekly"] = entry.get("weekly", 0) + 1
+    entry["overall"] = entry.get("overall", 0) + 1
+    save_message_stats(data)
+
+
+async def backup_message_stats_to_log_channel():
+    if os.path.exists(MESSAGES_DB_FILE):
+        await _backup_file_to_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
+
+
+async def restore_message_stats_from_log_channel():
+    if os.path.exists(MESSAGES_DB_FILE):
+        return  # local data already present (e.g. a crash-restart, not a fresh container)
+    found = await _restore_file_from_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
+    if found:
+        print("Restored message stats from log channel backup.")
+    else:
+        print("No existing message stats backup found — starting fresh.")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.guild is None:
+        return  # ignore DMs
+    record_tracked_message(message.author.id)
+
+
+@tasks.loop(minutes=5)
+async def backup_message_stats():
+    await backup_message_stats_to_log_channel()
+
+
+@backup_message_stats.before_loop
+async def before_backup_message_stats():
+    await bot.wait_until_ready()
 
 
 def find_team_by_leader(db: dict, user_id: int):
@@ -2562,9 +2640,49 @@ async def testupdate(interaction: discord.Interaction):
     )
 
 
+# ---------- Message stats slash command ----------
+@bot.tree.command(name="messagestats", description="Show weekly and overall message leaderboards")
+async def messagestats(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    data = load_message_stats()
+    users = data.get("users", {})
+    week_start = _current_week_start()
+
+    weekly_rows = [
+        (uid, entry.get("weekly", 0))
+        for uid, entry in users.items()
+        if entry.get("week_start") == week_start and entry.get("weekly", 0) > 0
+    ]
+    weekly_rows.sort(key=lambda r: r[1], reverse=True)
+
+    overall_rows = [(uid, entry.get("overall", 0)) for uid, entry in users.items() if entry.get("overall", 0) > 0]
+    overall_rows.sort(key=lambda r: r[1], reverse=True)
+
+    def _format_rows(rows: list) -> str:
+        if not rows:
+            return "No messages tracked yet."
+        return "\n".join(f"**{i}.** <@{uid}> — {count}" for i, (uid, count) in enumerate(rows[:10], start=1))
+
+    embed = discord.Embed(
+        title="📊 Message Stats",
+        description="Tracking messages sent anywhere in the server.",
+        colour=discord.Colour.blurple(),
+    )
+    embed.add_field(name=f"This Week (since {week_start})", value=_format_rows(weekly_rows), inline=False)
+    embed.add_field(name="All-Time", value=_format_rows(overall_rows), inline=False)
+
+    last_updated = data.get("last_updated")
+    if last_updated:
+        embed.set_footer(text=f"Last updated: {last_updated}")
+
+    await interaction.followup.send(embed=embed)
+
+
 @bot.event
 async def on_ready():
     await restore_db_from_log_channel()
+    await restore_message_stats_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
@@ -2587,6 +2705,8 @@ async def on_ready():
         check_oculus_updates.start()
     if not check_giveaways.is_running():
         check_giveaways.start()
+    if not backup_message_stats.is_running():
+        backup_message_stats.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
