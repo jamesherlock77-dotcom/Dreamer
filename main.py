@@ -40,6 +40,7 @@ TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, curre
 MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
+TEAM_STATS_CHANNEL_ID = 1530999622405980334  # the team stats panel is posted/refreshed here
 MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
 OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
 OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
@@ -686,6 +687,9 @@ async def refresh_support_ticket_panel():
     await channel.send(embed=embed, file=file, view=view)
 
 
+# ---------- Team stats panel ----------
+TEAM_STATS_PANEL_TITLE = "AC: Arena Hub"
+
 # ---------- Tournament submission panel ----------
 TOURNAMENT_PANEL_TITLE = "Tournament Submissions"
 TOURNAMENT_COMPETITOR_EMOJI = "<:SilverTrophy:1528216893297791098>"
@@ -1153,6 +1157,156 @@ async def refresh_tournament_panel():
         colour=discord.Colour.gold(),
     )
     await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
+
+
+TEAM_STATS_TEAMS_PER_PAGE = 25
+_TEAM_STATS_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
+
+
+def build_team_stats_embed(team_name: str, info: dict, guild: discord.Guild) -> discord.Embed:
+    """Stats card shown when someone picks a team from the stats dropdown. Pulls what we
+    actually track per-team: member count/cap, the leader, and premium status. Noted as
+    possibly not fully accurate since role membership can drift from the members list."""
+    role = guild.get_role(info.get("role_id"))
+    member_count = len(info.get("members", []))
+    leader_id = info.get("leader_id")
+
+    embed = discord.Embed(
+        title=f"{info.get('emoji', '')} {team_name}",
+        colour=discord.Colour.orange(),
+    )
+    embed.add_field(name="Leader", value=f"<@{leader_id}>" if leader_id else "Unknown", inline=False)
+    embed.add_field(
+        name="Members", value=f"**{member_count}** / {MAX_TEAM_MEMBERS}", inline=False
+    )
+    embed.add_field(
+        name="Premium", value="✅ Yes" if info.get("premium") else "❌ No", inline=False
+    )
+    if role is not None:
+        embed.add_field(name="Role", value=role.mention, inline=False)
+    embed.set_footer(text="Stats may not be fully accurate.")
+    return embed
+
+
+class TeamStatsSelectView(discord.ui.View):
+    """The dropdown panel shown in the team-stats channel. Same paging approach as
+    TournamentTeamSelectView (Discord caps select menus at 25 options, and current page is
+    read back from the live message's select placeholder so a single persistent view
+    instance can serve every message and survive restarts), but each option also shows the
+    team's emoji, and picking one replies with that team's stats instead of opening a modal."""
+
+    def __init__(self, team_names: list = None, page: int = 0, keep_nav_buttons: bool = False):
+        super().__init__(timeout=None)
+        db = load_db()
+        all_names = list(team_names or [])
+        total_pages = max(1, -(-len(all_names) // TEAM_STATS_TEAMS_PER_PAGE)) if all_names else 1
+        page = max(0, min(page, total_pages - 1))
+        start = page * TEAM_STATS_TEAMS_PER_PAGE
+        page_names = all_names[start:start + TEAM_STATS_TEAMS_PER_PAGE]
+
+        options = []
+        for name in page_names:
+            info = db["teams"].get(name, {})
+            emoji = info.get("emoji")
+            option_kwargs = {"label": name[:100], "value": name[:100]}
+            if emoji and is_valid_standard_emoji(emoji):
+                option_kwargs["emoji"] = emoji
+            options.append(discord.SelectOption(**option_kwargs))
+        if not options:
+            options = [discord.SelectOption(label="No teams yet", value="__none__")]
+        self.team_select.options = options
+
+        placeholder = "Select a team..."
+        if total_pages > 1:
+            placeholder += f" (page {page + 1}/{total_pages})"
+        self.team_select.placeholder = placeholder
+
+        if total_pages <= 1 and not keep_nav_buttons:
+            self.remove_item(self.prev_page)
+            self.remove_item(self.next_page)
+        else:
+            self.prev_page.disabled = page <= 0
+            self.next_page.disabled = page >= total_pages - 1
+
+    @discord.ui.select(
+        placeholder="Select a team...",
+        custom_id="team_stats_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        team_name = select.values[0]
+        if team_name == "__none__":
+            await interaction.response.send_message("There are no teams yet.", ephemeral=True)
+            return
+
+        db = load_db()
+        info = db["teams"].get(team_name)
+        if info is None:
+            await interaction.response.send_message(
+                "That team no longer exists — the panel may be out of date.", ephemeral=True
+            )
+            return
+
+        embed = build_team_stats_embed(team_name, info, interaction.guild)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="team_stats_prev_page", row=1)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, -1)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="team_stats_next_page", row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._go_to_page(interaction, 1)
+
+    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
+        current_page = 0
+        for row in interaction.message.components:
+            for component in row.children:
+                if getattr(component, "custom_id", None) == "team_stats_select":
+                    match = _TEAM_STATS_PAGE_RE.search(component.placeholder or "")
+                    if match:
+                        current_page = int(match.group(1)) - 1
+
+        db = load_db()
+        team_names = sorted(db["teams"].keys())
+        new_view = TeamStatsSelectView(team_names, page=current_page + delta)
+        await interaction.response.edit_message(view=new_view)
+
+
+async def refresh_team_stats_panel():
+    """Deletes any previously posted team-stats panel in the target channel and posts a
+    fresh one listing the current teams. Called on every bot startup so the panel never
+    goes stale or duplicates across restarts."""
+    channel = bot.get_channel(TEAM_STATS_CHANNEL_ID) or await bot.fetch_channel(TEAM_STATS_CHANNEL_ID)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TEAM_STATS_PANEL_TITLE:
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+
+    db = load_db()
+    team_names = sorted(db["teams"].keys())
+
+    embed = discord.Embed(
+        title=TEAM_STATS_PANEL_TITLE,
+        description=(
+            "Welcome! Here, you'll find stats for every team including your own. "
+            "Please keep in mind, these stats may not be full accurate."
+        ),
+        colour=discord.Colour.orange(),
+    )
+    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+
+    view = TeamStatsSelectView(team_names)
+
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+        await channel.send(embed=embed, file=file, view=view)
+    else:
+        embed.set_image(url=None)
+        await channel.send(embed=embed, view=view)
 
 
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
@@ -2713,6 +2867,7 @@ async def on_ready():
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
     bot.add_view(CodeRecipientSelectView([], keep_nav_buttons=True))
+    bot.add_view(TeamStatsSelectView(keep_nav_buttons=True))
     bot.add_view(GiveawayJoinView())
     await bot.tree.sync()
     try:
@@ -2727,6 +2882,10 @@ async def on_ready():
         await refresh_tournament_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
+    try:
+        await refresh_team_stats_panel()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh team stats panel: {e}")
     if not check_oculus_updates.is_running():
         check_oculus_updates.start()
     if not check_giveaways.is_running():
