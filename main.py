@@ -1164,27 +1164,33 @@ _TEAM_STATS_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
 
 
 def build_team_stats_embed(team_name: str, info: dict, guild: discord.Guild) -> discord.Embed:
-    """Stats card shown when someone picks a team from the stats dropdown. Pulls what we
-    actually track per-team: member count/cap, the leader, and premium status. Noted as
-    possibly not fully accurate since role membership can drift from the members list."""
+    """Stats card shown when someone picks a team from the stats dropdown. Match stats
+    (rating, matches played, tournaments, placements, win rate, K/D) aren't tracked
+    anywhere yet, so they're placeholder N/A fields until that data exists somewhere.
+    The embed colour follows the team's own role colour instead of a fixed colour."""
     role = guild.get_role(info.get("role_id"))
-    member_count = len(info.get("members", []))
     leader_id = info.get("leader_id")
+    emoji = info.get("emoji", "")
+
+    description = (
+        f"## {team_name} Team {emoji}\n"
+        f"Leader: {f'<@{leader_id}>' if leader_id else 'Unknown'}\n"
+        f"Overall Rating: ` N/A `\n"
+        f"---\n"
+        f"*Matches ever played:* `N/A`\n"
+        f"*Tournaments Won:* ` N/A `\n"
+        f"*Best ever placement:* ` N/A `\n"
+        f"---\n"
+        f"*Win Rate:* ` N/A `\n"
+        f"*Average kills:* ` N/A `\n"
+        f"*Average deaths:* ` N/A `\n"
+        f"*Kill to death Ratio:* ` N/A `"
+    )
 
     embed = discord.Embed(
-        title=f"{info.get('emoji', '')} {team_name}",
-        colour=discord.Colour.orange(),
+        description=description,
+        colour=role.colour if role is not None else discord.Colour.orange(),
     )
-    embed.add_field(name="Leader", value=f"<@{leader_id}>" if leader_id else "Unknown", inline=False)
-    embed.add_field(
-        name="Members", value=f"**{member_count}** / {MAX_TEAM_MEMBERS}", inline=False
-    )
-    embed.add_field(
-        name="Premium", value="✅ Yes" if info.get("premium") else "❌ No", inline=False
-    )
-    if role is not None:
-        embed.add_field(name="Role", value=role.mention, inline=False)
-    embed.set_footer(text="Stats may not be fully accurate.")
     return embed
 
 
