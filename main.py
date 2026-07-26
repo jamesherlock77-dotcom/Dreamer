@@ -41,6 +41,7 @@ MAX_TEAM_MEMBERS = 20                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TEAM_STATS_CHANNEL_ID = 1530999622405980334  # the team stats panel is posted/refreshed here
+STATS_LOG_CHANNEL_ID = 1531007591331795126  # team stats JSON "database" message lives here
 MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
 OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
 OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
@@ -51,6 +52,7 @@ META_UPDATE_EMOJI = "<:Meta:1528228318510452786>"
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
 MESSAGES_DB_FILE = "messages_data.json"
+TEAM_STATS_DB_FILE = "team_stats_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -508,6 +510,64 @@ async def backup_message_stats():
 @backup_message_stats.before_loop
 async def before_backup_message_stats():
     await bot.wait_until_ready()
+
+
+# ---------- Team stats (set via /statssettings, shown on the team-stats panel) ----------
+# Match/performance stats aren't derived from anything else the bot tracks — they're set
+# manually by staff via /statssettings and just stored per-team here. Keyed by team name so
+# a rename in /changeteamsettings or /staffchangesetting doesn't automatically carry the
+# stats over; see the rename-handling note near those commands.
+TEAM_STAT_FIELDS = {
+    "rating": "Overall Rating",
+    "matches": "Matches ever played",
+    "tournaments": "Tournaments Won",
+    "placement": "Best ever placement",
+    "winrate": "Win Rate",
+    "avgkills": "Average kills",
+    "avgdeaths": "Average deaths",
+    "kd": "Kill to death Ratio",
+}
+
+
+def load_team_stats() -> dict:
+    if not os.path.exists(TEAM_STATS_DB_FILE):
+        return {"teams": {}}
+    with open(TEAM_STATS_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("teams", {})
+    return data
+
+
+def save_team_stats(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(TEAM_STATS_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_team_stats_to_log_channel():
+    try:
+        await _backup_file_to_channel(STATS_LOG_CHANNEL_ID, TEAM_STATS_DB_FILE, TEAM_STATS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up team stats to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill a command
+        print(f"Unexpected error backing up team stats: {e}")
+
+
+async def restore_team_stats_from_log_channel():
+    if os.path.exists(TEAM_STATS_DB_FILE):
+        # Local data already present (e.g. a crash-restart, not a fresh container) — push
+        # it straight to the log channel so the backup there is confirmed up to date.
+        await backup_team_stats_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(STATS_LOG_CHANNEL_ID, TEAM_STATS_DB_FILE, TEAM_STATS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore team stats from log channel: {e}")
+        return
+    if found:
+        print("Restored team stats from log channel backup.")
+    else:
+        print("No existing team stats backup found — starting fresh.")
 
 
 def find_team_by_leader(db: dict, user_id: int):
@@ -1163,28 +1223,31 @@ TEAM_STATS_TEAMS_PER_PAGE = 25
 _TEAM_STATS_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
 
 
-def build_team_stats_embed(team_name: str, info: dict, guild: discord.Guild) -> discord.Embed:
-    """Stats card shown when someone picks a team from the stats dropdown. Match stats
-    (rating, matches played, tournaments, placements, win rate, K/D) aren't tracked
-    anywhere yet, so they're placeholder N/A fields until that data exists somewhere.
-    The embed colour follows the team's own role colour instead of a fixed colour."""
+def build_team_stats_embed(team_name: str, info: dict, stats: dict, guild: discord.Guild) -> discord.Embed:
+    """Stats card shown when someone picks a team from the stats dropdown. `stats` comes
+    from the team_stats database (set via /statssettings) — any field not yet set shows as
+    N/A. The embed colour follows the team's own role colour instead of a fixed colour."""
     role = guild.get_role(info.get("role_id"))
     leader_id = info.get("leader_id")
     emoji = info.get("emoji", "")
 
+    def stat(key: str) -> str:
+        value = stats.get(key)
+        return str(value) if value not in (None, "") else "N/A"
+
     description = (
         f"## {team_name} Team {emoji}\n"
         f"Leader: {f'<@{leader_id}>' if leader_id else 'Unknown'}\n"
-        f"Overall Rating: ` N/A `\n"
+        f"Overall Rating: ` {stat('rating')} `\n"
         f"---\n"
-        f"*Matches ever played:* `N/A`\n"
-        f"*Tournaments Won:* ` N/A `\n"
-        f"*Best ever placement:* ` N/A `\n"
+        f"*Matches ever played:* `{stat('matches')}`\n"
+        f"*Tournaments Won:* ` {stat('tournaments')} `\n"
+        f"*Best ever placement:* ` {stat('placement')} `\n"
         f"---\n"
-        f"*Win Rate:* ` N/A `\n"
-        f"*Average kills:* ` N/A `\n"
-        f"*Average deaths:* ` N/A `\n"
-        f"*Kill to death Ratio:* ` N/A `"
+        f"*Win Rate:* ` {stat('winrate')} `\n"
+        f"*Average kills:* ` {stat('avgkills')} `\n"
+        f"*Average deaths:* ` {stat('avgdeaths')} `\n"
+        f"*Kill to death Ratio:* ` {stat('kd')} `"
     )
 
     embed = discord.Embed(
@@ -1253,7 +1316,10 @@ class TeamStatsSelectView(discord.ui.View):
             )
             return
 
-        embed = build_team_stats_embed(team_name, info, interaction.guild)
+        stats_db = load_team_stats()
+        stats = stats_db["teams"].get(team_name, {})
+
+        embed = build_team_stats_embed(team_name, info, stats, interaction.guild)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="team_stats_prev_page", row=1)
@@ -2318,6 +2384,80 @@ staffchangesetting.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(
+    name="statssettings",
+    description="(Staff) Set a team's stats shown on the team-stats panel",
+)
+@app_commands.describe(
+    team="Team to update",
+    overall="Overall rating",
+    matches="Matches ever played",
+    tournaments="Tournaments won",
+    placement="Best ever placement",
+    winrate="Win rate",
+    avgkills="Average kills",
+    avgdeaths="Average deaths",
+    kd="Kill to death ratio",
+)
+async def statssettings(
+    interaction: discord.Interaction,
+    team: str,
+    overall: str = None,
+    matches: str = None,
+    tournaments: str = None,
+    placement: str = None,
+    winrate: str = None,
+    avgkills: str = None,
+    avgdeaths: str = None,
+    kd: str = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    provided = {
+        "rating": overall,
+        "matches": matches,
+        "tournaments": tournaments,
+        "placement": placement,
+        "winrate": winrate,
+        "avgkills": avgkills,
+        "avgdeaths": avgdeaths,
+        "kd": kd,
+    }
+    updates = {key: value for key, value in provided.items() if value is not None}
+
+    if not updates:
+        await interaction.followup.send(
+            "You didn't provide any stats to update. Every field is optional, but you need to "
+            "set at least one.",
+            ephemeral=True,
+        )
+        return
+
+    stats_db = load_team_stats()
+    team_stats = stats_db["teams"].setdefault(team_key, {})
+    team_stats.update(updates)
+    save_team_stats(stats_db)
+    await backup_team_stats_to_log_channel()
+
+    changes = [f"{TEAM_STAT_FIELDS[key]} → `{value}`" for key, value in updates.items()]
+    await interaction.followup.send(
+        f"✅ Updated stats for **{team_key}**:\n" + "\n".join(changes), ephemeral=True
+    )
+
+
+statssettings.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(
     name="cleanuporphanteams",
     description="(Staff) Delete channels/roles in the team category that have no matching database entry",
 )
@@ -2869,6 +3009,7 @@ async def messagestats(interaction: discord.Interaction):
 async def on_ready():
     await restore_db_from_log_channel()
     await restore_message_stats_from_log_channel()
+    await restore_team_stats_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
