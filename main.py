@@ -5,7 +5,7 @@ import io
 import re
 import json
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 import aiohttp
 import emoji as emoji_lib
@@ -38,6 +38,7 @@ PREMIUM_ROLE_ID_2 = 1529805001088569384    # a second role that also grants prem
 CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-existing teams are grandfathered in)
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 10                      # includes the leader
+TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a team before leaving it
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
@@ -410,6 +411,32 @@ def find_team_key_ci(db: dict, name: str):
         if key.lower() == name_lower:
             return key
     return None
+
+
+def record_team_join(info: dict, user_id: int) -> None:
+    """Stamps the current time as when user_id joined this team, stored in the team's own
+    'joined_at' map (user_id -> ISO timestamp) inside the team database. Used to enforce the
+    TEAM_JOIN_COOLDOWN_DAYS wait before a member can leave and join a different team."""
+    info.setdefault("joined_at", {})[str(user_id)] = discord.utils.utcnow().isoformat()
+
+
+def clear_team_join(info: dict, user_id: int) -> None:
+    """Removes a member's join-date record, e.g. once they've left or been kicked."""
+    info.get("joined_at", {}).pop(str(user_id), None)
+
+
+def get_team_leave_eligible_ts(info: dict, user_id: int):
+    """Returns the unix timestamp at which user_id becomes free to leave this team (i.e.
+    TEAM_JOIN_COOLDOWN_DAYS after they joined), or None if there's no join date on record
+    (e.g. teams/members that existed before this feature was added)."""
+    joined_at_raw = info.get("joined_at", {}).get(str(user_id))
+    if not joined_at_raw:
+        return None
+    try:
+        joined_at = datetime.fromisoformat(joined_at_raw)
+    except ValueError:
+        return None
+    return int((joined_at + timedelta(days=TEAM_JOIN_COOLDOWN_DAYS)).timestamp())
 
 
 def is_valid_standard_emoji(text: str) -> bool:
@@ -1434,6 +1461,7 @@ class ConfirmTeamView(discord.ui.View):
             "channel_id": team_channel.id,
             "members": [self.requester_id],
         }
+        record_team_join(db["teams"][self.team_name], self.requester_id)
         save_db(db)
         await backup_db_to_log_channel()
         pending_team_requests.discard(self.requester_id)
@@ -1500,6 +1528,7 @@ class InviteResponseView(discord.ui.View):
 
         if self.invited_user_id not in info["members"]:
             info["members"].append(self.invited_user_id)
+        record_team_join(info, self.invited_user_id)
         save_db(db)
         await backup_db_to_log_channel()
 
@@ -1916,11 +1945,23 @@ async def leaveteam(interaction: discord.Interaction):
         )
         return
 
+    eligible_ts = get_team_leave_eligible_ts(info, interaction.user.id)
+    now_ts = int(discord.utils.utcnow().timestamp())
+    if eligible_ts is not None and now_ts < eligible_ts:
+        await interaction.followup.send(
+            f"You joined **{team_key}** less than {TEAM_JOIN_COOLDOWN_DAYS} days ago, so you "
+            f"can't leave (and join a different team) yet. You'll be able to leave "
+            f"<t:{eligible_ts}:R> (<t:{eligible_ts}:F>).",
+            ephemeral=True,
+        )
+        return
+
     role = interaction.guild.get_role(info["role_id"])
     if role:
         await interaction.user.remove_roles(role, reason="Left the team")
 
     info["members"] = [uid for uid in info["members"] if uid != interaction.user.id]
+    clear_team_join(info, interaction.user.id)
     save_db(db)
     await backup_db_to_log_channel()
 
@@ -1956,6 +1997,7 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
         await member.remove_roles(role, reason=f"Kicked from team by {interaction.user}")
 
     info["members"] = [uid for uid in info["members"] if uid != member.id]
+    clear_team_join(info, member.id)
     save_db(db)
     await backup_db_to_log_channel()
 
