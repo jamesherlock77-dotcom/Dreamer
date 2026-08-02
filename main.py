@@ -39,7 +39,9 @@ CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-ex
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 10                      # includes the leader
 TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a team before leaving it
-SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
+SUPPORT_TICKET_CHANNEL_ID = 1530456581903486996  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
+TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener) whenever a new ticket thread is opened
+TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
@@ -51,6 +53,7 @@ TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
 MESSAGES_DB_FILE = "messages_data.json"
 TEAM_STATS_DB_FILE = "team_stats_data.json"
+TICKETS_DB_FILE = "tickets_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -384,6 +387,53 @@ async def restore_team_stats_from_log_channel():
         print("No existing team stats backup found — starting fresh.")
 
 
+# ---------- Tickets (opened from the support panel) ----------
+# Each opened ticket gets a sequential number and a thread; the counter and a record of
+# every ticket (thread ID -> number/opener/category/closed state) live in TICKETS_DB_FILE
+# and are backed up as an auto-updated message in TICKET_LOG_CHANNEL_ID, the same way
+# teams/giveaways/message-stats/team-stats are.
+def load_ticket_db() -> dict:
+    if not os.path.exists(TICKETS_DB_FILE):
+        return {"next_number": 1, "tickets": {}}
+    with open(TICKETS_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("next_number", 1)
+    data.setdefault("tickets", {})
+    return data
+
+
+def save_ticket_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(TICKETS_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_ticket_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(TICKET_LOG_CHANNEL_ID, TICKETS_DB_FILE, TICKETS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up ticket db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill a command
+        print(f"Unexpected error backing up ticket db: {e}")
+
+
+async def restore_ticket_db_from_log_channel():
+    if os.path.exists(TICKETS_DB_FILE):
+        # Local data already present (e.g. a crash-restart, not a fresh container) — push
+        # it straight to the log channel so the backup there is confirmed up to date.
+        await backup_ticket_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(TICKET_LOG_CHANNEL_ID, TICKETS_DB_FILE, TICKETS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore ticket db from log channel: {e}")
+        return
+    if found:
+        print("Restored ticket db from log channel backup.")
+    else:
+        print("No existing ticket db backup found — starting fresh.")
+
+
 def find_team_by_leader(db: dict, user_id: int):
     for name, info in db.items():
         if info["leader_id"] == user_id:
@@ -536,7 +586,61 @@ def build_support_ticket_embed() -> discord.Embed:
     return embed
 
 
-# ---------- Cosmetic dropdown shown under the support ticket panel banner ----------
+# ---------- Persistent "Close" button attached to every ticket thread's first message ----------
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close_button")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread = interaction.channel
+        if not isinstance(thread, discord.Thread):
+            await interaction.response.send_message(
+                "This can only be used inside a ticket thread.", ephemeral=True
+            )
+            return
+
+        db = load_ticket_db()
+        ticket = db["tickets"].get(str(thread.id))
+
+        is_opener = ticket is not None and interaction.user.id == ticket.get("opener_id")
+        if not (has_staff_role(interaction.user) or is_opener):
+            await interaction.response.send_message(
+                "You don't have permission to close this ticket.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+
+        if ticket is not None:
+            ticket["closed"] = True
+            save_ticket_db(db)
+            await backup_ticket_db_to_log_channel()
+
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+        try:
+            await thread.send(f"🔒 Ticket closed by {interaction.user.mention}.")
+        except discord.HTTPException:
+            pass
+
+        try:
+            await thread.edit(
+                name="closed-ticket",
+                archived=True,
+                locked=True,
+                reason=f"Ticket closed by {interaction.user}",
+            )
+        except discord.HTTPException:
+            pass
+
+
+# ---------- Dropdown shown under the support ticket panel banner — opens a ticket thread ----------
 class SupportPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -556,24 +660,75 @@ class SupportPanelView(discord.ui.View):
         custom_id="support_panel_category_select",
     )
     async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        # Cosmetic only for now — no ticket creation logic wired up yet.
-        await interaction.response.send_message(
-            "Ticket creation isn't set up yet — check back soon!", ephemeral=True
+        await interaction.response.defer(ephemeral=True)
+
+        category_label = select.values[0]
+        channel = interaction.guild.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(
+            SUPPORT_TICKET_CHANNEL_ID
         )
+
+        db = load_ticket_db()
+        number = db["next_number"]
+        db["next_number"] = number + 1
+
+        thread_name = f"📈┃{number}-ticket"
+        try:
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.private_thread,
+                reason=f"Ticket opened by {interaction.user}",
+            )
+        except discord.HTTPException:
+            # Private threads require a certain server boost level; fall back to public
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.public_thread,
+                reason=f"Ticket opened by {interaction.user} (private threads unavailable)",
+            )
+
+        try:
+            await thread.add_user(interaction.user)
+        except discord.HTTPException:
+            pass
+
+        db["tickets"][str(thread.id)] = {
+            "number": number,
+            "opener_id": interaction.user.id,
+            "category": category_label,
+            "closed": False,
+            "created_at": discord.utils.utcnow().isoformat(),
+        }
+        save_ticket_db(db)
+        await backup_ticket_db_to_log_channel()
+
+        embed = discord.Embed(
+            title=f"Ticket #{number}",
+            description=(
+                f"**Category:** {category_label}\n\n"
+                f"Thanks for reaching out, {interaction.user.mention}! Please share as much detail "
+                f"as you can, and staff will be with you shortly."
+            ),
+            colour=discord.Colour.orange(),
+        )
+        await thread.send(
+            content=f"<@&{TICKET_PING_ROLE_ID}> {interaction.user.mention}",
+            embed=embed,
+            view=TicketCloseView(),
+        )
+
+        await interaction.followup.send(f"Ticket created: {thread.mention}", ephemeral=True)
 
 
 async def refresh_support_ticket_panel():
-    """Deletes any previously posted support ticket panel in the target channel and
-    posts a fresh one. Called on every bot startup so the panel never goes stale or
-    duplicates across restarts."""
+    """Posts the support ticket panel if one isn't already up in the target channel.
+    Unlike before, this does NOT delete and repost the panel on every startup — that would
+    spam the channel. It only posts a fresh panel the first time (or if the old one was
+    deleted)."""
     channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
 
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == SUPPORT_PANEL_TITLE:
-            try:
-                await msg.delete()
-            except discord.HTTPException:
-                pass
+            return  # panel already posted — leave it alone
 
     view = SupportPanelView()
 
@@ -2729,7 +2884,9 @@ async def on_ready():
     await restore_db_from_log_channel()
     await restore_message_stats_from_log_channel()
     await restore_team_stats_from_log_channel()
+    await restore_ticket_db_from_log_channel()
     bot.add_view(SupportPanelView())
+    bot.add_view(TicketCloseView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
     bot.add_view(TeamStatsSelectView(keep_nav_buttons=True))
