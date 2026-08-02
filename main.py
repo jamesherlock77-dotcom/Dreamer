@@ -40,6 +40,8 @@ TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, curre
 MAX_TEAM_MEMBERS = 10                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
+TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
+TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
 TEAM_STATS_CHANNEL_ID = 1530999622405980334  # the team stats panel is posted/refreshed here
 STATS_LOG_CHANNEL_ID = 1531007591331795126  # team stats JSON "database" message lives here
 MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
@@ -710,20 +712,42 @@ class TournamentSubmissionView(discord.ui.View):
             )
             return
 
-        panel_channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(
-            TOURNAMENT_PANEL_CHANNEL_ID
-        )
+        await interaction.response.defer(ephemeral=True)
 
-        content = (
-            f"**{team_key}** submission\n\n"
-            + build_tournament_submission_content(len(competitors), len(subs), competitors, subs)
-        )
-        recipient_view = await build_code_recipient_view(interaction.guild, recipient_ids)
-        await panel_channel.send(content=content, view=recipient_view)
+        guild = interaction.guild
+        role = guild.get_role(TOURNAMENT_SUBMISSION_ROLE_ID)
 
-        await interaction.response.send_message(
-            f"Submitted — posted in {panel_channel.mention}.", ephemeral=True
-        )
+        granted = 0
+        failed_ids = []
+        for user_id in recipient_ids:
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except discord.HTTPException:
+                    member = None
+            if member is None or role is None:
+                failed_ids.append(user_id)
+                continue
+            try:
+                await member.add_roles(role, reason=f"Tournament submission by {interaction.user} ({team_key})")
+                granted += 1
+            except discord.HTTPException:
+                failed_ids.append(user_id)
+
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException:
+            pass
+
+        if role is None:
+            result_message = "⚠️ Submitted, but couldn't find the tournament role to assign — check the role ID."
+        else:
+            result_message = f"✅ Submitted — gave the tournament role to {granted} member(s)."
+            if failed_ids:
+                result_message += f" Couldn't update {len(failed_ids)} member(s)."
+
+        await interaction.followup.send(result_message, ephemeral=True)
 
 
 class TournamentSubmissionModal(discord.ui.Modal):
@@ -780,146 +804,6 @@ class TournamentSubmissionModal(discord.ui.Modal):
             f"Tournament submission sheet posted in {channel.mention}.", ephemeral=True
         )
 
-
-TOURNAMENT_CODE_RECIPIENTS_PER_PAGE = 25
-_TOURNAMENT_CODE_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
-_MENTION_RE = re.compile(r"<@!?(\d+)>")
-
-
-def extract_mentions_in_order(content: str) -> list:
-    """Pulls every user-mention ID out of a message's content, in order, deduplicated."""
-    seen = set()
-    ids = []
-    for match in _MENTION_RE.finditer(content):
-        user_id = int(match.group(1))
-        if user_id not in seen:
-            seen.add(user_id)
-            ids.append(user_id)
-    return ids
-
-
-class CodeModal(discord.ui.Modal):
-    def __init__(self, recipient_id: int):
-        super().__init__(title="Send Code")
-        self.recipient_id = recipient_id
-        self.code_input = discord.ui.TextInput(
-            label="What's the code?", placeholder="e.g. ABCD-1234", max_length=200
-        )
-        self.add_item(self.code_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        code = self.code_input.value.strip()
-        if not code:
-            await interaction.response.send_message("The code can't be empty.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        member = guild.get_member(self.recipient_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(self.recipient_id)
-            except discord.HTTPException:
-                member = None
-
-        if member is None:
-            await interaction.response.send_message(
-                "Couldn't find that member in the server anymore.", ephemeral=True
-            )
-            return
-
-        try:
-            await member.send(f"Your tournament code: `{code}`")
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                f"Couldn't DM {member.mention} — they may have DMs off.", ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(f"Code sent to {member.mention} ✅", ephemeral=True)
-
-
-class CodeRecipientSelectView(discord.ui.View):
-    """Posted alongside a submitted team's sheet in the panel channel. Lets a staff member
-    pick a person and DM them a code. Like the team-select panel, current page is read
-    back from the message's own select placeholder rather than stored on the view, and the
-    full recipient list is re-derived from the message's mentions — so it survives restarts."""
-
-    def __init__(self, options: list, page: int = 0, total_pages: int = 1, keep_nav_buttons: bool = False):
-        super().__init__(timeout=None)
-        if not options:
-            options = [discord.SelectOption(label="No one signed up", value="__none__")]
-        self.recipient_select.options = options[:25]
-
-        placeholder = "Select a person..."
-        if total_pages > 1:
-            placeholder += f" (page {page + 1}/{total_pages})"
-        self.recipient_select.placeholder = placeholder
-
-        if total_pages <= 1 and not keep_nav_buttons:
-            self.remove_item(self.prev_page)
-            self.remove_item(self.next_page)
-        else:
-            self.prev_page.disabled = page <= 0
-            self.next_page.disabled = page >= total_pages - 1
-
-    @discord.ui.select(
-        placeholder="Select a person...",
-        custom_id="tournament_code_recipient_select",
-        options=[discord.SelectOption(label="placeholder", value="placeholder")],
-    )
-    async def recipient_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        value = select.values[0]
-        if value == "__none__":
-            await interaction.response.send_message("There's no one to send a code to.", ephemeral=True)
-            return
-        await interaction.response.send_modal(CodeModal(int(value)))
-
-    @discord.ui.button(
-        label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="tournament_code_prev_page", row=1
-    )
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, -1)
-
-    @discord.ui.button(
-        label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="tournament_code_next_page", row=1
-    )
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, 1)
-
-    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
-        current_page = 0
-        for row in interaction.message.components:
-            for component in row.children:
-                if getattr(component, "custom_id", None) == "tournament_code_recipient_select":
-                    match = _TOURNAMENT_CODE_PAGE_RE.search(component.placeholder or "")
-                    if match:
-                        current_page = int(match.group(1)) - 1
-
-        recipient_ids = extract_mentions_in_order(interaction.message.content)
-        new_view = await build_code_recipient_view(interaction.guild, recipient_ids, page=current_page + delta)
-        await interaction.response.edit_message(view=new_view)
-
-
-async def build_code_recipient_view(guild: discord.Guild, recipient_ids: list, page: int = 0) -> CodeRecipientSelectView:
-    total_pages = (
-        max(1, -(-len(recipient_ids) // TOURNAMENT_CODE_RECIPIENTS_PER_PAGE)) if recipient_ids else 1
-    )
-    page = max(0, min(page, total_pages - 1))
-    start = page * TOURNAMENT_CODE_RECIPIENTS_PER_PAGE
-    page_ids = recipient_ids[start:start + TOURNAMENT_CODE_RECIPIENTS_PER_PAGE]
-
-    options = []
-    for user_id in page_ids:
-        member = guild.get_member(user_id)
-        if member is None:
-            try:
-                member = await guild.fetch_member(user_id)
-            except discord.HTTPException:
-                member = None
-        label = member.display_name if member else f"Unknown user ({user_id})"
-        options.append(discord.SelectOption(label=label[:100], value=str(user_id)))
-
-    return CodeRecipientSelectView(options, page=page, total_pages=total_pages)
 
 
 TOURNAMENT_TEAMS_PER_PAGE = 25
@@ -1002,19 +886,66 @@ class TournamentTeamSelectView(discord.ui.View):
         new_view = TournamentTeamSelectView(team_names, page=current_page + delta)
         await interaction.response.edit_message(view=new_view)
 
+    @discord.ui.button(
+        label="Clear", style=discord.ButtonStyle.danger, custom_id="tournament_clear_button", row=2
+    )
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to use this.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        role = guild.get_role(TOURNAMENT_SUBMISSION_ROLE_ID)
+
+        removed = 0
+        if role is not None:
+            for member in list(role.members):
+                try:
+                    await member.remove_roles(role, reason=f"Tournament cleared by {interaction.user}")
+                    removed += 1
+                except discord.HTTPException:
+                    pass
+
+        purge_channel = guild.get_channel(TOURNAMENT_CLEAR_PURGE_CHANNEL_ID) or bot.get_channel(
+            TOURNAMENT_CLEAR_PURGE_CHANNEL_ID
+        )
+        if purge_channel is None:
+            try:
+                purge_channel = await bot.fetch_channel(TOURNAMENT_CLEAR_PURGE_CHANNEL_ID)
+            except discord.HTTPException:
+                purge_channel = None
+
+        purged = 0
+        if purge_channel is not None:
+            try:
+                deleted = await purge_channel.purge(limit=None)
+                purged = len(deleted)
+            except discord.HTTPException:
+                pass
+
+        channel_mention = purge_channel.mention if purge_channel else "the target channel"
+        role_note = "the tournament role" if role is not None else "the tournament role (role not found!)"
+        await interaction.followup.send(
+            f"🧹 Cleared — removed {role_note} from {removed} member(s) and purged "
+            f"{purged} message(s) from {channel_mention}.",
+            ephemeral=True,
+        )
+
 
 async def refresh_tournament_panel():
-    """Deletes any previously posted tournament panel in the target channel and posts a
-    fresh one listing the current teams. Called on every bot startup so the panel never
-    goes stale or duplicates across restarts."""
+    """Posts the tournament team-select panel if one isn't already up in the target
+    channel. Unlike before, this does NOT delete and repost the panel on every startup —
+    that would drop the persistent Clear button's state and spam the channel. It only
+    posts a fresh panel the first time (or if the old one was deleted)."""
     channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
 
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
-            try:
-                await msg.delete()
-            except discord.HTTPException:
-                pass
+            return  # panel already posted — leave it alone
 
     db = load_db()
     team_names = sorted(db["teams"].keys())
@@ -2759,7 +2690,6 @@ async def on_ready():
     bot.add_view(SupportPanelView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
-    bot.add_view(CodeRecipientSelectView([], keep_nav_buttons=True))
     bot.add_view(TeamStatsSelectView(keep_nav_buttons=True))
     bot.add_view(GiveawayJoinView())
     await bot.tree.sync()
