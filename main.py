@@ -37,17 +37,12 @@ PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium
 PREMIUM_ROLE_ID_2 = 1529805001088569384    # a second role that also grants premium access
 CREATE_TEAM_ROLE_ID = 1528160422857932868  # required to use /createteam (pre-existing teams are grandfathered in)
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
-MAX_TEAM_MEMBERS = 10                     # includes the leader
+MAX_TEAM_MEMBERS = 10                      # includes the leader
 SUPPORT_TICKET_CHANNEL_ID = 1528355152287760405  # the support ticket panel is posted/refreshed here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TEAM_STATS_CHANNEL_ID = 1530999622405980334  # the team stats panel is posted/refreshed here
 STATS_LOG_CHANNEL_ID = 1531007591331795126  # team stats JSON "database" message lives here
 MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
-OCULUS_UPDATE_CHANNEL_ID = 1528008387420356629  # where Animal Company update announcements post
-OCULUS_APP_ID = "7190422614401072"  # Animal Company's OculusDB app ID
-OCULUS_VERSIONS_URL = f"https://oculusdb.rui2015.me/api/v1/versions/{OCULUS_APP_ID}?onlydownloadable=true"
-OCULUS_VERSION_FILE = "oculus_version.json"  # tracks the last version we've already announced
-META_UPDATE_EMOJI = "<:Meta:1528228318510452786>"
 
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
@@ -97,190 +92,6 @@ def save_db(data: dict) -> None:
         json.dump({"teams": data.get("teams", {}), "last_updated": now}, f, indent=2)
     with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
         json.dump({"giveaways": data.get("giveaways", {}), "last_updated": now}, f, indent=2)
-
-
-# ---------- Meta Quest Store update tracker (Animal Company, via OculusDB's public API) ----------
-def load_oculus_version_state() -> dict:
-    """Load persisted version state. Returns {"current_version_code": ..., "previous_display_version": ...}.
-    Backward-compatible with older files that stored "last_version_code" or "previous_version_code"."""
-    if not os.path.exists(OCULUS_VERSION_FILE):
-        return {"current_version_code": None, "previous_display_version": None}
-    try:
-        with open(OCULUS_VERSION_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return {
-                "current_version_code": data.get("current_version_code") or data.get("last_version_code"),
-                "previous_display_version": data.get("previous_display_version")
-                or data.get("previous_version_code")
-                or data.get("last_display_version"),
-            }
-        return {"current_version_code": None, "previous_display_version": None}
-    except (json.JSONDecodeError, OSError):
-        return {"current_version_code": None, "previous_display_version": None}
-
-
-def save_oculus_version_state(current_version_code, previous_display_version=None) -> None:
-    with open(OCULUS_VERSION_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "current_version_code": current_version_code,
-                "previous_display_version": previous_display_version,
-                "last_updated": discord.utils.utcnow().isoformat(),
-            },
-            f,
-        )
-
-
-def _extract_latest_oculus_version_entry(payload):
-    """Confirmed against a live response: OculusDB's /api/v1/versions endpoint returns a bare
-    JSON list of version objects, newest first. Still guards against an empty list or an
-    unexpected wrapper dict in case the API shape ever changes."""
-    if isinstance(payload, list):
-        entries = payload
-    elif isinstance(payload, dict):
-        entries = payload.get("versions") or payload.get("data") or payload.get("items") or []
-    else:
-        entries = []
-    return entries[0] if entries else None
-
-
-def _extract_oculus_version_code(entry: dict):
-    """versionCode (e.g. 3211) is the reliable field for detecting an actual new build —
-    confirmed present on every entry in a live response."""
-    return entry.get("versionCode")
-
-
-def _extract_oculus_display_version(entry: dict):
-    """version (e.g. "1.82.2.3211") is the human-readable string shown in the announcement.
-    Falls back to the version code if it's ever missing."""
-    return entry.get("version") or entry.get("versionCode")
-
-
-def _extract_release_timestamp(entry: dict):
-    """Returns a Unix epoch int from the entry's release/upload date, or the current time."""
-    from datetime import datetime, timezone
-    ts = entry.get("uploadDate") or entry.get("lastPublishedDate") or entry.get("created")
-    if ts:
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            return int(dt.timestamp())
-        except (ValueError, TypeError):
-            pass
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def _build_update_embed(display_version, previous_version=None, release_ts=None):
-    """Builds the 'Meta Update Detected' embed matching the AC: Arena Hub style:
-    title, a Meta-emoji header, updated/last-logged version blocks, time of release,
-    and the support banner image — with a live "Checked at ... UTC" footer/timestamp."""
-    from datetime import datetime, timezone
-
-    embed = discord.Embed(
-        title="AC: Arena Hub",
-        description=f"{META_UPDATE_EMOJI} **Meta Update Detected**",
-        colour=discord.Colour.orange(),
-    )
-
-    embed.add_field(
-        name="🟢 Updated Version:",
-        value=f"```\n{display_version}\n```",
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🔴 Last Logged:",
-        value=f"```\n{previous_version if previous_version else 'N/A'}\n```",
-        inline=False,
-    )
-
-    if release_ts:
-        embed.add_field(
-            name="🕒 Time of Live Release:",
-            value=f"<t:{release_ts}:F>\n(<t:{release_ts}:R>)",
-            inline=False,
-        )
-
-    if os.path.exists(SUPPORT_BANNER_PATH):
-        embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
-
-    checked_at = datetime.now(timezone.utc)
-    embed.timestamp = checked_at
-    embed.set_footer(text=f"Checked at {checked_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    return embed
-
-
-@tasks.loop(minutes=10)
-async def check_oculus_updates():
-    if not OCULUS_UPDATE_CHANNEL_ID:
-        return  # not configured yet
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                OCULUS_VERSIONS_URL, timeout=aiohttp.ClientTimeout(total=15)
-            ) as response:
-                if response.status != 200:
-                    print(f"Oculus update check failed: HTTP {response.status}")
-                    return
-                payload = await response.json(content_type=None)
-    except (aiohttp.ClientError, TimeoutError) as e:
-        print(f"Oculus update check failed: {e}")
-        return
-
-    latest_entry = _extract_latest_oculus_version_entry(payload)
-    if latest_entry is None:
-        print("Oculus update check: no version entries found in the response — API shape may have changed.")
-        return
-
-    latest_version_code = _extract_oculus_version_code(latest_entry)
-    if latest_version_code is None:
-        print(f"Oculus update check: couldn't find versionCode in entry: {latest_entry}")
-        return
-
-    state = load_oculus_version_state()
-    last_seen_code = state["current_version_code"]
-
-    if last_seen_code is None:
-        # First run — record baseline without announcing, so a restart never looks like a
-        # fake "update".
-        display_version = _extract_oculus_display_version(latest_entry)
-        save_oculus_version_state(latest_version_code, display_version)
-        return
-
-    if str(latest_version_code) == str(last_seen_code):
-        return  # no change
-
-    display_version = _extract_oculus_display_version(latest_entry)
-    release_ts = _extract_release_timestamp(latest_entry)
-    previous_display = state.get("previous_display_version") or str(last_seen_code)
-
-    channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
-    embed = _build_update_embed(
-        display_version=display_version,
-        previous_version=previous_display,
-        release_ts=release_ts,
-    )
-
-    file = None
-    if os.path.exists(SUPPORT_BANNER_PATH):
-        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-
-    if file:
-        await channel.send(embed=embed, file=file)
-    else:
-        await channel.send(embed=embed)
-
-    # The new display version becomes "previous" the next time an update fires.
-    save_oculus_version_state(
-        current_version_code=latest_version_code,
-        previous_display_version=display_version,
-    )
-
-
-@check_oculus_updates.before_loop
-async def before_check_oculus_updates():
-    await bot.wait_until_ready()
 
 
 # Cache of each database message (keyed by channel ID) so we edit it in place instead of
@@ -2901,71 +2712,6 @@ async def startgiveaway(
     await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} Giveaway started in {sent.channel.mention}!", ephemeral=True)
 
 
-# ---------- /test command (admin-only — posts the update embed in the update channel) ----------
-@bot.tree.command(name="testupdate", description="(Admin) Post a test update embed in the update channel")
-@app_commands.default_permissions(administrator=True)
-async def testupdate(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "Only admins can use this command.", ephemeral=True
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    # Hit the live API so the embed shows real, current data
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                OCULUS_VERSIONS_URL, timeout=aiohttp.ClientTimeout(total=15)
-            ) as response:
-                if response.status != 200:
-                    await interaction.followup.send(
-                        f"API request failed (HTTP {response.status}).", ephemeral=True
-                    )
-                    return
-                payload = await response.json(content_type=None)
-    except (aiohttp.ClientError, TimeoutError) as e:
-        await interaction.followup.send(
-            f"API request failed: {e}", ephemeral=True
-        )
-        return
-
-    latest_entry = _extract_latest_oculus_version_entry(payload)
-    if latest_entry is None:
-        await interaction.followup.send(
-            "No version entries found in the API response.", ephemeral=True
-        )
-        return
-
-    display_version = _extract_oculus_display_version(latest_entry)
-    release_ts = _extract_release_timestamp(latest_entry)
-
-    state = load_oculus_version_state()
-    previous_display = state.get("previous_display_version") or "N/A"
-
-    embed = _build_update_embed(
-        display_version=display_version,
-        previous_version=previous_display,
-        release_ts=release_ts,
-    )
-
-    file = None
-    if os.path.exists(SUPPORT_BANNER_PATH):
-        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-
-    channel = bot.get_channel(OCULUS_UPDATE_CHANNEL_ID) or await bot.fetch_channel(OCULUS_UPDATE_CHANNEL_ID)
-
-    if file:
-        await channel.send(embed=embed, file=file)
-    else:
-        await channel.send(embed=embed)
-
-    await interaction.followup.send(
-        f"Test update posted in {channel.mention}.", ephemeral=True
-    )
-
-
 # ---------- Message stats slash command ----------
 @bot.tree.command(name="messagestats", description="Show weekly and overall message leaderboards")
 async def messagestats(interaction: discord.Interaction):
@@ -3033,8 +2779,6 @@ async def on_ready():
         await refresh_team_stats_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh team stats panel: {e}")
-    if not check_oculus_updates.is_running():
-        check_oculus_updates.start()
     if not check_giveaways.is_running():
         check_giveaways.start()
     if not backup_message_stats.is_running():
