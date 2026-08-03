@@ -641,6 +641,121 @@ class TicketCloseView(discord.ui.View):
 
 
 # ---------- Dropdown shown under the support ticket panel banner — opens a ticket thread ----------
+async def _create_ticket_thread(
+    interaction: discord.Interaction, category_label: str, answers: list[tuple[str, str]]
+):
+    """Shared by the intake modal: opens the ticket thread, pings the role + opener, posts
+    an embed with the submitted answers, and logs the ticket to the database. `answers` is
+    a list of (question, response) pairs shown in the ticket embed."""
+    channel = interaction.guild.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(
+        SUPPORT_TICKET_CHANNEL_ID
+    )
+
+    db = load_ticket_db()
+    number = db["next_number"]
+    db["next_number"] = number + 1
+
+    thread_name = f"📈┃{number}-ticket"
+    try:
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.private_thread,
+            reason=f"Ticket opened by {interaction.user}",
+        )
+    except discord.HTTPException:
+        # Private threads require a certain server boost level; fall back to public
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
+            reason=f"Ticket opened by {interaction.user} (private threads unavailable)",
+        )
+
+    try:
+        await thread.add_user(interaction.user)
+    except discord.HTTPException:
+        pass
+
+    db["tickets"][str(thread.id)] = {
+        "number": number,
+        "opener_id": interaction.user.id,
+        "category": category_label,
+        "answers": {question: response for question, response in answers},
+        "closed": False,
+        "created_at": discord.utils.utcnow().isoformat(),
+    }
+    save_ticket_db(db)
+    await backup_ticket_db_to_log_channel()
+
+    description = f"**Category:** {category_label}\n\n"
+    description += "\n\n".join(f"**{question}**\n{response}" for question, response in answers)
+    embed = discord.Embed(title=f"Ticket #{number}", description=description, colour=discord.Colour.orange())
+    embed.set_footer(text=f"Opened by {interaction.user}")
+
+    await thread.send(
+        content=f"<@&{TICKET_PING_ROLE_ID}> {interaction.user.mention}",
+        embed=embed,
+        view=TicketCloseView(),
+    )
+
+    await interaction.followup.send(f"Ticket created: {thread.mention}", ephemeral=True)
+
+
+class TicketIntakeModal(discord.ui.Modal, title="Open a Ticket"):
+    """Mirrors the intake questions shown on the reference ticket panel. Discord modals
+    cap out at 5 components, which is exactly how many fields the reference panel has."""
+
+    about_user = discord.ui.TextInput(
+        label="Is your issue about another Discord user?",
+        placeholder="Yes or No",
+        max_length=10,
+    )
+    issue = discord.ui.TextInput(
+        label="What is the issue you are experiencing?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Add as much detail as you can!",
+        max_length=1000,
+    )
+    proof = discord.ui.TextInput(
+        label="Do you have proof?",
+        placeholder="Yes or No",
+        max_length=10,
+    )
+    happened_here = discord.ui.TextInput(
+        label="Did the issue happen in this Discord server?",
+        placeholder="We can only moderate situations that happen in this Discord server",
+        max_length=10,
+    )
+    no_game_reports = discord.ui.TextInput(
+        label="Said no above? Don't file a ticket here!",
+        placeholder="We do not handle any game reports here!!!!",
+        required=False,
+        max_length=100,
+    )
+
+    def __init__(self, category_label: str):
+        super().__init__()
+        self.category_label = category_label
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if self.happened_here.value.strip().lower().startswith("n"):
+            await interaction.followup.send(
+                "We can only moderate situations that happen in this Discord server — "
+                "this issue can't be filed as a ticket here.",
+                ephemeral=True,
+            )
+            return
+
+        answers = [
+            (str(self.about_user.label), self.about_user.value),
+            (str(self.issue.label), self.issue.value),
+            (str(self.proof.label), self.proof.value),
+            (str(self.happened_here.label), self.happened_here.value),
+        ]
+        await _create_ticket_thread(interaction, self.category_label, answers)
+
+
 class SupportPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -660,63 +775,7 @@ class SupportPanelView(discord.ui.View):
         custom_id="support_panel_category_select",
     )
     async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        await interaction.response.defer(ephemeral=True)
-
-        category_label = select.values[0]
-        channel = interaction.guild.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(
-            SUPPORT_TICKET_CHANNEL_ID
-        )
-
-        db = load_ticket_db()
-        number = db["next_number"]
-        db["next_number"] = number + 1
-
-        thread_name = f"📈┃{number}-ticket"
-        try:
-            thread = await channel.create_thread(
-                name=thread_name,
-                type=discord.ChannelType.private_thread,
-                reason=f"Ticket opened by {interaction.user}",
-            )
-        except discord.HTTPException:
-            # Private threads require a certain server boost level; fall back to public
-            thread = await channel.create_thread(
-                name=thread_name,
-                type=discord.ChannelType.public_thread,
-                reason=f"Ticket opened by {interaction.user} (private threads unavailable)",
-            )
-
-        try:
-            await thread.add_user(interaction.user)
-        except discord.HTTPException:
-            pass
-
-        db["tickets"][str(thread.id)] = {
-            "number": number,
-            "opener_id": interaction.user.id,
-            "category": category_label,
-            "closed": False,
-            "created_at": discord.utils.utcnow().isoformat(),
-        }
-        save_ticket_db(db)
-        await backup_ticket_db_to_log_channel()
-
-        embed = discord.Embed(
-            title=f"Ticket #{number}",
-            description=(
-                f"**Category:** {category_label}\n\n"
-                f"Thanks for reaching out, {interaction.user.mention}! Please share as much detail "
-                f"as you can, and staff will be with you shortly."
-            ),
-            colour=discord.Colour.orange(),
-        )
-        await thread.send(
-            content=f"<@&{TICKET_PING_ROLE_ID}> {interaction.user.mention}",
-            embed=embed,
-            view=TicketCloseView(),
-        )
-
-        await interaction.followup.send(f"Ticket created: {thread.mention}", ephemeral=True)
+        await interaction.response.send_modal(TicketIntakeModal(select.values[0]))
 
 
 async def refresh_support_ticket_panel():
