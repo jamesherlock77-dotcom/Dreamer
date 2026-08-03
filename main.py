@@ -42,6 +42,7 @@ TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a t
 SUPPORT_TICKET_CHANNEL_ID = 1530456581903486996  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
 TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener) whenever a new ticket thread is opened
 TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
+TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can close any ticket, same as staff
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
@@ -604,7 +605,8 @@ class TicketCloseView(discord.ui.View):
         ticket = db["tickets"].get(str(thread.id))
 
         is_opener = ticket is not None and interaction.user.id == ticket.get("opener_id")
-        if not (has_staff_role(interaction.user) or is_opener):
+        has_close_role = any(role.id == TICKET_CLOSE_ROLE_ID for role in interaction.user.roles)
+        if not (has_staff_role(interaction.user) or has_close_role or is_opener):
             await interaction.response.send_message(
                 "You don't have permission to close this ticket.", ephemeral=True
             )
