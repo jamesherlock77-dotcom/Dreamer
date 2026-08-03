@@ -2902,10 +2902,12 @@ async def startgiveaway(
 
 
 # ---------- Message stats slash command ----------
-@bot.tree.command(name="messagestats", description="Show weekly and overall message leaderboards")
-async def messagestats(interaction: discord.Interaction):
+@bot.tree.command(name="messagestats", description="Show a message-stats card for yourself or another member")
+@app_commands.describe(user="Whose stats to show (defaults to you)")
+async def messagestats(interaction: discord.Interaction, user: discord.Member = None):
     await interaction.response.defer()
 
+    target = user or interaction.user
     data = load_message_stats()
     users = data.get("users", {})
     week_start = _current_week_start()
@@ -2920,22 +2922,42 @@ async def messagestats(interaction: discord.Interaction):
     overall_rows = [(uid, entry.get("overall", 0)) for uid, entry in users.items() if entry.get("overall", 0) > 0]
     overall_rows.sort(key=lambda r: r[1], reverse=True)
 
-    def _format_rows(rows: list) -> str:
-        if not rows:
-            return "No messages tracked yet."
-        return "\n".join(f"**{i}.** <@{uid}> — {count}" for i, (uid, count) in enumerate(rows[:10], start=1))
+    def _rank(rows: list, user_id: int):
+        for i, (uid, _count) in enumerate(rows, start=1):
+            if uid == str(user_id):
+                return i
+        return None
+
+    entry = users.get(str(target.id), {})
+    weekly_count = entry.get("weekly", 0) if entry.get("week_start") == week_start else 0
+    overall_count = entry.get("overall", 0)
+    weekly_rank = _rank(weekly_rows, target.id)
+    overall_rank = _rank(overall_rows, target.id)
+
+    def _rank_suffix(value: int) -> str:
+        if 11 <= value % 100 <= 13:
+            return "th"
+        return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+
+    def _format_rank(rank):
+        return f"#{rank}{_rank_suffix(rank)}" if rank else "Unranked"
 
     embed = discord.Embed(
-        title="📊 Message Stats",
-        description="Tracking messages sent anywhere in the server.",
-        colour=discord.Colour.blurple(),
+        title=f"{target.display_name}'s Message Stats",
+        colour=target.colour if target.colour.value else discord.Colour.blurple(),
     )
-    embed.add_field(name=f"This Week (since {week_start})", value=_format_rows(weekly_rows), inline=False)
-    embed.add_field(name="All-Time", value=_format_rows(overall_rows), inline=False)
-
-    last_updated = data.get("last_updated")
-    if last_updated:
-        embed.set_footer(text=f"Last updated: {last_updated}")
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(
+        name="📅 This Week",
+        value=f"**{weekly_count}** messages\n{_format_rank(weekly_rank)}",
+        inline=True,
+    )
+    embed.add_field(
+        name="📊 All-Time",
+        value=f"**{overall_count}** messages\n{_format_rank(overall_rank)}",
+        inline=True,
+    )
+    embed.set_footer(text=f"Since {week_start}")
 
     await interaction.followup.send(embed=embed)
 
