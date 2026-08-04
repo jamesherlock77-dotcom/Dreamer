@@ -2919,13 +2919,6 @@ async def globalteammessage(interaction: discord.Interaction, message: str):
         await interaction.followup.send("There are no teams to message.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title="📢 Announcement",
-        description=message,
-        colour=discord.Colour.orange(),
-    )
-    embed.set_footer(text=f"Sent by {interaction.user}")
-
     sent = 0
     failed_teams = []
     for team_name, info in db["teams"].items():
@@ -2934,7 +2927,7 @@ async def globalteammessage(interaction: discord.Interaction, message: str):
             failed_teams.append(team_name)
             continue
         try:
-            await channel.send(embed=embed)
+            await channel.send(content=message)
             sent += 1
         except discord.HTTPException:
             failed_teams.append(team_name)
