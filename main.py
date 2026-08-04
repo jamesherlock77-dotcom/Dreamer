@@ -2902,6 +2902,49 @@ async def startgiveaway(
 
 
 # ---------- Message stats slash command ----------
+@bot.tree.command(
+    name="globalteammessage",
+    description="(Staff) Send a message to every team's channel",
+)
+@app_commands.describe(message="The message to send to every team channel")
+async def globalteammessage(interaction: discord.Interaction, message: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    if not db["teams"]:
+        await interaction.followup.send("There are no teams to message.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📢 Announcement",
+        description=message,
+        colour=discord.Colour.orange(),
+    )
+    embed.set_footer(text=f"Sent by {interaction.user}")
+
+    sent = 0
+    failed_teams = []
+    for team_name, info in db["teams"].items():
+        channel = interaction.guild.get_channel(info.get("channel_id"))
+        if channel is None:
+            failed_teams.append(team_name)
+            continue
+        try:
+            await channel.send(embed=embed)
+            sent += 1
+        except discord.HTTPException:
+            failed_teams.append(team_name)
+
+    result = f"✅ Sent to {sent} team channel(s)."
+    if failed_teams:
+        result += f"\n⚠️ Couldn't send to: {', '.join(failed_teams)}."
+    await interaction.followup.send(result, ephemeral=True)
+
+
 @bot.tree.command(name="messagestats", description="Show a message-stats card for yourself or another member")
 @app_commands.describe(user="Whose stats to show (defaults to you)")
 async def messagestats(interaction: discord.Interaction, user: discord.Member = None):
