@@ -1361,6 +1361,30 @@ async def refresh_team_stats_panel():
         await channel.send(embed=embed, view=view)
 
 
+async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: discord.Guild, reason: str) -> bool:
+    """Removes a single member's team role and DB membership (does not touch the leader).
+    Returns False if the team or membership doesn't exist. Note this never enforces the
+    TEAM_JOIN_COOLDOWN_DAYS wait — that cooldown only applies to a member voluntarily using
+    /leaveteam, not to being kicked."""
+    info = db["teams"].get(team_name)
+    if info is None or user_id not in info.get("members", []):
+        return False
+
+    member = guild.get_member(user_id)
+    role = guild.get_role(info["role_id"])
+    if role and member:
+        try:
+            await member.remove_roles(role, reason=reason)
+        except discord.HTTPException:
+            pass
+
+    info["members"] = [uid for uid in info["members"] if uid != user_id]
+    clear_team_join(info, user_id)
+    save_db(db)
+    await backup_db_to_log_channel()
+    return True
+
+
 async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, reason: str) -> bool:
     """Removes a team's role, channel, and DB entry. Returns False if the team was already gone."""
     info = db["teams"].pop(team_name, None)
@@ -1487,6 +1511,66 @@ class DeleteTeamView(discord.ui.View):
 
 
 # ---------- Confirmation view for team deletion (used by /changeteamsettings and /staffchangesetting) ----------
+# ---------- Kick-a-member dropdown, attached to /changeteamsettings and /staffchangesetting ----------
+class KickMemberSelectView(discord.ui.View):
+    """Shows a dropdown of a team's current members (excluding the leader) so a leader or
+    staff member can kick someone right from /changeteamsettings or /staffchangesetting,
+    without needing the separate /kickteammember command. Picking someone kicks them
+    immediately — no confirmation step, matching /kickteammember's own behaviour."""
+
+    def __init__(self, team_name: str, guild: discord.Guild, invoker_id: int):
+        super().__init__(timeout=120)
+        self.team_name = team_name
+        self.guild = guild
+        self.invoker_id = invoker_id
+
+        db = load_db()
+        info = db["teams"].get(team_name, {})
+        member_ids = [uid for uid in info.get("members", []) if uid != info.get("leader_id")]
+
+        options = []
+        for uid in member_ids[:25]:
+            member = guild.get_member(uid)
+            label = member.display_name if member else f"Unknown member ({uid})"
+            options.append(discord.SelectOption(label=label[:100], value=str(uid)))
+
+        if not options:
+            options = [discord.SelectOption(label="No members to kick", value="__none__")]
+            self.kick_select.disabled = True
+        self.kick_select.options = options
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This menu isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(
+        placeholder="Kick a member...",
+        custom_id="kick_member_select",
+        options=[discord.SelectOption(label="placeholder", value="placeholder")],
+    )
+    async def kick_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if select.values[0] == "__none__":
+            await interaction.response.send_message("There's no one to kick.", ephemeral=True)
+            return
+
+        user_id = int(select.values[0])
+        db = load_db()
+        kicked = await perform_team_kick(
+            db, self.team_name, user_id, self.guild, reason=f"Kicked from team by {interaction.user}"
+        )
+        if not kicked:
+            await interaction.response.send_message(
+                "That member has already left the team (or the team no longer exists).", ephemeral=True
+            )
+            return
+
+        member = self.guild.get_member(user_id)
+        mention = member.mention if member else f"<@{user_id}>"
+        await interaction.response.send_message(f"Removed {mention} from **{self.team_name}**.", ephemeral=True)
+
+
 class ConfirmDeleteTeamView(discord.ui.View):
     def __init__(self, invoker_id: int, team_name: str, guild: discord.Guild):
         super().__init__(timeout=60)
@@ -2198,16 +2282,45 @@ async def kickteammember(interaction: discord.Interaction, member: discord.Membe
         await interaction.followup.send(f"{member.mention} isn't a member of **{team_key}**.", ephemeral=True)
         return
 
-    role = interaction.guild.get_role(info["role_id"])
-    if role:
-        await member.remove_roles(role, reason=f"Kicked from team by {interaction.user}")
-
-    info["members"] = [uid for uid in info["members"] if uid != member.id]
-    clear_team_join(info, member.id)
-    save_db(db)
-    await backup_db_to_log_channel()
+    await perform_team_kick(
+        db, team_key, member.id, interaction.guild, reason=f"Kicked from team by {interaction.user}"
+    )
 
     await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="forcekick",
+    description="(Staff) Remove a member from their team immediately, no leave cooldown applies",
+)
+@app_commands.describe(member="The member to force-kick from their current team")
+async def forcekick(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_by_member(db["teams"], member.id)
+    if not team_key:
+        await interaction.followup.send(f"{member.mention} isn't on a team.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+    if member.id == info.get("leader_id"):
+        await interaction.followup.send(
+            f"{member.mention} leads **{team_key}** — use `/staffchangesetting delete:True` if you "
+            f"want to remove the team entirely.",
+            ephemeral=True,
+        )
+        return
+
+    await perform_team_kick(
+        db, team_key, member.id, interaction.guild, reason=f"Force-kicked from team by staff member {interaction.user}"
+    )
+
+    await interaction.followup.send(f"Force-removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
 async def team_name_autocomplete(interaction: discord.Interaction, current: str):
@@ -2263,7 +2376,8 @@ async def staffchangesetting(
     if not any([changename, changecolour, changeicon]):
         await interaction.followup.send(
             "You didn't specify anything to change. Provide `changename`, `changecolour`, "
-            "`changeicon`, or set `delete:` to True.",
+            "`changeicon`, or set `delete:` to True — or kick a member below.",
+            view=KickMemberSelectView(team_key, interaction.guild, interaction.user.id),
             ephemeral=True,
         )
         return
@@ -2367,7 +2481,9 @@ async def staffchangesetting(
     message = f"✅ Updated **{team_key}**: " + ", ".join(changes)
     if icon_warning:
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
-    await interaction.followup.send(message, ephemeral=True)
+    await interaction.followup.send(
+        message, view=KickMemberSelectView(team_key, interaction.guild, interaction.user.id), ephemeral=True
+    )
 
 
 staffchangesetting.autocomplete("team")(team_name_autocomplete)
@@ -2761,7 +2877,8 @@ async def changeteamsettings(
     if not any([changename, changecolour, changeicon]):
         await interaction.followup.send(
             "You didn't specify anything to change. Provide `changename`, `changecolour`, "
-            "`changeicon`, or set `delete:` to True.",
+            "`changeicon`, or set `delete:` to True — or kick a member below.",
+            view=KickMemberSelectView(team_key, interaction.guild, interaction.user.id),
             ephemeral=True,
         )
         return
@@ -2865,7 +2982,9 @@ async def changeteamsettings(
     message = f"✅ Updated **{team_key}**: " + ", ".join(changes)
     if icon_warning:
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
-    await interaction.followup.send(message, ephemeral=True)
+    await interaction.followup.send(
+        message, view=KickMemberSelectView(team_key, interaction.guild, interaction.user.id), ephemeral=True
+    )
 
 
 # ---------- Giveaway slash command ----------
