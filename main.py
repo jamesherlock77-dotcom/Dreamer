@@ -1514,9 +1514,8 @@ class DeleteTeamView(discord.ui.View):
 # ---------- Kick-a-member dropdown, attached to /changeteamsettings and /staffchangesetting ----------
 class KickMemberSelectView(discord.ui.View):
     """Shows a dropdown of a team's current members (excluding the leader) so a leader or
-    staff member can kick someone right from /changeteamsettings or /staffchangesetting,
-    without needing the separate /kickteammember command. Picking someone kicks them
-    immediately — no confirmation step, matching /kickteammember's own behaviour."""
+    staff member can kick someone right from /changeteamsettings or /staffchangesetting.
+    Picking someone kicks them immediately — no confirmation step."""
 
     def __init__(self, team_name: str, guild: discord.Guild, invoker_id: int):
         super().__init__(timeout=120)
@@ -2256,37 +2255,6 @@ async def leaveteam(interaction: discord.Interaction):
     await backup_db_to_log_channel()
 
     await interaction.followup.send(f"You left **{team_key}**.", ephemeral=True)
-
-
-@bot.tree.command(name="kickteammember", description="Remove a member from your team")
-@app_commands.describe(member="The team member to remove")
-async def kickteammember(interaction: discord.Interaction, member: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-
-    db = load_db()
-    team_key = find_team_by_leader(db["teams"], interaction.user.id)
-    if not team_key:
-        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
-        return
-
-    info = db["teams"][team_key]
-
-    if member.id == interaction.user.id:
-        await interaction.followup.send(
-            "You can't kick yourself. Use `/changeteamsettings delete:True` if you want that.",
-            ephemeral=True,
-        )
-        return
-
-    if member.id not in info.get("members", []):
-        await interaction.followup.send(f"{member.mention} isn't a member of **{team_key}**.", ephemeral=True)
-        return
-
-    await perform_team_kick(
-        db, team_key, member.id, interaction.guild, reason=f"Kicked from team by {interaction.user}"
-    )
-
-    await interaction.followup.send(f"Removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
 @bot.tree.command(
