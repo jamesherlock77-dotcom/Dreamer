@@ -1725,6 +1725,7 @@ class InviteResponseView(discord.ui.View):
 
         if (
             self.invited_user_id not in info.get("members", [])
+            and not info.get("bypass_member_limit", False)
             and len(info.get("members", [])) >= MAX_TEAM_MEMBERS
         ):
             for child in self.children:
@@ -2119,7 +2120,7 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
 
     info = db["teams"][team_key]
 
-    if len(info.get("members", [])) >= MAX_TEAM_MEMBERS:
+    if not info.get("bypass_member_limit", False) and len(info.get("members", [])) >= MAX_TEAM_MEMBERS:
         await interaction.followup.send(
             f"**{team_key}** is already at the {MAX_TEAM_MEMBERS}-member cap — remove someone first.",
             ephemeral=True,
@@ -2455,6 +2456,45 @@ async def statssettings(
 
 
 statssettings.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(
+    name="bypassteamlimit",
+    description="(Staff) Let a team exceed the normal 10-member cap",
+)
+@app_commands.describe(
+    team="Team to update",
+    enabled="Whether the team can exceed the normal member cap (default: True)",
+)
+async def bypassteamlimit(interaction: discord.Interaction, team: str, enabled: bool = True):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+    info["bypass_member_limit"] = enabled
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    if enabled:
+        await interaction.followup.send(
+            f"✅ **{team_key}** can now have more than {MAX_TEAM_MEMBERS} members.", ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            f"✅ **{team_key}** is back to the normal {MAX_TEAM_MEMBERS}-member cap.", ephemeral=True
+        )
+
+
+bypassteamlimit.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(
