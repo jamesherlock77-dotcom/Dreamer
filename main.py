@@ -46,9 +46,7 @@ TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select 
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
 
-# TODO: replace REPLACE_WITH_EMOJI_ID with the real custom emoji ID for :toiletglasses: from your server
-# (right-click the emoji in Discord with developer mode on -> Copy ID), e.g. "<:toiletglasses:1234567890123456789>"
-TEAM_LEAVE_EMOJI = "<:toiletglasses:REPLACE_WITH_EMOJI_ID>"  # posted in the team channel when someone leaves/is kicked
+TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
