@@ -45,14 +45,9 @@ TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can clo
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
-TEAM_STATS_CHANNEL_ID = 1530999622405980334  # the team stats panel is posted/refreshed here
-STATS_LOG_CHANNEL_ID = 1531007591331795126  # team stats JSON "database" message lives here
-MESSAGE_LOG_CHANNEL_ID = 1530176459229106256       # message-count database backup lives here (tracking is server-wide)
 
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
-MESSAGES_DB_FILE = "messages_data.json"
-TEAM_STATS_DB_FILE = "team_stats_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
@@ -228,170 +223,11 @@ async def restore_db_from_log_channel():
     await backup_db_to_log_channel()
 
 
-# ---------- Message tracking (weekly + overall) ----------
-# Every non-bot message sent anywhere in the server is counted per-user, both for the
-# current week and all-time. The counts live in MESSAGES_DB_FILE and are backed up as an
-# auto-updated message in MESSAGE_LOG_CHANNEL_ID (reusing the generic backup/restore
-# helpers above), the same way teams and giveaways are.
-#
-# Backups are debounced rather than sent on every single message (to stay well clear of
-# Discord's edit rate limits on busy servers): each tracked message just flips a "dirty"
-# flag, and a short-interval loop below pushes a fresh backup only when something changed.
-_message_stats_dirty = False
-
-
-def load_message_stats() -> dict:
-    if not os.path.exists(MESSAGES_DB_FILE):
-        return {"users": {}}
-    with open(MESSAGES_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("users", {})
-    return data
-
-
-def save_message_stats(data: dict) -> None:
-    data["last_updated"] = discord.utils.utcnow().isoformat()
-    with open(MESSAGES_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def _current_week_start() -> str:
-    """Returns the ISO date (YYYY-MM-DD) of the Monday 00:00 UTC that starts the current week."""
-    now = discord.utils.utcnow()
-    monday = now - timedelta(days=now.weekday())
-    return monday.date().isoformat()
-
-
-def record_tracked_message(user_id: int) -> None:
-    global _message_stats_dirty
-    data = load_message_stats()
-    week_start = _current_week_start()
-    key = str(user_id)
-    entry = data["users"].setdefault(key, {"overall": 0, "weekly": 0, "week_start": week_start})
-    if entry.get("week_start") != week_start:
-        # A new week has started since this user's last tracked message — reset the weekly count.
-        entry["weekly"] = 0
-        entry["week_start"] = week_start
-    entry["weekly"] = entry.get("weekly", 0) + 1
-    entry["overall"] = entry.get("overall", 0) + 1
-    save_message_stats(data)
-    _message_stats_dirty = True
-
-
-async def backup_message_stats_to_log_channel():
-    if not os.path.exists(MESSAGES_DB_FILE):
-        return
-    try:
-        await _backup_file_to_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to back up message stats to log channel: {e}")
-    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the loop
-        print(f"Unexpected error backing up message stats: {e}")
-
-
-async def restore_message_stats_from_log_channel():
-    if os.path.exists(MESSAGES_DB_FILE):
-        # Local data already present (e.g. a crash-restart, not a fresh container) — push
-        # it straight to the log channel so the backup there is confirmed up to date.
-        await backup_message_stats_to_log_channel()
-        return
-    try:
-        found = await _restore_file_from_channel(MESSAGE_LOG_CHANNEL_ID, MESSAGES_DB_FILE, MESSAGES_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to restore message stats from log channel: {e}")
-        return
-    if found:
-        print("Restored message stats from log channel backup.")
-    else:
-        print("No existing message stats backup found — starting fresh.")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.guild is None:
-        return  # ignore DMs
-    record_tracked_message(message.author.id)
-
-
-@tasks.loop(seconds=30)
-async def backup_message_stats():
-    global _message_stats_dirty
-    if not _message_stats_dirty:
-        return
-    _message_stats_dirty = False
-    await backup_message_stats_to_log_channel()
-
-
-@backup_message_stats.before_loop
-async def before_backup_message_stats():
-    await bot.wait_until_ready()
-
-
-# ---------- Team stats (set via /statssettings, shown on the team-stats panel) ----------
-# Match/performance stats aren't derived from anything else the bot tracks — they're set
-# manually by staff via /statssettings and just stored per-team here. Keyed by team name so
-# a rename in /changeteamsettings or /staffchangesetting doesn't automatically carry the
-# stats over; see the rename-handling note near those commands.
-TEAM_STAT_FIELDS = {
-    "rating": "Overall Rating",
-    "matches": "Matches ever played",
-    "tournaments": "Tournaments Won",
-    "placement": "Best ever placement",
-    "winrate": "Win Rate",
-    "avgkills": "Average kills",
-    "avgdeaths": "Average deaths",
-    "kd": "Kill to death Ratio",
-}
-
-
-def load_team_stats() -> dict:
-    if not os.path.exists(TEAM_STATS_DB_FILE):
-        return {"teams": {}}
-    with open(TEAM_STATS_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data.setdefault("teams", {})
-    return data
-
-
-def save_team_stats(data: dict) -> None:
-    data["last_updated"] = discord.utils.utcnow().isoformat()
-    with open(TEAM_STATS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-async def backup_team_stats_to_log_channel():
-    try:
-        await _backup_file_to_channel(STATS_LOG_CHANNEL_ID, TEAM_STATS_DB_FILE, TEAM_STATS_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to back up team stats to log channel: {e}")
-    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill a command
-        print(f"Unexpected error backing up team stats: {e}")
-
-
-async def restore_team_stats_from_log_channel():
-    if os.path.exists(TEAM_STATS_DB_FILE):
-        # Local data already present (e.g. a crash-restart, not a fresh container) — push
-        # it straight to the log channel so the backup there is confirmed up to date.
-        await backup_team_stats_to_log_channel()
-        return
-    try:
-        found = await _restore_file_from_channel(STATS_LOG_CHANNEL_ID, TEAM_STATS_DB_FILE, TEAM_STATS_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to restore team stats from log channel: {e}")
-        return
-    if found:
-        print("Restored team stats from log channel backup.")
-    else:
-        print("No existing team stats backup found — starting fresh.")
-
-
 # ---------- Tickets (opened from the support panel) ----------
 # Each opened ticket gets a sequential number and a thread; the counter and a record of
 # every ticket (thread ID -> number/opener/category/closed state) live in TICKETS_DB_FILE
 # and are backed up as an auto-updated message in TICKET_LOG_CHANNEL_ID, the same way
-# teams/giveaways/message-stats/team-stats are.
+# teams/giveaways are.
 def load_ticket_db() -> dict:
     if not os.path.exists(TICKETS_DB_FILE):
         return {"next_number": 1, "tickets": {}}
@@ -798,9 +634,6 @@ async def refresh_support_ticket_panel():
     await channel.send(embed=embed, file=file, view=view)
 
 
-# ---------- Team stats panel ----------
-TEAM_STATS_PANEL_TITLE = "AC: Arena Hub"
-
 # ---------- Tournament submission panel ----------
 TOURNAMENT_PANEL_TITLE = "Tournament Submissions"
 TOURNAMENT_COMPETITOR_EMOJI = "<:SilverTrophy:1528216893297791098>"
@@ -1197,168 +1030,6 @@ async def refresh_tournament_panel():
         colour=discord.Colour.gold(),
     )
     await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
-
-
-TEAM_STATS_TEAMS_PER_PAGE = 25
-_TEAM_STATS_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
-
-
-def build_team_stats_embed(team_name: str, info: dict, stats: dict, guild: discord.Guild) -> discord.Embed:
-    """Stats card shown when someone picks a team from the stats dropdown. `stats` comes
-    from the team_stats database (set via /statssettings) — any field not yet set shows as
-    N/A. The embed colour follows the team's own role colour instead of a fixed colour."""
-    role = guild.get_role(info.get("role_id"))
-    leader_id = info.get("leader_id")
-    emoji = info.get("emoji", "")
-
-    def stat(key: str) -> str:
-        value = stats.get(key)
-        return str(value) if value not in (None, "") else "N/A"
-
-    description = (
-        f"## {team_name} Team {emoji}\n"
-        f"Leader: {f'<@{leader_id}>' if leader_id else 'Unknown'}\n"
-        f"Overall Rating: ` {stat('rating')} `\n"
-        f"---\n"
-        f"*Matches ever played:* `{stat('matches')}`\n"
-        f"*Tournaments Won:* ` {stat('tournaments')} `\n"
-        f"*Best ever placement:* ` {stat('placement')} `\n"
-        f"---\n"
-        f"*Win Rate:* ` {stat('winrate')} `\n"
-        f"*Average kills:* ` {stat('avgkills')} `\n"
-        f"*Average deaths:* ` {stat('avgdeaths')} `\n"
-        f"*Kill to death Ratio:* ` {stat('kd')} `"
-    )
-
-    embed = discord.Embed(
-        description=description,
-        colour=role.colour if role is not None else discord.Colour.orange(),
-    )
-    return embed
-
-
-class TeamStatsSelectView(discord.ui.View):
-    """The dropdown panel shown in the team-stats channel. Same paging approach as
-    TournamentTeamSelectView (Discord caps select menus at 25 options, and current page is
-    read back from the live message's select placeholder so a single persistent view
-    instance can serve every message and survive restarts), but each option also shows the
-    team's emoji, and picking one replies with that team's stats instead of opening a modal."""
-
-    def __init__(self, team_names: list = None, page: int = 0, keep_nav_buttons: bool = False):
-        super().__init__(timeout=None)
-        db = load_db()
-        all_names = list(team_names or [])
-        total_pages = max(1, -(-len(all_names) // TEAM_STATS_TEAMS_PER_PAGE)) if all_names else 1
-        page = max(0, min(page, total_pages - 1))
-        start = page * TEAM_STATS_TEAMS_PER_PAGE
-        page_names = all_names[start:start + TEAM_STATS_TEAMS_PER_PAGE]
-
-        options = []
-        for name in page_names:
-            info = db["teams"].get(name, {})
-            emoji = info.get("emoji")
-            option_kwargs = {"label": name[:100], "value": name[:100]}
-            if emoji and is_valid_standard_emoji(emoji):
-                option_kwargs["emoji"] = emoji
-            options.append(discord.SelectOption(**option_kwargs))
-        if not options:
-            options = [discord.SelectOption(label="No teams yet", value="__none__")]
-        self.team_select.options = options
-
-        placeholder = "Select a team..."
-        if total_pages > 1:
-            placeholder += f" (page {page + 1}/{total_pages})"
-        self.team_select.placeholder = placeholder
-
-        if total_pages <= 1 and not keep_nav_buttons:
-            self.remove_item(self.prev_page)
-            self.remove_item(self.next_page)
-        else:
-            self.prev_page.disabled = page <= 0
-            self.next_page.disabled = page >= total_pages - 1
-
-    @discord.ui.select(
-        placeholder="Select a team...",
-        custom_id="team_stats_select",
-        options=[discord.SelectOption(label="placeholder", value="placeholder")],
-    )
-    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        team_name = select.values[0]
-        if team_name == "__none__":
-            await interaction.response.send_message("There are no teams yet.", ephemeral=True)
-            return
-
-        db = load_db()
-        info = db["teams"].get(team_name)
-        if info is None:
-            await interaction.response.send_message(
-                "That team no longer exists — the panel may be out of date.", ephemeral=True
-            )
-            return
-
-        stats_db = load_team_stats()
-        stats = stats_db["teams"].get(team_name, {})
-
-        embed = build_team_stats_embed(team_name, info, stats, interaction.guild)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="team_stats_prev_page", row=1)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, -1)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="team_stats_next_page", row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, 1)
-
-    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
-        current_page = 0
-        for row in interaction.message.components:
-            for component in row.children:
-                if getattr(component, "custom_id", None) == "team_stats_select":
-                    match = _TEAM_STATS_PAGE_RE.search(component.placeholder or "")
-                    if match:
-                        current_page = int(match.group(1)) - 1
-
-        db = load_db()
-        team_names = sorted(db["teams"].keys())
-        new_view = TeamStatsSelectView(team_names, page=current_page + delta)
-        await interaction.response.edit_message(view=new_view)
-
-
-async def refresh_team_stats_panel():
-    """Deletes any previously posted team-stats panel in the target channel and posts a
-    fresh one listing the current teams. Called on every bot startup so the panel never
-    goes stale or duplicates across restarts."""
-    channel = bot.get_channel(TEAM_STATS_CHANNEL_ID) or await bot.fetch_channel(TEAM_STATS_CHANNEL_ID)
-
-    async for msg in channel.history(limit=50):
-        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TEAM_STATS_PANEL_TITLE:
-            try:
-                await msg.delete()
-            except discord.HTTPException:
-                pass
-
-    db = load_db()
-    team_names = sorted(db["teams"].keys())
-
-    embed = discord.Embed(
-        title=TEAM_STATS_PANEL_TITLE,
-        description=(
-            "Welcome! Here, you'll find stats for every team including your own. "
-            "Please keep in mind, these stats may not be full accurate."
-        ),
-        colour=discord.Colour.orange(),
-    )
-    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
-
-    view = TeamStatsSelectView(team_names)
-
-    if os.path.exists(SUPPORT_BANNER_PATH):
-        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-        await channel.send(embed=embed, file=file, view=view)
-    else:
-        embed.set_image(url=None)
-        await channel.send(embed=embed, view=view)
 
 
 async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: discord.Guild, reason: str) -> bool:
@@ -2412,80 +2083,6 @@ staffchangesetting.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(
-    name="statssettings",
-    description="(Staff) Set a team's stats shown on the team-stats panel",
-)
-@app_commands.describe(
-    team="Team to update",
-    overall="Overall rating",
-    matches="Matches ever played",
-    tournaments="Tournaments won",
-    placement="Best ever placement",
-    winrate="Win rate",
-    avgkills="Average kills",
-    avgdeaths="Average deaths",
-    kd="Kill to death ratio",
-)
-async def statssettings(
-    interaction: discord.Interaction,
-    team: str,
-    overall: str = None,
-    matches: str = None,
-    tournaments: str = None,
-    placement: str = None,
-    winrate: str = None,
-    avgkills: str = None,
-    avgdeaths: str = None,
-    kd: str = None,
-):
-    await interaction.response.defer(ephemeral=True)
-
-    if not has_staff_role(interaction.user):
-        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    db = load_db()
-    team_key = find_team_key_ci(db["teams"], team)
-    if not team_key:
-        await interaction.followup.send("No team found with that name.", ephemeral=True)
-        return
-
-    provided = {
-        "rating": overall,
-        "matches": matches,
-        "tournaments": tournaments,
-        "placement": placement,
-        "winrate": winrate,
-        "avgkills": avgkills,
-        "avgdeaths": avgdeaths,
-        "kd": kd,
-    }
-    updates = {key: value for key, value in provided.items() if value is not None}
-
-    if not updates:
-        await interaction.followup.send(
-            "You didn't provide any stats to update. Every field is optional, but you need to "
-            "set at least one.",
-            ephemeral=True,
-        )
-        return
-
-    stats_db = load_team_stats()
-    team_stats = stats_db["teams"].setdefault(team_key, {})
-    team_stats.update(updates)
-    save_team_stats(stats_db)
-    await backup_team_stats_to_log_channel()
-
-    changes = [f"{TEAM_STAT_FIELDS[key]} → `{value}`" for key, value in updates.items()]
-    await interaction.followup.send(
-        f"✅ Updated stats for **{team_key}**:\n" + "\n".join(changes), ephemeral=True
-    )
-
-
-statssettings.autocomplete("team")(team_name_autocomplete)
-
-
-@bot.tree.command(
     name="bypassteamlimit",
     description="(Staff) Let a team exceed the normal 10-member cap",
 )
@@ -3026,77 +2623,14 @@ async def globalteammessage(interaction: discord.Interaction, message: str):
     await interaction.followup.send(result, ephemeral=True)
 
 
-@bot.tree.command(name="messagestats", description="Show a message-stats card for yourself or another member")
-@app_commands.describe(user="Whose stats to show (defaults to you)")
-async def messagestats(interaction: discord.Interaction, user: discord.Member = None):
-    await interaction.response.defer()
-
-    target = user or interaction.user
-    data = load_message_stats()
-    users = data.get("users", {})
-    week_start = _current_week_start()
-
-    weekly_rows = [
-        (uid, entry.get("weekly", 0))
-        for uid, entry in users.items()
-        if entry.get("week_start") == week_start and entry.get("weekly", 0) > 0
-    ]
-    weekly_rows.sort(key=lambda r: r[1], reverse=True)
-
-    overall_rows = [(uid, entry.get("overall", 0)) for uid, entry in users.items() if entry.get("overall", 0) > 0]
-    overall_rows.sort(key=lambda r: r[1], reverse=True)
-
-    def _rank(rows: list, user_id: int):
-        for i, (uid, _count) in enumerate(rows, start=1):
-            if uid == str(user_id):
-                return i
-        return None
-
-    entry = users.get(str(target.id), {})
-    weekly_count = entry.get("weekly", 0) if entry.get("week_start") == week_start else 0
-    overall_count = entry.get("overall", 0)
-    weekly_rank = _rank(weekly_rows, target.id)
-    overall_rank = _rank(overall_rows, target.id)
-
-    def _rank_suffix(value: int) -> str:
-        if 11 <= value % 100 <= 13:
-            return "th"
-        return {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
-
-    def _format_rank(rank):
-        return f"#{rank}{_rank_suffix(rank)}" if rank else "Unranked"
-
-    embed = discord.Embed(
-        title=f"{target.display_name}'s Message Stats",
-        colour=target.colour if target.colour.value else discord.Colour.blurple(),
-    )
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(
-        name="📅 This Week",
-        value=f"**{weekly_count}** messages\n{_format_rank(weekly_rank)}",
-        inline=True,
-    )
-    embed.add_field(
-        name="📊 All-Time",
-        value=f"**{overall_count}** messages\n{_format_rank(overall_rank)}",
-        inline=True,
-    )
-    embed.set_footer(text=f"Since {week_start}")
-
-    await interaction.followup.send(embed=embed)
-
-
 @bot.event
 async def on_ready():
     await restore_db_from_log_channel()
-    await restore_message_stats_from_log_channel()
-    await restore_team_stats_from_log_channel()
     await restore_ticket_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
     bot.add_view(TournamentSubmissionView())
-    bot.add_view(TeamStatsSelectView(keep_nav_buttons=True))
     bot.add_view(GiveawayJoinView())
     await bot.tree.sync()
     try:
@@ -3111,14 +2645,8 @@ async def on_ready():
         await refresh_tournament_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
-    try:
-        await refresh_team_stats_panel()
-    except discord.HTTPException as e:
-        print(f"Failed to refresh team stats panel: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
-    if not backup_message_stats.is_running():
-        backup_message_stats.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
