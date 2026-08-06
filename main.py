@@ -27,6 +27,7 @@ logging.getLogger("discord.app_commands.tree").addFilter(_SuppressAutocompleteRa
 # ---------- Config ----------
 CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
 TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are created in
+TEAM_CATEGORY_OVERFLOW_ID = 1534991567486714026  # used once TEAM_CATEGORY_ID hits Discord's 50-channel cap
 TEAM_LOG_CHANNEL_ID = 1530008905663512626  # teams JSON "database" message lives here
 GIVEAWAY_LOG_CHANNEL_ID = 1530009058294370476  # giveaways JSON "database" message lives here
 LOG_CHANNEL_ID = 1528147225799037008       # legacy combined database channel — kept only so
@@ -347,6 +348,20 @@ def has_staff_role(member: discord.Member) -> bool:
 
 def has_premium_access(member: discord.Member) -> bool:
     return any(role.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2, STAFF_ROLE_ID) for role in member.roles)
+
+
+async def safe_edit_original_response(interaction: discord.Interaction, content: str, view=None) -> None:
+    """Edits the interaction's original response, falling back to a fresh ephemeral
+    followup message if the original response can no longer be found (e.g. it expired,
+    was dismissed, or was otherwise removed) — avoids crashing view callbacks with an
+    unhandled discord.NotFound."""
+    try:
+        await interaction.edit_original_response(content=content, view=view)
+    except discord.HTTPException:
+        try:
+            await interaction.followup.send(content=content, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 def build_team_leave_message(user_id: int) -> str:
@@ -1198,12 +1213,13 @@ class DeleteTeamView(discord.ui.View):
             db, self.team_name, self.guild, reason=f"Team deleted by {interaction.user}"
         )
         if not deleted:
-            await interaction.edit_original_response(content="That team no longer exists.", view=None)
+            await safe_edit_original_response(interaction, content="That team no longer exists.", view=None)
             return
 
         for child in self.children:
             child.disabled = True
-        await interaction.edit_original_response(
+        await safe_edit_original_response(
+            interaction,
             content=f"🗑️ Team **{self.team_name}** deleted. You can now create a new one.",
             view=self,
         )
@@ -1234,10 +1250,10 @@ class ConfirmDeleteTeamView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         if not deleted:
-            await interaction.edit_original_response(content="That team no longer exists.", view=self)
+            await safe_edit_original_response(interaction, content="That team no longer exists.", view=self)
             return
-        await interaction.edit_original_response(
-            content=f"🗑️ Team **{self.team_name}** has been deleted.", view=self
+        await safe_edit_original_response(
+            interaction, content=f"🗑️ Team **{self.team_name}** has been deleted.", view=self
         )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -1326,7 +1342,21 @@ class ConfirmTeamView(discord.ui.View):
             pass
 
         guild = self.guild
-        category = guild.get_channel(TEAM_CATEGORY_ID)
+        primary_category = guild.get_channel(TEAM_CATEGORY_ID)
+        overflow_category = guild.get_channel(TEAM_CATEGORY_OVERFLOW_ID)
+
+        category = primary_category
+        if category is None or (category is not None and len(category.channels) >= 50):
+            category = overflow_category
+
+        if category is None or len(category.channels) >= 50:
+            pending_team_requests.discard(self.requester_id)
+            await interaction.followup.send(
+                f"❌ Couldn't create **{self.team_name}** — both team categories are full "
+                f"(Discord's 50-channel limit). Delete or move some existing team channels "
+                f"out of one of the categories, then have the requester try `/createteam` again."
+            )
+            return
 
         role_colour = discord.Colour.from_str(self.colour)
         try:
@@ -1367,12 +1397,29 @@ class ConfirmTeamView(discord.ui.View):
         }
 
         channel_name = f"{self.emoji}┃{self.team_name}-Team"
-        team_channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            reason=f"Team created, confirmed by {interaction.user}",
-        )
+        try:
+            team_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Team created, confirmed by {interaction.user}",
+            )
+        except discord.HTTPException as e:
+            # Channel creation failed (e.g. the category filled up to Discord's 50-channel
+            # cap in the time between our check above and this call). Clean up the role we
+            # already created so we don't leave an orphan behind for /cleanuporphanteams to
+            # find later, and let the admin know the team was NOT created.
+            try:
+                await role.delete(reason="Team channel creation failed — cleaning up orphaned role")
+            except discord.HTTPException:
+                pass
+            pending_team_requests.discard(self.requester_id)
+            await interaction.followup.send(
+                f"❌ Couldn't create the channel for **{self.team_name}** (Discord rejected the "
+                f"request — the team category may have just filled up). No role was left "
+                f"behind; the requester can safely try `/createteam` again."
+            )
+            return
 
         await leader.add_roles(role, reason="New team leader")
 
@@ -1444,7 +1491,7 @@ class InviteResponseView(discord.ui.View):
         if info is None:
             for child in self.children:
                 child.disabled = True
-            await interaction.edit_original_response(content="This team no longer exists.", view=self)
+            await safe_edit_original_response(interaction, content="This team no longer exists.", view=self)
             return
 
         if (
@@ -1454,7 +1501,8 @@ class InviteResponseView(discord.ui.View):
         ):
             for child in self.children:
                 child.disabled = True
-            await interaction.edit_original_response(
+            await safe_edit_original_response(
+                interaction,
                 content=f"**{self.team_name}** filled up to the {MAX_TEAM_MEMBERS}-member cap "
                 f"before you accepted — ask the leader to check again.",
                 view=self,
@@ -1479,7 +1527,7 @@ class InviteResponseView(discord.ui.View):
 
         for child in self.children:
             child.disabled = True
-        await interaction.edit_original_response(content=f"You joined **{self.team_name}**! 🎉", view=self)
+        await safe_edit_original_response(interaction, content=f"You joined **{self.team_name}**! 🎉", view=self)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2172,30 +2220,36 @@ async def cleanuporphanteams(interaction: discord.Interaction):
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
-    category = interaction.guild.get_channel(TEAM_CATEGORY_ID)
-    if category is None or not isinstance(category, discord.CategoryChannel):
-        await interaction.followup.send("Couldn't find the team category.", ephemeral=True)
+    categories = []
+    for cat_id in (TEAM_CATEGORY_ID, TEAM_CATEGORY_OVERFLOW_ID):
+        cat = interaction.guild.get_channel(cat_id)
+        if cat is not None and isinstance(cat, discord.CategoryChannel):
+            categories.append(cat)
+
+    if not categories:
+        await interaction.followup.send("Couldn't find either team category.", ephemeral=True)
         return
 
     db = load_db()
     known_channel_ids = {info["channel_id"] for info in db["teams"].values()}
 
     orphans = []  # list of (channel, role_or_None)
-    for channel in category.channels:
-        if channel.id in known_channel_ids:
-            continue
-        linked_role = None
-        for target, overwrite in channel.overwrites.items():
-            if isinstance(target, discord.Role) and target.id != interaction.guild.default_role.id:
-                allow, _deny = overwrite.pair()
-                if allow.view_channel:
-                    linked_role = target
-                    break
-        orphans.append((channel, linked_role))
+    for category in categories:
+        for channel in category.channels:
+            if channel.id in known_channel_ids:
+                continue
+            linked_role = None
+            for target, overwrite in channel.overwrites.items():
+                if isinstance(target, discord.Role) and target.id != interaction.guild.default_role.id:
+                    allow, _deny = overwrite.pair()
+                    if allow.view_channel:
+                        linked_role = target
+                        break
+            orphans.append((channel, linked_role))
 
     if not orphans:
         await interaction.followup.send(
-            "No orphaned team channels found — everything in the category matches the database.",
+            "No orphaned team channels found — everything in both team categories matches the database.",
             ephemeral=True,
         )
         return
@@ -2210,8 +2264,8 @@ async def cleanuporphanteams(interaction: discord.Interaction):
 
     view = ConfirmCleanupView(interaction.user.id, orphans)
     await interaction.followup.send(
-        f"Found **{len(orphans)}** channel(s) in the team category with no matching database "
-        f"entry:\n" + "\n".join(lines) + "\n\nDelete them (and their linked roles)? This can't be undone.",
+        f"Found **{len(orphans)}** channel(s) across both team categories with no matching "
+        f"database entry:\n" + "\n".join(lines) + "\n\nDelete them (and their linked roles)? This can't be undone.",
         view=view,
         ephemeral=True,
     )
@@ -2631,8 +2685,23 @@ async def startgiveaway(
     name="globalteammessage",
     description="(Staff) Send a message to every team's channel",
 )
-@app_commands.describe(message="The message to send to every team channel")
-async def globalteammessage(interaction: discord.Interaction, message: str):
+@app_commands.describe(
+    message="The message to send to every team channel",
+    exclude1="Team to exclude from this broadcast (optional)",
+    exclude2="Team to exclude from this broadcast (optional)",
+    exclude3="Team to exclude from this broadcast (optional)",
+    exclude4="Team to exclude from this broadcast (optional)",
+    exclude5="Team to exclude from this broadcast (optional)",
+)
+async def globalteammessage(
+    interaction: discord.Interaction,
+    message: str,
+    exclude1: str = None,
+    exclude2: str = None,
+    exclude3: str = None,
+    exclude4: str = None,
+    exclude5: str = None,
+):
     await interaction.response.defer(ephemeral=True)
 
     if not has_staff_role(interaction.user):
@@ -2644,9 +2713,26 @@ async def globalteammessage(interaction: discord.Interaction, message: str):
         await interaction.followup.send("There are no teams to message.", ephemeral=True)
         return
 
+    # Discord slash commands don't support a true multi-select for dynamic values, so
+    # exclusions are up to 5 separate optional slots (each with autocomplete, same as the
+    # `team` parameter elsewhere) instead of one true dropdown.
+    requested_excludes = [name for name in (exclude1, exclude2, exclude3, exclude4, exclude5) if name]
+    excluded_keys = set()
+    unknown_excludes = []
+    for name in requested_excludes:
+        key = find_team_key_ci(db["teams"], name)
+        if key is None:
+            unknown_excludes.append(name)
+        else:
+            excluded_keys.add(key)
+
     sent = 0
+    skipped = []
     failed_teams = []
     for team_name, info in db["teams"].items():
+        if team_name in excluded_keys:
+            skipped.append(team_name)
+            continue
         channel = interaction.guild.get_channel(info.get("channel_id"))
         if channel is None:
             failed_teams.append(team_name)
@@ -2658,9 +2744,63 @@ async def globalteammessage(interaction: discord.Interaction, message: str):
             failed_teams.append(team_name)
 
     result = f"✅ Sent to {sent} team channel(s)."
+    if skipped:
+        result += f"\n🚫 Excluded: {', '.join(skipped)}."
+    if unknown_excludes:
+        result += f"\n⚠️ Couldn't match these to a team (ignored): {', '.join(unknown_excludes)}."
     if failed_teams:
         result += f"\n⚠️ Couldn't send to: {', '.join(failed_teams)}."
     await interaction.followup.send(result, ephemeral=True)
+
+
+globalteammessage.autocomplete("exclude1")(team_name_autocomplete)
+globalteammessage.autocomplete("exclude2")(team_name_autocomplete)
+globalteammessage.autocomplete("exclude3")(team_name_autocomplete)
+globalteammessage.autocomplete("exclude4")(team_name_autocomplete)
+globalteammessage.autocomplete("exclude5")(team_name_autocomplete)
+
+
+# ---------- Global slash-command error handler ----------
+# Without this, discord.py just logs a full traceback for every unhandled command error
+# (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
+# left staring at "This interaction failed" with no explanation. This catches the common,
+# expected cases quietly and gives the user something useful, and still logs anything
+# unexpected so real bugs aren't hidden.
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    command_name = interaction.command.name if interaction.command else "unknown"
+
+    original = getattr(error, "original", error)
+
+    # The interaction (or a message it referenced) expired/vanished before we could
+    # respond — e.g. Discord hiccups, or the bot was briefly slow. Nothing we can send
+    # back at this point; just log it quietly instead of a full traceback.
+    if isinstance(original, discord.NotFound):
+        print(f"'{command_name}': interaction or message no longer exists ({original}).")
+        return
+
+    # A Member/User/Channel argument couldn't be resolved (e.g. autocomplete raced with
+    # typed text, or the target left the server between typing and submitting).
+    if isinstance(error, app_commands.TransformerError):
+        message = "Couldn't resolve that option — please pick from the autocomplete/picker list and try again."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
+        return
+
+    print(f"Unhandled error in '{command_name}': {error!r}")
+    try:
+        message = "Something went wrong running that command. Please try again."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 @bot.event
