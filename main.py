@@ -46,6 +46,10 @@ TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select 
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
 
+# TODO: replace REPLACE_WITH_EMOJI_ID with the real custom emoji ID for :toiletglasses: from your server
+# (right-click the emoji in Discord with developer mode on -> Copy ID), e.g. "<:toiletglasses:1234567890123456789>"
+TEAM_LEAVE_EMOJI = "<:toiletglasses:REPLACE_WITH_EMOJI_ID>"  # posted in the team channel when someone leaves/is kicked
+
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
@@ -345,6 +349,24 @@ def has_staff_role(member: discord.Member) -> bool:
 
 def has_premium_access(member: discord.Member) -> bool:
     return any(role.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2, STAFF_ROLE_ID) for role in member.roles)
+
+
+def build_team_leave_message(user_id: int) -> str:
+    """Posted in the team channel whenever a member leaves or is kicked from the team."""
+    return f"{TEAM_LEAVE_EMOJI} <@{user_id}>, just left the team"
+
+
+def build_team_welcome_message(user_id: int, role_id: int) -> str:
+    """Posted in a team's channel right after it's created, welcoming the new leader."""
+    return (
+        f"Hello <@{user_id}> !\n"
+        f"You are now, the leader of <@&{role_id}> .\n"
+        f"**__List of commands:__**\n"
+        f"`/invite`\n"
+        f"`/changeteamsettings`\n"
+        f"`/premiumteamsettings`\n"
+        f"`/promote`"
+    )
 
 
 def team_leader_channel_overwrite() -> discord.PermissionOverwrite:
@@ -1053,6 +1075,14 @@ async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: disco
     clear_team_join(info, user_id)
     save_db(db)
     await backup_db_to_log_channel()
+
+    channel = guild.get_channel(info["channel_id"])
+    if channel is not None:
+        try:
+            await channel.send(build_team_leave_message(user_id))
+        except discord.HTTPException:
+            pass
+
     return True
 
 
@@ -1358,6 +1388,11 @@ class ConfirmTeamView(discord.ui.View):
         try:
             await leader.send(f"You're now the leader of **{self.team_name}** {self.emoji}!")
         except discord.Forbidden:
+            pass
+
+        try:
+            await team_channel.send(build_team_welcome_message(self.requester_id, role.id))
+        except discord.HTTPException:
             pass
 
         db = load_db()
@@ -1866,6 +1901,13 @@ async def leaveteam(interaction: discord.Interaction):
     clear_team_join(info, interaction.user.id)
     save_db(db)
     await backup_db_to_log_channel()
+
+    channel = interaction.guild.get_channel(info["channel_id"])
+    if channel is not None:
+        try:
+            await channel.send(build_team_leave_message(interaction.user.id))
+        except discord.HTTPException:
+            pass
 
     await interaction.followup.send(f"You left **{team_key}**.", ephemeral=True)
 
