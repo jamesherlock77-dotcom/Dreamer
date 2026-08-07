@@ -294,6 +294,13 @@ def find_team_by_channel(db: dict, channel_id: int):
     return None
 
 
+def find_team_by_role_id(db: dict, role_id: int):
+    for name, info in db.items():
+        if info.get("role_id") == role_id:
+            return name
+    return None
+
+
 def find_team_key_ci(db: dict, name: str):
     name_lower = name.lower()
     for key in db:
@@ -2758,6 +2765,118 @@ globalteammessage.autocomplete("exclude2")(team_name_autocomplete)
 globalteammessage.autocomplete("exclude3")(team_name_autocomplete)
 globalteammessage.autocomplete("exclude4")(team_name_autocomplete)
 globalteammessage.autocomplete("exclude5")(team_name_autocomplete)
+
+
+# ---------- Tournament selection notification ----------
+async def multi_team_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocompletes a comma-separated list of team names one team at a time: whatever's
+    already typed before the last comma is kept as-is, and only the piece being typed
+    right now gets suggestions, so picking multiple teams still feels like a dropdown."""
+    db = load_db()
+    team_names = sorted(db["teams"].keys())
+
+    if "," in current:
+        prefix, _, last_part = current.rpartition(",")
+        prefix = f"{prefix}, "
+    else:
+        prefix = ""
+        last_part = current
+
+    last_part_stripped = last_part.strip().lower()
+    matches = [name for name in team_names if last_part_stripped in name.lower()]
+
+    choices = []
+    for name in matches[:25]:
+        full_value = f"{prefix}{name}"
+        choices.append(app_commands.Choice(name=full_value[:100], value=full_value[:100]))
+    return choices
+
+
+# Matches either a role mention like <@&123456789012345678> or a bare role ID typed on
+# its own — lets /sendtournament accept a block of pasted role mentions, one per line.
+_ROLE_MENTION_OR_ID_RE = re.compile(r"<@&(\d+)>|\b(\d{15,21})\b")
+
+
+@bot.tree.command(
+    name="sendtournament",
+    description="(Staff) Tell one or more teams they've been selected for the upcoming tournament",
+)
+@app_commands.describe(
+    teams="Team role mentions/IDs or names to notify — one per line or comma-separated"
+)
+async def sendtournament(interaction: discord.Interaction, teams: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    if not db["teams"]:
+        await interaction.followup.send("There are no teams to notify.", ephemeral=True)
+        return
+
+    resolved_keys = []
+    unknown = []
+    seen = set()
+
+    # First, pull out every role mention/ID (people commonly paste a block of <@&...>
+    # role mentions, one per line).
+    role_ids_found = [int(m.group(1) or m.group(2)) for m in _ROLE_MENTION_OR_ID_RE.finditer(teams)]
+    for role_id in role_ids_found:
+        key = find_team_by_role_id(db["teams"], role_id)
+        if key is None:
+            unknown.append(f"<@&{role_id}>")
+        elif key not in seen:
+            resolved_keys.append(key)
+            seen.add(key)
+
+    # Anything left over (with the mentions/IDs stripped out) is treated as plain team
+    # names, comma- or newline-separated — still supports the old `Alpha, Bravo` style.
+    remainder = _ROLE_MENTION_OR_ID_RE.sub(" ", teams)
+    requested_names = [part.strip() for part in re.split(r"[,\n]+", remainder) if part.strip()]
+    for name in requested_names:
+        key = find_team_key_ci(db["teams"], name)
+        if key is None:
+            unknown.append(name)
+        elif key not in seen:
+            resolved_keys.append(key)
+            seen.add(key)
+
+    if not resolved_keys:
+        detail = f": {', '.join(unknown)}" if unknown else ""
+        await interaction.followup.send(f"Couldn't match any of those to a team{detail}", ephemeral=True)
+        return
+
+    notified = []
+    failed_teams = []
+    for team_name in resolved_keys:
+        info = db["teams"][team_name]
+        channel = interaction.guild.get_channel(info.get("channel_id"))
+        role_id = info.get("role_id")
+        if channel is None or role_id is None:
+            failed_teams.append(team_name)
+            continue
+
+        message = (
+            f"Hello <@&{role_id}> , you have been selected to play for the upcoming "
+            f"tournament. So stay Tuned! {TOURNAMENT_SUB_EMOJI}"
+        )
+        try:
+            await channel.send(content=message)
+            notified.append(team_name)
+        except discord.HTTPException:
+            failed_teams.append(team_name)
+
+    result = f"✅ Notified {len(notified)} team(s): {', '.join(notified)}." if notified else "No teams were notified."
+    if unknown:
+        result += f"\n⚠️ Couldn't match these to a team (ignored): {', '.join(unknown)}."
+    if failed_teams:
+        result += f"\n⚠️ Couldn't send to: {', '.join(failed_teams)}."
+    await interaction.followup.send(result, ephemeral=True)
+
+
+sendtournament.autocomplete("teams")(multi_team_autocomplete)
 
 
 # ---------- Global slash-command error handler ----------
