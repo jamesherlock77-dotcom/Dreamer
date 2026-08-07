@@ -385,7 +385,7 @@ def build_team_welcome_message(user_id: int, role_id: int) -> str:
         f"`/invite`\n"
         f"`/changeteamsettings`\n"
         f"`/premiumteamsettings`\n"
-        f"`/promote`"
+        f"`/leaderpromote`"
     )
 
 
@@ -1136,7 +1136,72 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
     return True
 
 
-async def sync_existing_teams():
+async def perform_leader_promotion(
+    db: dict, team_name: str, new_leader_id: int, guild: discord.Guild, reason: str
+) -> bool:
+    """Swaps a team's leader to new_leader_id (the caller must already have confirmed
+    new_leader_id is a current member of the team). Moves the TEAM_LEADER_ROLE_ID marker
+    role and the special channel permission overwrite (manage_messages/mention_everyone)
+    from the old leader to the new one, and saves the DB. Returns False if the team no
+    longer exists."""
+    info = db["teams"].get(team_name)
+    if info is None:
+        return False
+
+    old_leader_id = info.get("leader_id")
+    info["leader_id"] = new_leader_id
+
+    channel = guild.get_channel(info.get("channel_id"))
+    leader_marker_role = guild.get_role(TEAM_LEADER_ROLE_ID)
+
+    try:
+        new_member = guild.get_member(new_leader_id) or await guild.fetch_member(new_leader_id)
+    except discord.HTTPException:
+        new_member = None
+
+    old_member = guild.get_member(old_leader_id) if old_leader_id is not None else None
+
+    if channel is not None:
+        if old_member is not None:
+            try:
+                # Reverts the old leader back to whatever the team role alone grants them —
+                # removes their manage_messages/mention_everyone override, not the channel.
+                await channel.set_permissions(old_member, overwrite=None, reason=reason)
+            except discord.HTTPException:
+                pass
+        if new_member is not None:
+            try:
+                await channel.set_permissions(
+                    new_member, overwrite=team_leader_channel_overwrite(), reason=reason
+                )
+            except discord.HTTPException:
+                pass
+
+    if leader_marker_role is not None:
+        if new_member is not None and leader_marker_role not in new_member.roles:
+            try:
+                await new_member.add_roles(leader_marker_role, reason=reason)
+            except discord.HTTPException:
+                pass
+
+        if old_member is not None and leader_marker_role in old_member.roles:
+            # Only strip the marker role if the old leader doesn't lead a different team too.
+            still_leads_other = any(
+                other_name != team_name and other_info.get("leader_id") == old_leader_id
+                for other_name, other_info in db["teams"].items()
+            )
+            if not still_leads_other:
+                try:
+                    await old_member.remove_roles(leader_marker_role, reason=reason)
+                except discord.HTTPException:
+                    pass
+
+    save_db(db)
+    await backup_db_to_log_channel()
+    return True
+
+
+
     """Backfill pass run on every startup: makes sure every current team leader holds
     TEAM_LEADER_ROLE_ID and has the manage-messages/mention-everyone overrides in their
     own team channel (so they can ping the team, delete messages, and pin messages).
@@ -1268,6 +1333,68 @@ class ConfirmDeleteTeamView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="Cancelled — team not deleted.", view=self)
+
+
+# ---------- Confirmation view for /leaderpromote ----------
+class ConfirmLeaderPromoteView(discord.ui.View):
+    def __init__(self, invoker_id: int, team_name: str, new_leader_id: int, guild: discord.Guild):
+        super().__init__(timeout=60)
+        self.invoker_id = invoker_id
+        self.team_name = team_name
+        self.new_leader_id = new_leader_id
+        self.guild = guild
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, promote them", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        db = load_db()
+        info = db["teams"].get(self.team_name)
+        if info is None or info.get("leader_id") != self.invoker_id:
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(
+                interaction,
+                content="That team no longer exists, or you're no longer its leader.",
+                view=self,
+            )
+            return
+
+        promoted = await perform_leader_promotion(
+            db, self.team_name, self.new_leader_id, self.guild,
+            reason=f"Leader promotion by {interaction.user}",
+        )
+        for child in self.children:
+            child.disabled = True
+
+        if not promoted:
+            await safe_edit_original_response(interaction, content="That team no longer exists.", view=self)
+            return
+
+        await safe_edit_original_response(
+            interaction,
+            content=f"✅ <@{self.new_leader_id}> is now the leader of **{self.team_name}**.",
+            view=self,
+        )
+
+        channel = self.guild.get_channel(info.get("channel_id"))
+        if channel is not None:
+            try:
+                await channel.send(f"👑 <@{self.new_leader_id}> is now the leader of the team!")
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Cancelled — leadership unchanged.", view=self)
 
 
 # ---------- Confirmation view for /cleanuporphanteams ----------
@@ -2623,6 +2750,93 @@ async def changeteamsettings(
     if icon_warning:
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
     await interaction.followup.send(message, ephemeral=True)
+
+
+# ---------- Leader promotion commands ----------
+@bot.tree.command(
+    name="leaderpromote",
+    description="Promote a member of your team to leader (leader only)",
+)
+@app_commands.describe(member="The team member to promote to leader")
+async def leaderpromote(interaction: discord.Interaction, member: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    if not team_key:
+        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+
+    if member.id == interaction.user.id:
+        await interaction.followup.send("You're already the leader.", ephemeral=True)
+        return
+
+    if member.bot:
+        await interaction.followup.send("You can't promote a bot.", ephemeral=True)
+        return
+
+    if member.id not in info.get("members", []):
+        await interaction.followup.send(f"{member.mention} isn't a member of **{team_key}**.", ephemeral=True)
+        return
+
+    view = ConfirmLeaderPromoteView(interaction.user.id, team_key, member.id, interaction.guild)
+    await interaction.followup.send(
+        f"Are you sure you want to make {member.mention} the new leader of **{team_key}**? "
+        f"You'll be demoted to a regular member.",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="staffleaderpromote",
+    description="(Staff) Promote a member to leader of the specified team",
+)
+@app_commands.describe(team="Team to update", user="The member to promote to leader")
+async def staffleaderpromote(interaction: discord.Interaction, team: str, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+
+    if user.bot:
+        await interaction.followup.send("You can't promote a bot.", ephemeral=True)
+        return
+
+    if info.get("leader_id") == user.id:
+        await interaction.followup.send(f"{user.mention} is already the leader of **{team_key}**.", ephemeral=True)
+        return
+
+    if user.id not in info.get("members", []):
+        await interaction.followup.send(f"{user.mention} isn't a member of **{team_key}**.", ephemeral=True)
+        return
+
+    await perform_leader_promotion(
+        db, team_key, user.id, interaction.guild, reason=f"Leader promotion by staff member {interaction.user}"
+    )
+
+    await interaction.followup.send(f"✅ {user.mention} is now the leader of **{team_key}**.", ephemeral=True)
+
+    channel = interaction.guild.get_channel(info.get("channel_id"))
+    if channel is not None:
+        try:
+            await channel.send(f"👑 {user.mention} is now the leader of the team!")
+        except discord.HTTPException:
+            pass
+
+
+staffleaderpromote.autocomplete("team")(team_name_autocomplete)
 
 
 # ---------- Giveaway slash command ----------
