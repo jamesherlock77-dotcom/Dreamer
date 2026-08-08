@@ -2137,7 +2137,6 @@ def build_meta_update_embed(current: str, previous: str | None, detected_ts: int
     embed = discord.Embed(
         title="Update Detected!",
         description=f"<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**",
-        colour=discord.Colour.default(),
     )
     embed.set_author(name=META_EMBED_AUTHOR)
     embed.add_field(name="🟢 | Updated Version:", value=f"```{current_display}```", inline=False)
