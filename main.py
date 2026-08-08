@@ -67,8 +67,10 @@ SUPPORT_BANNER_FILENAME = "support_banner.png"
 
 # ---------- Meta Quest update tracker config ----------
 META_UPDATE_CHANNEL_ID = 1528007337699311743  # where update announcements are posted
+META_LOG_CHANNEL_ID = 1535478538776608859     # last-logged-version JSON "database" message lives here
 META_URL = "https://www.meta.com/experiences/animal-company/7190422614401072/"
-META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")
+META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")  # legacy plaintext file — read only, for one-time migration
+META_VERSION_DB_FILE = "meta_version_data.json"
 META_CHECK_INTERVAL_MINUTES = 5  # how often to auto-check for a new version
 META_GAME_DISPLAY_NAME = "Wooster Games, Animal Company"  # bold subtitle line shown on the update embed
 META_EMBED_AUTHOR = "ReTracker v2"  # small eyebrow text shown above the embed title
@@ -1940,16 +1942,76 @@ async def before_check_giveaways():
 # ============================================================
 
 def load_last_meta_version() -> str | None:
+    if os.path.exists(META_VERSION_DB_FILE):
+        with open(META_VERSION_DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("last_version") or None
+
+    # One-time migration: an older build of this bot stored the version as plain text
+    # in META_VERSION_FILE with no channel backup at all, so a redeploy silently wiped
+    # it (Railway wipes the container's disk on every redeploy). If that legacy file is
+    # still lying around locally, read it once so this rollout doesn't fire a spurious
+    # "update detected" — save_last_meta_version() below will write the JSON version.
     if os.path.exists(META_VERSION_FILE):
         with open(META_VERSION_FILE, "r", encoding="utf-8") as f:
             v = f.read().strip()
-            return v or None
+        return v or None
+
     return None
 
 
 def save_last_meta_version(version: str) -> None:
-    with open(META_VERSION_FILE, "w", encoding="utf-8") as f:
-        f.write(version)
+    with open(META_VERSION_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"last_version": version, "last_updated": discord.utils.utcnow().isoformat()},
+            f,
+            indent=2,
+        )
+
+
+async def backup_meta_version_to_log_channel():
+    try:
+        await _backup_file_to_channel(META_LOG_CHANNEL_ID, META_VERSION_DB_FILE, META_VERSION_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up meta version db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the poll loop
+        print(f"Unexpected error backing up meta version db: {e}")
+
+
+async def restore_meta_version_from_log_channel():
+    """Pulls the last-logged version JSON from META_LOG_CHANNEL_ID into local storage on
+    startup — critical because Railway wipes the container's disk on every redeploy,
+    the same reason teams/giveaways/tickets are backed up this way. Falls back to
+    migrating the legacy local .txt file (if present) and immediately pushing a fresh
+    backup, so no previously-known version is lost."""
+    if os.path.exists(META_VERSION_DB_FILE):
+        # Local data already present (e.g. a crash-restart, not a fresh container) —
+        # push it straight to the log channel so the backup there is confirmed up to date.
+        await backup_meta_version_to_log_channel()
+        return
+
+    try:
+        found = await _restore_file_from_channel(META_LOG_CHANNEL_ID, META_VERSION_DB_FILE, META_VERSION_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore meta version db from log channel: {e}")
+        found = False
+
+    if found:
+        print("Restored last-logged Meta version from log channel backup.")
+        return
+
+    # No backup in the channel yet — fall back to the legacy local .txt file, if any,
+    # migrate it into the JSON format, and push the first backup right away.
+    if os.path.exists(META_VERSION_FILE):
+        with open(META_VERSION_FILE, "r", encoding="utf-8") as f:
+            legacy_version = f.read().strip()
+        if legacy_version:
+            save_last_meta_version(legacy_version)
+            await backup_meta_version_to_log_channel()
+            print("Migrated last-logged Meta version from the legacy local file.")
+            return
+
+    print("No existing last-logged Meta version found — starting fresh.")
 
 
 def _sanitize_version_text(text: str | None, max_len: int = 1000) -> str | None:
@@ -2075,6 +2137,7 @@ def build_meta_update_embed(current: str, previous: str | None, detected_ts: int
     embed = discord.Embed(
         title="Update Detected!",
         description=f"<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**",
+        colour=discord.Colour.default(),
     )
     embed.set_author(name=META_EMBED_AUTHOR)
     embed.add_field(name="🟢 | Updated Version:", value=f"```{current_display}```", inline=False)
@@ -2082,152 +2145,27 @@ def build_meta_update_embed(current: str, previous: str | None, detected_ts: int
     return embed
 
 
-# Pulls the page's Open Graph image (the store banner/key art shown for the game),
-# preferring the https secure_url variant when present.
-_OG_IMAGE_SECURE_RE = re.compile(
-    r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
-)
-_OG_IMAGE_RE = re.compile(
-    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
-)
-
-
-async def fetch_meta_banner() -> tuple[bytes, str] | None:
-    """Scrapes the store page's banner/key art and downloads it.
-
-    Mirrors fetch_meta_version's two-stage approach: first tries a fast aiohttp request
-    for the og:image meta tag in the raw (pre-JS-render) HTML; since the store page is
-    client-rendered, that raw HTML often doesn't contain it, so this now falls back to
-    Playwright (a real rendered browser) to read the tag out of the live DOM — and, if
-    even that comes up empty, to the largest visible <img> on the page as a best-effort
-    banner guess, rather than giving up. Returns (image_bytes, filename) on success, or
-    None if no banner could be found/downloaded — callers should fall back to sending the
-    embed without an image.
-    """
-    image_url = None
-
-    # 1) Fast path: og:image meta tag in the raw, un-rendered HTML.
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
-        }
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(META_URL) as resp:
-                if resp.status != 200:
-                    print(f"[DEBUG] fetch_meta_banner: HTTP {resp.status} from {META_URL}")
-                else:
-                    html = await resp.text()
-                    match = _OG_IMAGE_SECURE_RE.search(html) or _OG_IMAGE_RE.search(html)
-                    if match:
-                        image_url = match.group(1).replace("&amp;", "&")
-                    else:
-                        print(
-                            "[DEBUG] fetch_meta_banner: no og:image tag in the raw HTML "
-                            "(expected — the page is client-rendered) — falling back to Playwright."
-                        )
-    except Exception as e:
-        print(f"[DEBUG] fetch_meta_banner aiohttp attempt failed: {e}")
-
-    # 2) Fallback: Playwright renders the page's JS, same as a real browser, then reads
-    # the og:image tag (or, failing that, the largest visible <img>) from the live DOM.
-    if image_url is None:
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-                page = await browser.new_page()
-                try:
-                    try:
-                        await page.goto(META_URL, wait_until="networkidle", timeout=20000)
-                    except Exception:
-                        try:
-                            await page.goto(META_URL, timeout=20000)
-                        except Exception as e:
-                            print(f"[ERROR] fetch_meta_banner: Playwright failed to navigate: {e}")
-                            await browser.close()
-                            image_url = None
-                            raise StopIteration  # jump past the evaluate() below
-
-                    image_url = await page.evaluate(
-                        """() => {
-                            const secure = document.querySelector('meta[property="og:image:secure_url"]');
-                            if (secure && secure.content) return secure.content;
-                            const og = document.querySelector('meta[property="og:image"]');
-                            if (og && og.content) return og.content;
-                            // Best-effort fallback: the largest reasonably-sized visible
-                            // image on the page, as a stand-in for the missing og:image tag.
-                            const imgs = [...document.querySelectorAll('img')]
-                                .filter(img => img.naturalWidth > 200 && img.naturalHeight > 100)
-                                .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
-                            return imgs.length ? imgs[0].src : null;
-                        }"""
-                    )
-                except StopIteration:
-                    pass
-                finally:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-
-            if image_url:
-                image_url = image_url.replace("&amp;", "&")
-            else:
-                print("[DEBUG] fetch_meta_banner: no image found via Playwright either.")
-        except Exception as e:
-            print(f"[ERROR] fetch_meta_banner: Playwright fallback failed: {e}")
-            image_url = None
-
-    if not image_url:
-        return None
-
-    # Download whichever image URL we resolved above.
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
-        }
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(image_url) as img_resp:
-                if img_resp.status != 200:
-                    print(f"[DEBUG] fetch_meta_banner: HTTP {img_resp.status} fetching image")
-                    return None
-                image_bytes = await img_resp.read()
-                content_type = img_resp.headers.get("Content-Type", "")
-    except Exception as e:
-        print(f"[DEBUG] fetch_meta_banner: failed downloading image: {e}")
-        return None
-
-    ext = ".png"
-    lowered_url = image_url.lower().split("?")[0]
-    if "webp" in content_type or lowered_url.endswith(".webp"):
-        ext = ".webp"
-    elif "jpeg" in content_type or "jpg" in content_type or lowered_url.endswith((".jpg", ".jpeg")):
-        ext = ".jpg"
-
-    return image_bytes, f"meta_banner{ext}"
-
-
 async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
     """Checks the store for a new version and, if it changed, posts the update embed
-    (with the freshly scraped store banner attached, when available) to
-    META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
+    (with support_banner.png attached, same image used on the ticket panel and giveaway
+    embeds) to META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
     previous = load_last_meta_version()
     current = await fetch_meta_version()
 
     if current and current != previous:
         save_last_meta_version(current)
+        await backup_meta_version_to_log_channel()
         channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
         if channel:
             detected_ts = int(discord.utils.utcnow().timestamp())
             embed = build_meta_update_embed(current, previous, detected_ts)
 
-            banner = await fetch_meta_banner()
             file = None
-            if banner is not None:
-                image_bytes, filename = banner
-                file = discord.File(io.BytesIO(image_bytes), filename=filename)
-                embed.set_image(url=f"attachment://{filename}")
+            if os.path.exists(SUPPORT_BANNER_PATH):
+                file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+                embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+            else:
+                print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — update embed sent without image.")
 
             try:
                 if file is not None:
@@ -3578,6 +3516,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def on_ready():
     await restore_db_from_log_channel()
     await restore_ticket_db_from_log_channel()
+    await restore_meta_version_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
