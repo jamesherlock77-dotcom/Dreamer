@@ -2216,6 +2216,39 @@ async def checkupdate(interaction: discord.Interaction):
         await interaction.followup.send(f"No update detected.\nCurrent: `{current}`")
 
 
+@bot.tree.command(
+    name="updateembed",
+    description="(Staff) Preview the update embed's current look — doesn't post to the update channel or save anything",
+)
+async def updateembed(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    current = await fetch_meta_version()
+    if current is None:
+        await interaction.followup.send(
+            "⚠️ Couldn't fetch the version from the Meta store page — nothing to preview.", ephemeral=True
+        )
+        return
+
+    previous = load_last_meta_version()
+    detected_ts = int(discord.utils.utcnow().timestamp())
+    embed = build_meta_update_embed(current, previous, detected_ts)
+
+    file = None
+    if os.path.exists(SUPPORT_BANNER_PATH):
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+        embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+
+    if file is not None:
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ---------- Slash commands ----------
 @bot.tree.command(name="createteam", description="Create a new team")
 @app_commands.describe(
