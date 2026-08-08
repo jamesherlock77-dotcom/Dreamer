@@ -2218,7 +2218,7 @@ async def checkupdate(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="updateembed",
-    description="(Staff) Preview the update embed's current look — doesn't post to the update channel or save anything",
+    description="(Staff) Preview the update embed's current look — doesn't post or save anything",
 )
 async def updateembed(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
