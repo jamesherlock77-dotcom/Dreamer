@@ -1951,28 +1951,76 @@ def save_last_meta_version(version: str) -> None:
 
 
 async def fetch_meta_version() -> str | None:
-    """Loads the Meta store page and scrapes the 'Version' text."""
+    """Try to fetch the Meta store page and scrape the 'Version' text.
+    First tries a lightweight aiohttp request + regex; falls back to Playwright if needed.
+    Returns the version string or None on failure.
+    """
+    # 1) Try aiohttp + regex (fast, avoids needing Playwright / browser on Railway)
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(META_URL) as resp:
+                if resp.status != 200:
+                    print(f"[DEBUG] fetch_meta_version: HTTP {resp.status} from {META_URL}")
+                else:
+                    text = await resp.text()
+                    # Try patterns like "Version 1.2.3" or "Version: 1.2.3"
+                    m = re.search(r"Version[:\s\-–—]*([^\n<]+)", text, re.IGNORECASE)
+                    if m:
+                        ver = m.group(1).strip()
+                        if ver:
+                            return ver
+    except Exception as e:
+        print(f"[DEBUG] aiohttp attempt failed: {e}")
+
+    # 2) Fallback to Playwright (only if aiohttp didn't find it)
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            # --no-sandbox helps in many restricted containers; if it causes issues remove it.
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             page = await browser.new_page()
-            await page.goto(META_URL, wait_until="networkidle")
+            try:
+                await page.goto(META_URL, wait_until="networkidle", timeout=20000)
+            except Exception:
+                # Some pages never hit networkidle; retry without waiting for networkidle
+                try:
+                    await page.goto(META_URL, timeout=20000)
+                except Exception as e:
+                    await browser.close()
+                    print(f"[ERROR] Playwright failed to navigate to {META_URL}: {e}")
+                    return None
 
-            version = await page.evaluate(
-                """() => {
-                    const divs = [...document.querySelectorAll('div')];
-                    for (const el of divs) {
-                        if (el.innerText && el.innerText.startsWith('Version')) {
-                            return el.innerText.replace('Version', '').trim();
+            try:
+                version = await page.evaluate(
+                    """() => {
+                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                        let node;
+                        while (node = walker.nextNode()) {
+                            const t = node.textContent.trim();
+                            if (!t) continue;
+                            const idx = t.toLowerCase().indexOf('version');
+                            if (idx !== -1) {
+                                const after = t.slice(idx + 'version'.length).replace(/^[:\\s\\-–—]+/, '').trim();
+                                if (after) return after;
+                            }
                         }
-                    }
-                    return null;
-                }"""
-            )
-            await browser.close()
+                        const divs = [...document.querySelectorAll('div, span, p')];
+                        for (const el of divs) {
+                            if (el.innerText && el.innerText.trim().toLowerCase().startsWith('version')) {
+                                return el.innerText.replace(/^version[:\\s]*/i, '').trim();
+                            }
+                        }
+                        return null;
+                    }"""
+                )
+            finally:
+                await browser.close()
             return version
     except Exception as e:
-        print(f"[ERROR] Failed to fetch Meta version: {e}")
+        print(f"[ERROR] Failed to fetch Meta version (Playwright): {e}")
         return None
 
 
