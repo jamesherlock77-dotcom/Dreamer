@@ -66,14 +66,15 @@ SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
 
 # ---------- Meta Quest update tracker config ----------
-META_UPDATE_CHANNEL_ID = 1528007337699311743  # where update announcements are posted
+META_UPDATE_CHANNEL_ID = 1528008387420356629  # where update announcements are posted
 META_LOG_CHANNEL_ID = 1535478538776608859     # last-logged-version JSON "database" message lives here
 META_URL = "https://www.meta.com/experiences/animal-company/7190422614401072/"
 META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")  # legacy plaintext file — read only, for one-time migration
 META_VERSION_DB_FILE = "meta_version_data.json"
 META_CHECK_INTERVAL_MINUTES = 5  # how often to auto-check for a new version
 META_GAME_DISPLAY_NAME = "Wooster Games, Animal Company"  # bold subtitle line shown on the update embed
-META_EMBED_AUTHOR = "ReTracker v2"  # small eyebrow text shown above the embed title
+META_EMBED_AUTHOR = "AC: Arena Hub"  # small eyebrow text shown above the embed title
+META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update is detected
 
 
 # ---------- Bot setup ----------
@@ -2168,9 +2169,9 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
 
             try:
                 if file is not None:
-                    await channel.send(embed=embed, file=file)
+                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", embed=embed, file=file)
                 else:
-                    await channel.send(embed=embed)
+                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", embed=embed)
             except discord.HTTPException as e:
                 # If embed fails (still too large or otherwise invalid), fall back to a plaintext summary.
                 print(f"[ERROR] Failed to send meta update embed: {e}")
@@ -2178,7 +2179,7 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
                     short_current = _sanitize_version_text(current, max_len=800)
                     short_previous = _sanitize_version_text(previous or current, max_len=800)
                     fallback_msg = (
-                        f"Meta Update Detected!\n\nUpdated Version: {short_current}\n"
+                        f"<@&{META_UPDATE_PING_ROLE_ID}> Meta Update Detected!\n\nUpdated Version: {short_current}\n"
                         f"Last Logged: {short_previous or 'None'}"
                     )
                     await channel.send(content=fallback_msg)
