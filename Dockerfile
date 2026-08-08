@@ -17,4 +17,4 @@ RUN playwright install --with-deps chromium
 # Now copy the rest of your bot's code
 COPY . .
 
-CMD ["python", "bot.py"]
+CMD ["python", "main.py"]
