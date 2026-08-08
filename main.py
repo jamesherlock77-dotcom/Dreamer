@@ -2776,6 +2776,71 @@ async def cleanuporphanteams(interaction: discord.Interaction):
 
 
 @bot.tree.command(
+    name="randomgiverole",
+    description="(Staff) Give a role to a random selection of members",
+)
+@app_commands.describe(
+    role="The role to hand out",
+    number="How many random members should receive it (capped automatically at the eligible member count)",
+)
+async def randomgiverole(
+    interaction: discord.Interaction, role: discord.Role, number: app_commands.Range[int, 1, 1000000]
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if role.is_default() or role.managed:
+        await interaction.followup.send(
+            "Can't hand out `@everyone` or a bot/integration-managed role.", ephemeral=True
+        )
+        return
+
+    if role >= interaction.guild.me.top_role:
+        await interaction.followup.send(
+            f"I can't assign {role.mention} — it's positioned above (or equal to) my own top role. "
+            f"Move my role above it and try again.",
+            ephemeral=True,
+        )
+        return
+
+    # Only real members who don't already have the role are eligible to win it.
+    eligible = [member for member in interaction.guild.members if not member.bot and role not in member.roles]
+
+    if not eligible:
+        await interaction.followup.send(
+            f"No eligible members — everyone (or nobody) already has {role.mention}.", ephemeral=True
+        )
+        return
+
+    import random
+
+    pick_count = min(number, len(eligible))
+    chosen = random.sample(eligible, pick_count)
+
+    granted = []
+    failed = []
+    for member in chosen:
+        try:
+            await member.add_roles(role, reason=f"/randomgiverole by {interaction.user}")
+            granted.append(member)
+        except discord.HTTPException:
+            failed.append(member)
+
+    result = f"🎲 Gave {role.mention} to {len(granted)} random member(s):\n" + ", ".join(
+        m.mention for m in granted
+    )
+    if pick_count < number:
+        result += f"\n\n⚠️ Only {len(eligible)} member(s) were eligible, so fewer than {number} were picked."
+    if failed:
+        result += f"\n⚠️ Couldn't assign the role to: {', '.join(m.mention for m in failed)}."
+
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(
     name="premiumteamsettings",
     description="(Premium) Apply gradient role colours or a custom role icon to your team",
 )
