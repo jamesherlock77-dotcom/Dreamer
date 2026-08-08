@@ -1950,10 +1950,24 @@ def save_last_meta_version(version: str) -> None:
         f.write(version)
 
 
+def _sanitize_version_text(text: str | None, max_len: int = 1000) -> str | None:
+    """Remove HTML tags, collapse whitespace, and truncate to max_len."""
+    if text is None:
+        return None
+    s = str(text)
+    # Remove obvious HTML tags if present
+    s = re.sub(r"<[^>]+>", "", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        return s[: max_len - 1] + "…"
+    return s
+
+
 async def fetch_meta_version() -> str | None:
     """Try to fetch the Meta store page and scrape the 'Version' text.
     First tries a lightweight aiohttp request + regex; falls back to Playwright if needed.
-    Returns the version string or None on failure.
+    Returns the sanitized, truncated version string or None on failure.
     """
     # 1) Try aiohttp + regex (fast, avoids needing Playwright / browser on Railway)
     try:
@@ -1971,8 +1985,7 @@ async def fetch_meta_version() -> str | None:
                     m = re.search(r"Version[:\s\-–—]*([^\n<]+)", text, re.IGNORECASE)
                     if m:
                         ver = m.group(1).strip()
-                        if ver:
-                            return ver
+                        return _sanitize_version_text(ver, max_len=1000)
     except Exception as e:
         print(f"[DEBUG] aiohttp attempt failed: {e}")
 
@@ -2003,14 +2016,14 @@ async def fetch_meta_version() -> str | None:
                             if (!t) continue;
                             const idx = t.toLowerCase().indexOf('version');
                             if (idx !== -1) {
-                                const after = t.slice(idx + 'version'.length).replace(/^[:\\s\\-–—]+/, '').trim();
+                                const after = t.slice(idx + 'version'.length).replace(/^[:\s\-–—]+/, '').trim();
                                 if (after) return after;
                             }
                         }
                         const divs = [...document.querySelectorAll('div, span, p')];
                         for (const el of divs) {
                             if (el.innerText && el.innerText.trim().toLowerCase().startsWith('version')) {
-                                return el.innerText.replace(/^version[:\\s]*/i, '').trim();
+                                return el.innerText.replace(/^version[:\s]*/i, '').trim();
                             }
                         }
                         return null;
@@ -2018,20 +2031,28 @@ async def fetch_meta_version() -> str | None:
                 )
             finally:
                 await browser.close()
-            return version
+            return _sanitize_version_text(version, max_len=1000)
     except Exception as e:
         print(f"[ERROR] Failed to fetch Meta version (Playwright): {e}")
         return None
 
 
 def build_meta_update_embed(current: str, previous: str | None) -> discord.Embed:
+    """Build a compact embed for the meta update, truncating long values to fit Discord limits."""
+    # Field values are limited (per-field ~1024, overall embed <= 6000). Keep trimmed.
+    current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
+    previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
+
+    # Use shorter titles and values so we stay well under the embed limit.
     embed = discord.Embed(
         title="Meta Update Detected!",
         color=0x800080,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="🟢 Updated Version", value=f"```{current}```", inline=True)
-    embed.add_field(name="🔴 Last Logged", value=previous or current, inline=True)
+
+    # Use code blocks around the version strings but truncated to safe length.
+    embed.add_field(name="🟢 Updated Version", value=f"```{current_display}```", inline=True)
+    embed.add_field(name="🔴 Last Logged", value=previous_display, inline=True)
     return embed
 
 
@@ -2045,7 +2066,21 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
         save_last_meta_version(current)
         channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
         if channel:
-            await channel.send(embed=build_meta_update_embed(current, previous))
+            try:
+                await channel.send(embed=build_meta_update_embed(current, previous))
+            except discord.HTTPException as e:
+                # If embed fails (still too large or otherwise invalid), fall back to a plaintext summary.
+                print(f"[ERROR] Failed to send meta update embed: {e}")
+                try:
+                    short_current = _sanitize_version_text(current, max_len=800)
+                    short_previous = _sanitize_version_text(previous or current, max_len=800)
+                    fallback_msg = (
+                        f"Meta Update Detected!\n\nUpdated Version: {short_current}\n"
+                        f"Last Logged: {short_previous or 'None'}"
+                    )
+                    await channel.send(content=fallback_msg)
+                except Exception as e2:
+                    print(f"[ERROR] Failed to send fallback meta update message: {e2}")
         return True, current, previous
 
     return False, current, previous
