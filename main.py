@@ -5,13 +5,15 @@ import io
 import re
 import json
 import logging
-from datetime import timedelta, datetime
+import asyncio
+from datetime import timedelta, datetime, timezone
 
 import aiohttp
 import emoji as emoji_lib
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from playwright.async_api import async_playwright
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
 # the interaction (e.g. the user typed another character before the bot replied).
@@ -62,6 +64,12 @@ DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migra
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
+
+# ---------- Meta Quest update tracker config ----------
+META_UPDATE_CHANNEL_ID = 1528007337699311743  # where update announcements are posted
+META_URL = "https://www.meta.com/experiences/animal-company/7190422614401072/"
+META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")
+META_CHECK_INTERVAL_MINUTES = 5  # how often to auto-check for a new version
 
 
 # ---------- Bot setup ----------
@@ -1923,6 +1931,105 @@ async def before_check_giveaways():
     await bot.wait_until_ready()
 
 
+# ============================================================
+# META QUEST UPDATE TRACKER — watches the Animal Company store
+# page and posts an embed to META_UPDATE_CHANNEL_ID whenever the
+# version number changes.
+# ============================================================
+
+def load_last_meta_version() -> str | None:
+    if os.path.exists(META_VERSION_FILE):
+        with open(META_VERSION_FILE, "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or None
+    return None
+
+
+def save_last_meta_version(version: str) -> None:
+    with open(META_VERSION_FILE, "w", encoding="utf-8") as f:
+        f.write(version)
+
+
+async def fetch_meta_version() -> str | None:
+    """Loads the Meta store page and scrapes the 'Version' text."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(META_URL, wait_until="networkidle")
+
+            version = await page.evaluate(
+                """() => {
+                    const divs = [...document.querySelectorAll('div')];
+                    for (const el of divs) {
+                        if (el.innerText && el.innerText.startsWith('Version')) {
+                            return el.innerText.replace('Version', '').trim();
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            await browser.close()
+            return version
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch Meta version: {e}")
+        return None
+
+
+def build_meta_update_embed(current: str, previous: str | None) -> discord.Embed:
+    embed = discord.Embed(
+        title="Meta Update Detected!",
+        color=0x800080,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🟢 Updated Version", value=f"```{current}```", inline=True)
+    embed.add_field(name="🔴 Last Logged", value=previous or current, inline=True)
+    return embed
+
+
+async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
+    """Checks the store for a new version and, if it changed, posts the update embed to
+    META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
+    previous = load_last_meta_version()
+    current = await fetch_meta_version()
+
+    if current and current != previous:
+        save_last_meta_version(current)
+        channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
+        if channel:
+            await channel.send(embed=build_meta_update_embed(current, previous))
+        return True, current, previous
+
+    return False, current, previous
+
+
+@tasks.loop(minutes=META_CHECK_INTERVAL_MINUTES)
+async def meta_poll_loop():
+    await check_for_meta_update()
+
+
+@meta_poll_loop.before_loop
+async def before_meta_poll_loop():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="checkupdate", description="Checks for an Animal Company update manually")
+async def checkupdate(interaction: discord.Interaction):
+    await interaction.response.defer()
+    changed, current, previous = await check_for_meta_update()
+
+    if current is None:
+        await interaction.followup.send("⚠️ Couldn't fetch the version from the Meta store page.")
+        return
+
+    if changed:
+        await interaction.followup.send(
+            f"✅ Update detected!\nCurrent: `{current}`\nPrevious: `{previous or 'None'}`"
+        )
+    else:
+        await interaction.followup.send(f"No update detected.\nCurrent: `{current}`")
+
+
 # ---------- Slash commands ----------
 @bot.tree.command(name="createteam", description="Create a new team")
 @app_commands.describe(
@@ -3242,6 +3349,8 @@ async def on_ready():
         print(f"Failed to refresh tournament panel: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
+    if not meta_poll_loop.is_running():
+        meta_poll_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
