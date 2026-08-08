@@ -70,6 +70,8 @@ META_UPDATE_CHANNEL_ID = 1528007337699311743  # where update announcements are p
 META_URL = "https://www.meta.com/experiences/animal-company/7190422614401072/"
 META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")
 META_CHECK_INTERVAL_MINUTES = 5  # how often to auto-check for a new version
+META_GAME_DISPLAY_NAME = "Wooster Games, Animal Company"  # bold subtitle line shown on the update embed
+META_EMBED_AUTHOR = "ReTracker v2"  # small eyebrow text shown above the embed title
 
 
 # ---------- Bot setup ----------
@@ -2037,27 +2039,81 @@ async def fetch_meta_version() -> str | None:
         return None
 
 
-def build_meta_update_embed(current: str, previous: str | None) -> discord.Embed:
-    """Build a compact embed for the meta update, truncating long values to fit Discord limits."""
-    # Field values are limited (per-field ~1024, overall embed <= 6000). Keep trimmed.
+def build_meta_update_embed(current: str, previous: str | None, detected_ts: int) -> discord.Embed:
+    """Build the update-detected embed, styled to match the reference "ReTracker v2"
+    panel: a small author eyebrow, "Update Detected!" title, a timestamp + bold game name
+    in the description, and two stacked fields (green dot = new version, red dot = last
+    logged version) each rendered as a code block. The banner image (if one was
+    successfully scraped/attached) is set separately by the caller via set_image."""
     current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
     previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
 
-    # Use shorter titles and values so we stay well under the embed limit.
     embed = discord.Embed(
-        title="Meta Update Detected!",
-        color=0x800080,
-        timestamp=datetime.now(timezone.utc),
+        title="Update Detected!",
+        description=f"<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**",
     )
-
-    # Use code blocks around the version strings but truncated to safe length.
-    embed.add_field(name="🟢 Updated Version", value=f"```{current_display}```", inline=True)
-    embed.add_field(name="🔴 Last Logged", value=previous_display, inline=True)
+    embed.set_author(name=META_EMBED_AUTHOR)
+    embed.add_field(name="🟢 | Updated Version:", value=f"```{current_display}```", inline=False)
+    embed.add_field(name="🔴 | Last Logged:", value=f"```{previous_display}```", inline=False)
     return embed
 
 
+# Pulls the page's Open Graph image (the store banner/key art shown for the game),
+# preferring the https secure_url variant when present.
+_OG_IMAGE_SECURE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
+)
+_OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE
+)
+
+
+async def fetch_meta_banner() -> tuple[bytes, str] | None:
+    """Scrapes the store page's og:image (the game's banner/key art) and downloads it.
+    Returns (image_bytes, filename) on success, or None if the banner couldn't be found
+    or downloaded — callers should fall back to sending the embed without an image."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(META_URL) as resp:
+                if resp.status != 200:
+                    print(f"[DEBUG] fetch_meta_banner: HTTP {resp.status} from {META_URL}")
+                    return None
+                html = await resp.text()
+
+            match = _OG_IMAGE_SECURE_RE.search(html) or _OG_IMAGE_RE.search(html)
+            if not match:
+                print("[DEBUG] fetch_meta_banner: no og:image tag found on the store page")
+                return None
+
+            image_url = match.group(1).replace("&amp;", "&")
+
+            async with session.get(image_url) as img_resp:
+                if img_resp.status != 200:
+                    print(f"[DEBUG] fetch_meta_banner: HTTP {img_resp.status} fetching image")
+                    return None
+                image_bytes = await img_resp.read()
+                content_type = img_resp.headers.get("Content-Type", "")
+
+        ext = ".png"
+        lowered_url = image_url.lower().split("?")[0]
+        if "webp" in content_type or lowered_url.endswith(".webp"):
+            ext = ".webp"
+        elif "jpeg" in content_type or "jpg" in content_type or lowered_url.endswith((".jpg", ".jpeg")):
+            ext = ".jpg"
+
+        return image_bytes, f"meta_banner{ext}"
+    except Exception as e:
+        print(f"[DEBUG] fetch_meta_banner failed: {e}")
+        return None
+
+
 async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
-    """Checks the store for a new version and, if it changed, posts the update embed to
+    """Checks the store for a new version and, if it changed, posts the update embed
+    (with the freshly scraped store banner attached, when available) to
     META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
     previous = load_last_meta_version()
     current = await fetch_meta_version()
@@ -2066,8 +2122,21 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
         save_last_meta_version(current)
         channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
         if channel:
+            detected_ts = int(discord.utils.utcnow().timestamp())
+            embed = build_meta_update_embed(current, previous, detected_ts)
+
+            banner = await fetch_meta_banner()
+            file = None
+            if banner is not None:
+                image_bytes, filename = banner
+                file = discord.File(io.BytesIO(image_bytes), filename=filename)
+                embed.set_image(url=f"attachment://{filename}")
+
             try:
-                await channel.send(embed=build_meta_update_embed(current, previous))
+                if file is not None:
+                    await channel.send(embed=embed, file=file)
+                else:
+                    await channel.send(embed=embed)
             except discord.HTTPException as e:
                 # If embed fails (still too large or otherwise invalid), fall back to a plaintext summary.
                 print(f"[ERROR] Failed to send meta update embed: {e}")
