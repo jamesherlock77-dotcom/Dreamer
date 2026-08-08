@@ -2093,9 +2093,20 @@ _OG_IMAGE_RE = re.compile(
 
 
 async def fetch_meta_banner() -> tuple[bytes, str] | None:
-    """Scrapes the store page's og:image (the game's banner/key art) and downloads it.
-    Returns (image_bytes, filename) on success, or None if the banner couldn't be found
-    or downloaded — callers should fall back to sending the embed without an image."""
+    """Scrapes the store page's banner/key art and downloads it.
+
+    Mirrors fetch_meta_version's two-stage approach: first tries a fast aiohttp request
+    for the og:image meta tag in the raw (pre-JS-render) HTML; since the store page is
+    client-rendered, that raw HTML often doesn't contain it, so this now falls back to
+    Playwright (a real rendered browser) to read the tag out of the live DOM — and, if
+    even that comes up empty, to the largest visible <img> on the page as a best-effort
+    banner guess, rather than giving up. Returns (image_bytes, filename) on success, or
+    None if no banner could be found/downloaded — callers should fall back to sending the
+    embed without an image.
+    """
+    image_url = None
+
+    # 1) Fast path: og:image meta tag in the raw, un-rendered HTML.
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         headers = {
@@ -2105,34 +2116,96 @@ async def fetch_meta_banner() -> tuple[bytes, str] | None:
             async with session.get(META_URL) as resp:
                 if resp.status != 200:
                     print(f"[DEBUG] fetch_meta_banner: HTTP {resp.status} from {META_URL}")
-                    return None
-                html = await resp.text()
+                else:
+                    html = await resp.text()
+                    match = _OG_IMAGE_SECURE_RE.search(html) or _OG_IMAGE_RE.search(html)
+                    if match:
+                        image_url = match.group(1).replace("&amp;", "&")
+                    else:
+                        print(
+                            "[DEBUG] fetch_meta_banner: no og:image tag in the raw HTML "
+                            "(expected — the page is client-rendered) — falling back to Playwright."
+                        )
+    except Exception as e:
+        print(f"[DEBUG] fetch_meta_banner aiohttp attempt failed: {e}")
 
-            match = _OG_IMAGE_SECURE_RE.search(html) or _OG_IMAGE_RE.search(html)
-            if not match:
-                print("[DEBUG] fetch_meta_banner: no og:image tag found on the store page")
-                return None
+    # 2) Fallback: Playwright renders the page's JS, same as a real browser, then reads
+    # the og:image tag (or, failing that, the largest visible <img>) from the live DOM.
+    if image_url is None:
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                page = await browser.new_page()
+                try:
+                    try:
+                        await page.goto(META_URL, wait_until="networkidle", timeout=20000)
+                    except Exception:
+                        try:
+                            await page.goto(META_URL, timeout=20000)
+                        except Exception as e:
+                            print(f"[ERROR] fetch_meta_banner: Playwright failed to navigate: {e}")
+                            await browser.close()
+                            image_url = None
+                            raise StopIteration  # jump past the evaluate() below
 
-            image_url = match.group(1).replace("&amp;", "&")
+                    image_url = await page.evaluate(
+                        """() => {
+                            const secure = document.querySelector('meta[property="og:image:secure_url"]');
+                            if (secure && secure.content) return secure.content;
+                            const og = document.querySelector('meta[property="og:image"]');
+                            if (og && og.content) return og.content;
+                            // Best-effort fallback: the largest reasonably-sized visible
+                            // image on the page, as a stand-in for the missing og:image tag.
+                            const imgs = [...document.querySelectorAll('img')]
+                                .filter(img => img.naturalWidth > 200 && img.naturalHeight > 100)
+                                .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight));
+                            return imgs.length ? imgs[0].src : null;
+                        }"""
+                    )
+                except StopIteration:
+                    pass
+                finally:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
 
+            if image_url:
+                image_url = image_url.replace("&amp;", "&")
+            else:
+                print("[DEBUG] fetch_meta_banner: no image found via Playwright either.")
+        except Exception as e:
+            print(f"[ERROR] fetch_meta_banner: Playwright fallback failed: {e}")
+            image_url = None
+
+    if not image_url:
+        return None
+
+    # Download whichever image URL we resolved above.
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
+        }
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
             async with session.get(image_url) as img_resp:
                 if img_resp.status != 200:
                     print(f"[DEBUG] fetch_meta_banner: HTTP {img_resp.status} fetching image")
                     return None
                 image_bytes = await img_resp.read()
                 content_type = img_resp.headers.get("Content-Type", "")
-
-        ext = ".png"
-        lowered_url = image_url.lower().split("?")[0]
-        if "webp" in content_type or lowered_url.endswith(".webp"):
-            ext = ".webp"
-        elif "jpeg" in content_type or "jpg" in content_type or lowered_url.endswith((".jpg", ".jpeg")):
-            ext = ".jpg"
-
-        return image_bytes, f"meta_banner{ext}"
     except Exception as e:
-        print(f"[DEBUG] fetch_meta_banner failed: {e}")
+        print(f"[DEBUG] fetch_meta_banner: failed downloading image: {e}")
         return None
+
+    ext = ".png"
+    lowered_url = image_url.lower().split("?")[0]
+    if "webp" in content_type or lowered_url.endswith(".webp"):
+        ext = ".webp"
+    elif "jpeg" in content_type or "jpg" in content_type or lowered_url.endswith((".jpg", ".jpeg")):
+        ext = ".jpg"
+
+    return image_bytes, f"meta_banner{ext}"
 
 
 async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
