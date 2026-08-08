@@ -47,6 +47,8 @@ TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select 
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
 
+TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
+
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
 
@@ -402,6 +404,12 @@ def team_leader_channel_overwrite() -> discord.PermissionOverwrite:
         manage_messages=True,
         mention_everyone=True,
     )
+
+
+def team_channel_full_access_overwrite() -> discord.PermissionOverwrite:
+    """Every permission, allowed — granted to TEAM_CHANNEL_FULL_ACCESS_ROLE_ID in every
+    team channel."""
+    return discord.PermissionOverwrite.from_pair(discord.Permissions.all(), discord.Permissions.none())
 
 
 # Preset palette offered in /premiumteamsettings' colour1/colour2 dropdowns (Discord caps choices at 25).
@@ -1204,10 +1212,11 @@ async def perform_leader_promotion(
     return True
 
 
-
+async def sync_existing_teams():
     """Backfill pass run on every startup: makes sure every current team leader holds
     TEAM_LEADER_ROLE_ID and has the manage-messages/mention-everyone overrides in their
-    own team channel (so they can ping the team, delete messages, and pin messages).
+    own team channel (so they can ping the team, delete messages, and pin messages), and
+    that TEAM_CHANNEL_FULL_ACCESS_ROLE_ID has every permission in every team channel.
     Idempotent — cheap after the first run, and self-heals if a permission or role is
     ever reverted manually."""
     db = load_db()
@@ -1217,18 +1226,45 @@ async def perform_leader_promotion(
     guild = None
     leader_role_granted = 0
     perms_updated = 0
+    full_access_updated = 0
 
     for team_name, info in db["teams"].items():
         leader_id = info.get("leader_id")
         channel_id = info.get("channel_id")
+
+        if guild is None and channel_id is not None:
+            try:
+                # all teams live in one guild for this bot; grab it from any known channel
+                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                guild = seed_channel.guild
+            except discord.HTTPException:
+                continue
+
+        if guild is None:
+            continue
+
+        channel = guild.get_channel(channel_id) if channel_id is not None else None
+
+        # Backfill the full-access role's channel permissions regardless of who leads the team.
+        if channel is not None:
+            full_access_role = guild.get_role(TEAM_CHANNEL_FULL_ACCESS_ROLE_ID)
+            if full_access_role is not None:
+                allow, _deny = channel.overwrites_for(full_access_role).pair()
+                if allow != discord.Permissions.all():
+                    try:
+                        await channel.set_permissions(
+                            full_access_role,
+                            overwrite=team_channel_full_access_overwrite(),
+                            reason=f"Backfilled full-access role permissions for existing team {team_name}",
+                        )
+                        full_access_updated += 1
+                    except discord.HTTPException:
+                        pass
+
         if leader_id is None:
             continue
 
         try:
-            if guild is None:
-                # all teams live in one guild for this bot; grab it from any known channel
-                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-                guild = seed_channel.guild
             member = guild.get_member(leader_id) or await guild.fetch_member(leader_id)
         except discord.HTTPException:
             continue
@@ -1245,7 +1281,6 @@ async def perform_leader_promotion(
             except discord.HTTPException:
                 pass
 
-        channel = guild.get_channel(channel_id)
         if channel is not None:
             existing = channel.overwrites_for(member)
             if not (existing.manage_messages and existing.mention_everyone):
@@ -1259,10 +1294,11 @@ async def perform_leader_promotion(
                 except discord.HTTPException:
                     pass
 
-    if leader_role_granted or perms_updated:
+    if leader_role_granted or perms_updated or full_access_updated:
         print(
-            f"Backfilled team-leader role onto {leader_role_granted} leader(s) and "
-            f"channel permissions onto {perms_updated} leader(s)."
+            f"Backfilled team-leader role onto {leader_role_granted} leader(s), channel "
+            f"permissions onto {perms_updated} leader(s), and full-access role permissions "
+            f"onto {full_access_updated} team channel(s)."
         )
 
 
@@ -1532,6 +1568,10 @@ class ConfirmTeamView(discord.ui.View):
             # the team role even though it isn't set to be mentionable.
             leader: team_leader_channel_overwrite(),
         }
+
+        full_access_role = guild.get_role(TEAM_CHANNEL_FULL_ACCESS_ROLE_ID)
+        if full_access_role is not None:
+            overwrites[full_access_role] = team_channel_full_access_overwrite()
 
         channel_name = f"{self.emoji}┃{self.team_name}-Team"
         try:
