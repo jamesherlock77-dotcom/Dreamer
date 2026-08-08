@@ -1966,12 +1966,26 @@ def _sanitize_version_text(text: str | None, max_len: int = 1000) -> str | None:
     return s
 
 
+# Only accepts an actual version-number shape (e.g. "1.85.2.3320") immediately after the
+# word "Version" — NOT just any text. The raw (pre-JS-render) HTML aiohttp fetches below
+# often contains the literal word "version" buried in unrelated embedded JS/config blobs
+# (analytics config, DTSG tokens, etc.); a loose regex would grab whatever text follows
+# THAT instead of the real game version, and since *a* match was found the old code
+# returned immediately without ever trying the reliable Playwright (real browser) path.
+# Requiring a numeric X.Y[.Z[.W]] shape makes false positives on that kind of JS/JSON
+# noise extremely unlikely, so a non-match here correctly falls through to Playwright.
+_VERSION_NUMBER_RE = re.compile(r"\bVersion\b[:\s\-–—]*([0-9]+(?:\.[0-9]+){1,4})", re.IGNORECASE)
+
+
 async def fetch_meta_version() -> str | None:
     """Try to fetch the Meta store page and scrape the 'Version' text.
-    First tries a lightweight aiohttp request + regex; falls back to Playwright if needed.
-    Returns the sanitized, truncated version string or None on failure.
+    First tries a lightweight aiohttp request + a strict version-number regex; falls back
+    to Playwright (which renders the page's JS, same as a real browser) whenever that
+    strict match isn't found — which, since the store page is client-rendered, is the
+    common case. Returns the sanitized, truncated version string or None on failure.
     """
-    # 1) Try aiohttp + regex (fast, avoids needing Playwright / browser on Railway)
+    # 1) Try aiohttp + a strict regex (fast, avoids needing Playwright / a browser on
+    # Railway) — but only trust it if it actually looks like a version number.
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         headers = {
@@ -1983,11 +1997,13 @@ async def fetch_meta_version() -> str | None:
                     print(f"[DEBUG] fetch_meta_version: HTTP {resp.status} from {META_URL}")
                 else:
                     text = await resp.text()
-                    # Try patterns like "Version 1.2.3" or "Version: 1.2.3"
-                    m = re.search(r"Version[:\s\-–—]*([^\n<]+)", text, re.IGNORECASE)
+                    m = _VERSION_NUMBER_RE.search(text)
                     if m:
-                        ver = m.group(1).strip()
-                        return _sanitize_version_text(ver, max_len=1000)
+                        return _sanitize_version_text(m.group(1), max_len=100)
+                    print(
+                        "[DEBUG] fetch_meta_version: no version-number-shaped match in the raw "
+                        "HTML (expected — the page is client-rendered) — falling back to Playwright."
+                    )
     except Exception as e:
         print(f"[DEBUG] aiohttp attempt failed: {e}")
 
@@ -2011,6 +2027,11 @@ async def fetch_meta_version() -> str | None:
             try:
                 version = await page.evaluate(
                     """() => {
+                        // Only accept an actual version-number shape (e.g. "1.85.2.3320")
+                        // right after the word "Version" — same strictness as the aiohttp
+                        // regex, so a stray "version" elsewhere on the page can't be
+                        // mistaken for the real one.
+                        const versionShape = /^[:\s\-\u2013\u2014]*([0-9]+(?:\.[0-9]+){1,4})/;
                         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
                         let node;
                         while (node = walker.nextNode()) {
@@ -2018,14 +2039,17 @@ async def fetch_meta_version() -> str | None:
                             if (!t) continue;
                             const idx = t.toLowerCase().indexOf('version');
                             if (idx !== -1) {
-                                const after = t.slice(idx + 'version'.length).replace(/^[:\s\-–—]+/, '').trim();
-                                if (after) return after;
+                                const after = t.slice(idx + 'version'.length);
+                                const match = after.match(versionShape);
+                                if (match) return match[1];
                             }
                         }
                         const divs = [...document.querySelectorAll('div, span, p')];
                         for (const el of divs) {
-                            if (el.innerText && el.innerText.trim().toLowerCase().startsWith('version')) {
-                                return el.innerText.replace(/^version[:\s]*/i, '').trim();
+                            const t = (el.innerText || '').trim();
+                            if (t.toLowerCase().startsWith('version')) {
+                                const match = t.slice('version'.length).match(versionShape);
+                                if (match) return match[1];
                             }
                         }
                         return null;
@@ -2033,7 +2057,7 @@ async def fetch_meta_version() -> str | None:
                 )
             finally:
                 await browser.close()
-            return _sanitize_version_text(version, max_len=1000)
+            return _sanitize_version_text(version, max_len=100)
     except Exception as e:
         print(f"[ERROR] Failed to fetch Meta version (Playwright): {e}")
         return None
