@@ -47,6 +47,9 @@ TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select 
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
 
+QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
+QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
+
 TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
@@ -3091,6 +3094,45 @@ async def sendtournament(interaction: discord.Interaction, teams: str):
 
 
 sendtournament.autocomplete("teams")(multi_team_autocomplete)
+
+
+# ---------- Question of the Day ----------
+@bot.tree.command(
+    name="qotd",
+    description="(Staff) Post a Question of the Day and open a discussion thread on it",
+)
+@app_commands.describe(question="The question to ask")
+async def qotd(interaction: discord.Interaction, question: app_commands.Range[str, 1, 200]):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    channel = interaction.guild.get_channel(QOTD_CHANNEL_ID) or await bot.fetch_channel(QOTD_CHANNEL_ID)
+
+    content = f"<@&{QOTD_PING_ROLE_ID}>\n\n**Question of the Day:**\n{question}"
+
+    try:
+        sent = await channel.send(content=content)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Couldn't post the question — check the bot's permissions in that channel.", ephemeral=True
+        )
+        return
+
+    thread_name = f"QOTD: {question}"[:100]  # Discord caps thread names at 100 characters
+    try:
+        await sent.create_thread(name=thread_name, reason=f"QOTD opened by {interaction.user}")
+    except discord.HTTPException:
+        await interaction.followup.send(
+            f"Posted in {channel.mention}, but couldn't open a thread on it — check the bot's "
+            f"permissions there (needs Create Public Threads).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(f"✅ Posted in {channel.mention} and opened a thread.", ephemeral=True)
 
 
 # ---------- Global slash-command error handler ----------
