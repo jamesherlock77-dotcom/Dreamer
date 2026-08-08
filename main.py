@@ -2218,10 +2218,10 @@ async def checkupdate(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="updateembed",
-    description="(Staff) Preview the update embed's current look — doesn't post or save anything",
+    description="(Staff) Preview the update embed's current look — doesn't save anything",
 )
 async def updateembed(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
 
     if not has_staff_role(interaction.user):
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
@@ -2244,9 +2244,9 @@ async def updateembed(interaction: discord.Interaction):
         embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
 
     if file is not None:
-        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+        await interaction.followup.send(embed=embed, file=file)
     else:
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
 
 # ---------- Slash commands ----------
