@@ -1510,6 +1510,62 @@ class ConfirmCleanupView(discord.ui.View):
         await interaction.followup.send("Cleanup cancelled — nothing was deleted.", ephemeral=True)
 
 
+# ---------- Confirmation view for /cleanup (solo, leader-only teams) ----------
+class ConfirmSoloTeamCleanupView(discord.ui.View):
+    def __init__(self, invoker_id: int, team_names: list, guild: discord.Guild):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.team_names = team_names
+        self.guild = guild
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete them", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+        deleted = []
+        skipped = []
+        db = load_db()
+        for team_name in self.team_names:
+            # Re-check membership against the latest data in case something changed
+            # (e.g. someone joined) between the confirmation prompt and this click.
+            info = db["teams"].get(team_name)
+            if info is None or len(info.get("members", [])) != 1 or info["members"][0] != info.get("leader_id"):
+                skipped.append(team_name)
+                continue
+            reason = f"Solo (leader-only) team cleanup by {interaction.user}"
+            ok = await perform_team_deletion(db, team_name, self.guild, reason=reason)
+            if ok:
+                deleted.append(team_name)
+            else:
+                skipped.append(team_name)
+
+        message = f"🧹 Cleanup complete — deleted {len(deleted)} solo team(s)."
+        if deleted:
+            message += "\n" + ", ".join(f"**{name}**" for name in deleted)
+        if skipped:
+            message += f"\n⚠️ Skipped {len(skipped)} (no longer solo, or already gone): " + ", ".join(skipped)
+        await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send("Cleanup cancelled — nothing was deleted.", ephemeral=True)
+
+
 # ---------- Admin confirmation view for /createteam ----------
 class ConfirmTeamView(discord.ui.View):
     def __init__(self, requester_id: int, team_name: str, emoji: str, colour: str, guild: discord.Guild):
@@ -2826,6 +2882,48 @@ async def bypassteamlimit(interaction: discord.Interaction, team: str, enabled: 
 
 
 bypassteamlimit.autocomplete("team")(team_name_autocomplete)
+
+
+@bot.tree.command(
+    name="cleanup",
+    description="(Staff) Delete teams that only have their leader and no other members",
+)
+async def cleanup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    solo_teams = [
+        team_name
+        for team_name, info in db["teams"].items()
+        if len(info.get("members", [])) == 1 and info["members"][0] == info.get("leader_id")
+    ]
+
+    if not solo_teams:
+        await interaction.followup.send(
+            "No teams found with only the leader on them — nothing to clean up.", ephemeral=True
+        )
+        return
+
+    preview_limit = 20
+    lines = []
+    for team_name in solo_teams[:preview_limit]:
+        info = db["teams"][team_name]
+        leader_id = info.get("leader_id")
+        lines.append(f"• **{team_name}** — leader <@{leader_id}>")
+    if len(solo_teams) > preview_limit:
+        lines.append(f"…and {len(solo_teams) - preview_limit} more")
+
+    view = ConfirmSoloTeamCleanupView(interaction.user.id, solo_teams, interaction.guild)
+    await interaction.followup.send(
+        f"Found **{len(solo_teams)}** team(s) with only the leader on them:\n" + "\n".join(lines) +
+        "\n\nDelete them (role, channel, and database entry)? This can't be undone.",
+        view=view,
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
