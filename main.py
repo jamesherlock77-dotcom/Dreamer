@@ -3325,7 +3325,7 @@ class MemberCountView(discord.ui.LayoutView):
         super().__init__(timeout=None)
         label = "member" if member_count == 1 else "members"
         text = discord.ui.TextDisplay(f"**{member_count:,}** {label}")
-        container = discord.ui.Container(text, accent_colour=discord.Colour.from_str("#2b1e18"))
+        container = discord.ui.Container(text)
         self.add_item(container)
 
 
