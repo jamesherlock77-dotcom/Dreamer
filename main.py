@@ -44,11 +44,9 @@ TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a t
 SUPPORT_TICKET_CHANNEL_ID = 1530456581903486996  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
 TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener) whenever a new ticket thread is opened
 TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
-MOD_ACTIONS_ROLE_ID = 1535819394129854474         # only audit-log actions by holders of this role are synced
-MOD_ACTIONS_LOG_CHANNEL_ID = 1535819132287717476  # /syncmodactions posts its JSON export here
-DYNO_BOT_ID = 155149108183695360           # Dyno#3861's user ID
-MOD_AUDIT_LOG_CHANNEL_ID = 1528155930439586015  # Dyno's own action-log channel, scanned by /syncmodactions
 TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can close any ticket, same as staff
+INVITE_TRACKER_CHANNEL_ID = 1528160701955313722   # channel where the Invite Tracker app posts join/leave messages
+INVITE_LOG_CHANNEL_ID = 1535819132287717476       # /syncinvites and the live listener keep an auto-updated JSON "database" message here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
@@ -63,6 +61,7 @@ TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team chann
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
+INVITES_DB_FILE = "invites_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +83,7 @@ META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update 
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
 intents.members = True  # needed to reliably resolve members / add roles
-intents.message_content = True  # needed to read Dyno's embeds when scanning MOD_AUDIT_LOG_CHANNEL_ID
+intents.message_content = True  # needed to read Invite Tracker's messages in INVITE_TRACKER_CHANNEL_ID
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -3122,224 +3121,272 @@ async def randomgiverole(
     await interaction.followup.send(result, ephemeral=True)
 
 
-async def scan_mod_audit_channel(channel: discord.abc.Messageable, role: discord.Role) -> list[dict]:
-    """Reads MOD_AUDIT_LOG_CHANNEL_ID's history and captures every embed Dyno has posted
-    there generically (title/description/fields/footer) — its exact log format isn't
-    something we can verify without a live instance, so nothing is hard-coded to specific
-    field names. Each entry is heuristically attributed to any role-holder whose ID or
-    mention appears anywhere in the embed text; this is a best-effort match, not a
-    guarantee, since we don't know for certain how Dyno identifies the moderator in these
-    log embeds. Entries are still included even with no match, so nothing is silently
-    dropped — matched_moderator_ids will just be an empty list for those."""
-    role_member_ids = {member.id: str(member) for member in role.members}
-    entries = []
+# ---------- Invite tracking (built from the Invite Tracker app's messages) ----------
+# We don't call Discord's native invite API directly — instead we read the plain-text
+# join/leave messages the Invite Tracker app already posts in INVITE_TRACKER_CHANNEL_ID
+# and turn those into a JSON "database" of who invited whom, backed up the same way
+# teams/giveaways/tickets are (an auto-updated message in INVITE_LOG_CHANNEL_ID).
+#
+# Known message shapes we parse (Invite Tracker's exact wording, matched literally):
+#   "{user} joined using a vanity invite."
+#   "{user} left the server. They joined using the vanity invite."
+#   "{user} left the server, they were invited by {inviter}."
+#   "{user} has been invited by {inviter} and has now {count} invites."
+_INVITE_JOIN_INVITED_RE = re.compile(
+    r"^(?P<user>.+?) has been invited by (?P<inviter>.+?) and has now (?P<count>\d+) invites?\.?\s*$"
+)
+_INVITE_LEFT_INVITED_RE = re.compile(
+    r"^(?P<user>.+?) left the server, they were invited by (?P<inviter>.+?)\.?\s*$"
+)
+_INVITE_LEFT_VANITY_RE = re.compile(
+    r"^(?P<user>.+?) left the server\.\s*They joined using the vanity invite\.?\s*$"
+)
+_INVITE_JOIN_VANITY_RE = re.compile(r"^(?P<user>.+?) joined using a vanity invite\.?\s*$")
+_MENTION_ID_RE = re.compile(r"<@!?(\d+)>")
 
-    async for message in channel.history(limit=None, oldest_first=True):
-        if message.author.id != DYNO_BOT_ID or not message.embeds:
-            continue
 
-        for embed in message.embeds:
-            text_parts = []
-            if embed.title:
-                text_parts.append(embed.title)
-            if embed.description:
-                text_parts.append(embed.description)
-            if embed.footer and embed.footer.text:
-                text_parts.append(embed.footer.text)
-            for field in embed.fields:
-                text_parts.append(field.name or "")
-                text_parts.append(field.value or "")
-            blob = "\n".join(text_parts)
+def _extract_mention_id(text: str) -> int | None:
+    m = _MENTION_ID_RE.search(text)
+    return int(m.group(1)) if m else None
 
-            matched_ids = [
-                mid
-                for mid in role_member_ids
-                if f"<@{mid}>" in blob or f"<@!{mid}>" in blob or str(mid) in blob
-            ]
 
-            entries.append(
-                {
-                    "message_id": message.id,
-                    "timestamp": message.created_at.isoformat(),
-                    "title": embed.title,
-                    "description": embed.description,
-                    "fields": [
-                        {"name": f.name, "value": f.value, "inline": f.inline} for f in embed.fields
-                    ],
-                    "footer": embed.footer.text if embed.footer else None,
-                    "matched_moderator_ids": matched_ids,
-                    "matched_moderator_names": [role_member_ids[mid] for mid in matched_ids],
-                }
-            )
+def _clean_invite_name(text: str) -> str:
+    stripped = _MENTION_ID_RE.sub("", text).strip()
+    return stripped or text.strip()
 
-    return entries
+
+def parse_invite_tracker_line(line: str) -> dict | None:
+    """Matches a single line of Invite Tracker text against the known message shapes.
+    Returns a small event dict, or None if the line doesn't match anything we recognise
+    (e.g. an unrelated message that happens to land in the same channel)."""
+    line = line.strip()
+    if not line:
+        return None
+
+    m = _INVITE_JOIN_INVITED_RE.match(line)
+    if m:
+        return {
+            "kind": "join",
+            "method": "invite",
+            "user_raw": m.group("user"),
+            "inviter_raw": m.group("inviter"),
+            "invite_count": int(m.group("count")),
+        }
+
+    m = _INVITE_LEFT_INVITED_RE.match(line)
+    if m:
+        return {"kind": "left", "method": "invite", "user_raw": m.group("user"), "inviter_raw": m.group("inviter")}
+
+    m = _INVITE_LEFT_VANITY_RE.match(line)
+    if m:
+        return {"kind": "left", "method": "vanity", "user_raw": m.group("user"), "inviter_raw": None}
+
+    m = _INVITE_JOIN_VANITY_RE.match(line)
+    if m:
+        return {"kind": "join", "method": "vanity", "user_raw": m.group("user"), "inviter_raw": None}
+
+    return None
+
+
+def _resolve_member_id_by_name(guild: discord.Guild | None, name_text: str) -> int | None:
+    """Best-effort lookup — Invite Tracker names the joining/leaving user as plain text
+    (not a mention) in most message shapes, so this is the only way to attach a real user
+    ID for those. Relies on the member cache (intents.members is enabled), and can miss or
+    mismatch if someone's changed their name/nickname since the message was posted."""
+    if guild is None or not name_text:
+        return None
+    name_clean = name_text.strip()
+    member = discord.utils.find(
+        lambda m: name_clean in (m.display_name, m.name, str(m)),
+        guild.members,
+    )
+    return member.id if member else None
+
+
+def _invite_record_key(user_id: int | None, name_text: str) -> str:
+    if user_id is not None:
+        return str(user_id)
+    return f"name:{name_text.strip().lower()}"
+
+
+def apply_invite_event(
+    db: dict, event: dict, timestamp: str, message_id: int, guild: discord.Guild | None
+) -> None:
+    """Folds one parsed event into db["invited_users"], keyed by user ID when we can
+    resolve one, falling back to a lowercased-name key otherwise."""
+    invited_users = db.setdefault("invited_users", {})
+
+    user_mention_id = _extract_mention_id(event["user_raw"])
+    user_name = _clean_invite_name(event["user_raw"])
+    user_id = user_mention_id or _resolve_member_id_by_name(guild, user_name)
+
+    inviter_name = "vanity"
+    inviter_id = None
+    if event.get("inviter_raw"):
+        inviter_name = _clean_invite_name(event["inviter_raw"])
+        inviter_id = _extract_mention_id(event["inviter_raw"]) or _resolve_member_id_by_name(guild, inviter_name)
+
+    key = _invite_record_key(user_id, user_name)
+    record = invited_users.get(key, {})
+    record["user_name"] = user_name
+    if user_id is not None:
+        record["user_id"] = user_id
+    else:
+        record.setdefault("user_id", None)
+
+    if event["kind"] == "join":
+        record["inviter_name"] = inviter_name
+        record["inviter_id"] = inviter_id
+        record["method"] = event["method"]
+        record["joined_at"] = timestamp
+        record["joined_message_id"] = message_id
+        record["still_in_server"] = True
+        if event["method"] == "invite" and "invite_count" in event:
+            record["inviter_invite_count"] = event["invite_count"]
+    else:  # left
+        # A leave message is a weaker signal than a join message for who the inviter was —
+        # only fill it in if we don't already have it from an earlier join event.
+        record.setdefault("inviter_name", inviter_name)
+        record.setdefault("inviter_id", inviter_id)
+        record.setdefault("method", event["method"])
+        record["left_at"] = timestamp
+        record["left_message_id"] = message_id
+        record["still_in_server"] = False
+
+    invited_users[key] = record
+
+
+def load_invite_db() -> dict:
+    if not os.path.exists(INVITES_DB_FILE):
+        return {"invited_users": {}, "last_processed_message_id": None}
+    with open(INVITES_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("invited_users", {})
+    data.setdefault("last_processed_message_id", None)
+    return data
+
+
+def save_invite_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(INVITES_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_invite_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(INVITE_LOG_CHANNEL_ID, INVITES_DB_FILE, INVITES_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up invite db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill anything else
+        print(f"Unexpected error backing up invite db: {e}")
+
+
+async def restore_invite_db_from_log_channel():
+    if os.path.exists(INVITES_DB_FILE):
+        # Local data already present (e.g. a crash-restart, not a fresh container) — push
+        # it straight to the log channel so the backup there is confirmed up to date.
+        await backup_invite_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(INVITE_LOG_CHANNEL_ID, INVITES_DB_FILE, INVITES_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore invite db from log channel: {e}")
+        found = False
+    if found:
+        print("Restored invite db from log channel backup.")
+    else:
+        print("No existing invite db backup found — starting fresh.")
+
+
+async def _process_invite_tracker_message(message: discord.Message) -> None:
+    """Called live for every new message posted in INVITE_TRACKER_CHANNEL_ID — this is
+    what keeps the database updating in real time as people join/leave, without needing
+    a manual /syncinvites re-scan."""
+    events = [e for e in (parse_invite_tracker_line(line) for line in message.content.split("\n")) if e]
+    if not events:
+        return
+
+    db = load_invite_db()
+    timestamp = message.created_at.isoformat()
+    for event in events:
+        apply_invite_event(db, event, timestamp, message.id, message.guild)
+    db["last_processed_message_id"] = message.id
+    save_invite_db(db)
+    await backup_invite_db_to_log_channel()
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.channel.id == INVITE_TRACKER_CHANNEL_ID and message.author.bot:
+        try:
+            await _process_invite_tracker_message(message)
+        except discord.HTTPException as e:
+            print(f"Failed to process an invite tracker message: {e}")
+    await bot.process_commands(message)
 
 
 @bot.tree.command(
-    name="syncmodactions",
-    description="(Staff) Export mod-role holders' actions (audit log + log channel) to JSON",
+    name="syncinvites",
+    description="(Staff) Rebuild the invite database by rescanning the Invite Tracker channel's history",
 )
-async def syncmodactions(interaction: discord.Interaction):
+async def syncinvites(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     if not has_staff_role(interaction.user):
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
-    role = interaction.guild.get_role(MOD_ACTIONS_ROLE_ID)
-    if role is None:
-        await interaction.followup.send(
-            "Couldn't find the moderator role to filter by — check MOD_ACTIONS_ROLE_ID.", ephemeral=True
-        )
-        return
-
-    log_channel = interaction.guild.get_channel(MOD_ACTIONS_LOG_CHANNEL_ID) or bot.get_channel(
-        MOD_ACTIONS_LOG_CHANNEL_ID
+    channel = interaction.guild.get_channel(INVITE_TRACKER_CHANNEL_ID) or bot.get_channel(
+        INVITE_TRACKER_CHANNEL_ID
     )
-    if log_channel is None:
+    if channel is None:
         try:
-            log_channel = await bot.fetch_channel(MOD_ACTIONS_LOG_CHANNEL_ID)
+            channel = await bot.fetch_channel(INVITE_TRACKER_CHANNEL_ID)
         except discord.HTTPException:
             await interaction.followup.send(
-                "Couldn't find the output channel — check MOD_ACTIONS_LOG_CHANNEL_ID.", ephemeral=True
+                "Couldn't find the invite tracker channel — check INVITE_TRACKER_CHANNEL_ID.", ephemeral=True
             )
             return
 
-    # NOTE: this can only see bans, kicks, and timeouts (Discord's own native mutes) —
-    # these are the only moderation actions Discord's audit log records. Warns can't be
-    # included: Dyno stores warning data only in its own private database, and Dyno (like
-    # virtually every moderation bot) ignores command messages sent by other bots as an
-    # anti-abuse/anti-loop measure, so there's no way for this bot to trigger or read
-    # Dyno's own reports either. Warn data simply isn't reachable from our side at all.
-    _member_role_cache: dict = {}
+    db = {"invited_users": {}, "last_processed_message_id": None}
+    processed_messages = 0
+    matched_events = 0
+    last_message_id = None
 
-    async def _executor_has_role(user) -> bool:
-        if user is None:
-            return False
-        if user.id in _member_role_cache:
-            return _member_role_cache[user.id]
-        member = interaction.guild.get_member(user.id)
-        if member is None:
-            try:
-                member = await interaction.guild.fetch_member(user.id)
-            except discord.HTTPException:
-                member = None
-        result = member is not None and role in member.roles
-        _member_role_cache[user.id] = result
-        return result
-
-    actions = []
     try:
-        async for entry in interaction.guild.audit_logs(limit=None):
-            if entry.action not in (
-                discord.AuditLogAction.ban,
-                discord.AuditLogAction.kick,
-                discord.AuditLogAction.member_update,
-            ):
+        async for message in channel.history(limit=None, oldest_first=True):
+            if not message.author.bot:
                 continue
-
-            if entry.action == discord.AuditLogAction.member_update:
-                # member_update covers a lot of unrelated changes (nickname, roles, etc.)
-                # — only keep entries where a timeout was actually applied (before/after
-                # timed_out_until differ and after is set), i.e. an actual mute.
-                before_timeout = getattr(entry.before, "timed_out_until", None)
-                after_timeout = getattr(entry.after, "timed_out_until", None)
-                if after_timeout is None or before_timeout == after_timeout:
-                    continue
-                action_type = "mute"
-            elif entry.action == discord.AuditLogAction.ban:
-                action_type = "ban"
-            else:
-                action_type = "kick"
-
-            if not await _executor_has_role(entry.user):
-                continue
-
-            actions.append(
-                {
-                    "action": action_type,
-                    "moderator_id": entry.user.id if entry.user else None,
-                    "moderator_name": str(entry.user) if entry.user else None,
-                    "target_id": entry.target.id if entry.target else None,
-                    "target_name": str(entry.target) if entry.target else None,
-                    "reason": entry.reason,
-                    "timestamp": entry.created_at.isoformat(),
-                }
-            )
+            timestamp = message.created_at.isoformat()
+            found_any = False
+            for line in message.content.split("\n"):
+                parsed = parse_invite_tracker_line(line)
+                if parsed:
+                    apply_invite_event(db, parsed, timestamp, message.id, interaction.guild)
+                    matched_events += 1
+                    found_any = True
+            if found_any:
+                processed_messages += 1
+            last_message_id = message.id
     except discord.Forbidden:
         await interaction.followup.send(
-            "I don't have permission to view this server's audit log — grant me the "
-            "**View Audit Log** permission and try again.",
-            ephemeral=True,
+            "I don't have permission to read that channel's history.", ephemeral=True
         )
         return
     except discord.HTTPException as e:
-        await interaction.followup.send(f"Couldn't read the audit log: {e}", ephemeral=True)
+        await interaction.followup.send(f"Couldn't read the invite tracker channel: {e}", ephemeral=True)
         return
 
-    # Also scan Dyno's own action-log channel — this can surface entries (like mutes done
-    # via a Muted role instead of a native timeout) that Discord's audit log alone might
-    # miss, though attribution here is a best-effort text match, not a guarantee.
-    audit_channel = interaction.guild.get_channel(MOD_AUDIT_LOG_CHANNEL_ID) or bot.get_channel(
-        MOD_AUDIT_LOG_CHANNEL_ID
+    db["last_processed_message_id"] = last_message_id
+    save_invite_db(db)
+    await backup_invite_db_to_log_channel()
+
+    await interaction.followup.send(
+        f"✅ Rebuilt the invite database from {channel.mention} — matched {matched_events} join/leave "
+        f"event(s) across {processed_messages} message(s), now tracking {len(db['invited_users'])} "
+        f"invited member(s). Backed up to <#{INVITE_LOG_CHANNEL_ID}>.",
+        ephemeral=True,
     )
-    if audit_channel is None:
-        try:
-            audit_channel = await bot.fetch_channel(MOD_AUDIT_LOG_CHANNEL_ID)
-        except discord.HTTPException:
-            audit_channel = None
-
-    channel_log_entries = []
-    channel_scan_error = None
-    if audit_channel is None:
-        channel_scan_error = "couldn't find MOD_AUDIT_LOG_CHANNEL_ID — channel scan skipped entirely"
-    else:
-        try:
-            channel_log_entries = await scan_mod_audit_channel(audit_channel, role)
-        except discord.Forbidden:
-            channel_scan_error = "missing permission to read that channel's history"
-        except discord.HTTPException as e:
-            channel_scan_error = f"failed while reading channel history: {e}"
-
-    matched_channel_entries = sum(1 for e in channel_log_entries if e["matched_moderator_ids"])
-
-    now = discord.utils.utcnow()
-    payload = {
-        "role_filter_id": MOD_ACTIONS_ROLE_ID,
-        "synced_at": now.isoformat(),
-        "synced_by": interaction.user.id,
-        "action_count": len(actions),
-        "actions": actions,
-        "channel_log_entry_count": len(channel_log_entries),
-        "channel_log_entries": channel_log_entries,
-        "channel_scan_error": channel_scan_error,
-    }
-
-    filename = f"mod_actions_{int(now.timestamp())}.json"
-    file_bytes = json.dumps(payload, indent=2).encode("utf-8")
-
-    try:
-        await log_channel.send(
-            content=f"🗂️ Mod action sync — {len(actions)} audit-log action(s) (bans/kicks/mutes) "
-            f"+ {len(channel_log_entries)} entr(y/ies) from the audit-log channel "
-            f"({matched_channel_entries} matched to a mod-role holder). Warns still aren't "
-            f"included — see note in the file.",
-            file=discord.File(io.BytesIO(file_bytes), filename=filename),
-        )
-    except discord.HTTPException as e:
-        await interaction.followup.send(f"Found {len(actions)} action(s), but couldn't post the file: {e}", ephemeral=True)
-        return
-
-    result_msg = (
-        f"✅ Synced {len(actions)} audit-log action(s) + {len(channel_log_entries)} channel-log "
-        f"entr(y/ies) ({matched_channel_entries} matched to a mod-role holder) to {log_channel.mention}.\n"
-        f"⚠️ Warns still aren't included — Dyno stores those in its own private database, "
-        f"which isn't accessible to any other bot (Dyno included) or through Discord's API."
-    )
-    if channel_scan_error:
-        result_msg += f"\n⚠️ Channel scan issue: {channel_scan_error}"
-
-    await interaction.followup.send(result_msg, ephemeral=True)
 
 
 
@@ -4118,6 +4165,7 @@ async def on_ready():
     await restore_db_from_log_channel()
     await restore_ticket_db_from_log_channel()
     await restore_meta_version_from_log_channel()
+    await restore_invite_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
     bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
