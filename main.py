@@ -3371,7 +3371,10 @@ async def on_message(message: discord.Message):
             pass
         try:
             png_bytes = await generate_member_count_image(message.guild.member_count)
-            await message.channel.send(file=discord.File(io.BytesIO(png_bytes), filename="membercount.png"))
+            file = discord.File(io.BytesIO(png_bytes), filename="membercount.png")
+            embed = discord.Embed(colour=discord.Colour.from_str("#2b1e18"))
+            embed.set_image(url="attachment://membercount.png")
+            await message.channel.send(embed=embed, file=file)
         except Exception as e:  # noqa: BLE001 - don't let a rendering hiccup go unlogged
             print(f"Failed to generate/send member count image: {e}")
         return
