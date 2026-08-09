@@ -46,6 +46,11 @@ TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener)
 TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
 MOD_ACTIONS_ROLE_ID = 1535819394129854474         # only audit-log actions by holders of this role are synced
 MOD_ACTIONS_LOG_CHANNEL_ID = 1535819132287717476  # /syncmodactions posts its JSON export here
+DYNO_BOT_ID = 155149108183695360    # Dyno#3861's user ID — used to identify its replies
+DYNO_PREFIX = "?"                   # this server's Dyno prefix
+DYNO_MODSTATS_CHANNEL_ID = 1528007337699311743  # channel /syncmodactions runs "?modstats" in
+DYNO_MODSTATS_TIMEOUT_SECONDS = 15  # how long to wait for Dyno's reply before giving up on a mod
+DYNO_MODSTATS_DELAY_SECONDS = 2     # courtesy delay between each mod's ?modstats request
 TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can close any ticket, same as staff
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
@@ -82,6 +87,7 @@ META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update 
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
 intents.members = True  # needed to reliably resolve members / add roles
+intents.message_content = True  # needed to read Dyno's ?modstats reply embeds (/syncmodactions)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -2842,9 +2848,45 @@ async def randomgiverole(
     await interaction.followup.send(result, ephemeral=True)
 
 
+async def fetch_dyno_modstats(channel: discord.abc.Messageable, member: discord.Member) -> dict:
+    """Sends '?modstats @member' in `channel` and waits for Dyno's reply, parsing whatever
+    embed it sends back generically (title/description/every field) rather than assuming
+    specific field names, since Dyno's exact modstats layout isn't something we can verify
+    ahead of time. Dyno aggregates a mod's own warns/bans/kicks/mutes internally, so this
+    is the only way to include warn counts at all — Discord's audit log never sees them.
+    Returns a dict describing the result; on timeout, {"error": "no response ..."}."""
+    try:
+        sent = await channel.send(f"{DYNO_PREFIX}modstats <@{member.id}>")
+    except discord.HTTPException as e:
+        return {"error": f"couldn't send the modstats command: {e}"}
+
+    def check(message: discord.Message) -> bool:
+        return (
+            message.channel.id == channel.id
+            and message.author.id == DYNO_BOT_ID
+            and message.created_at >= sent.created_at
+            and bool(message.embeds)
+        )
+
+    try:
+        reply = await bot.wait_for("message", check=check, timeout=DYNO_MODSTATS_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return {"error": f"no response from Dyno within {DYNO_MODSTATS_TIMEOUT_SECONDS}s"}
+
+    embed = reply.embeds[0]
+    return {
+        "title": embed.title,
+        "description": embed.description,
+        "fields": [
+            {"name": field.name, "value": field.value, "inline": field.inline}
+            for field in embed.fields
+        ],
+    }
+
+
 @bot.tree.command(
     name="syncmodactions",
-    description="(Staff) Export ban/kick/mute actions by role-holders to a JSON file",
+    description="(Staff) Export mod-role holders' bans/kicks/mutes + Dyno modstats to JSON",
 )
 async def syncmodactions(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -2872,11 +2914,11 @@ async def syncmodactions(interaction: discord.Interaction):
             )
             return
 
-    # NOTE: this can only see bans, kicks, and timeouts (Discord's own native mutes) —
-    # these are the only moderation actions Discord's audit log records. Warns are not
-    # included: Dyno stores warning data in its own private database (viewable only via
-    # Dyno's own dashboard/commands), never in Discord's audit log or API, so no other
-    # bot — including this one — has any way to read that data.
+    # NOTE: Discord's own audit log only records bans, kicks, and timeouts (native mutes)
+    # — it never sees warns, since Dyno stores those in its own private database with no
+    # audit-log or API exposure. That's why this scan is combined below with each mod's
+    # own "?modstats" report (fetch_dyno_modstats), which Dyno aggregates internally and
+    # does include warns — that's the only way to get warn data into this export at all.
     _member_role_cache: dict = {}
 
     async def _executor_has_role(user) -> bool:
@@ -2943,6 +2985,27 @@ async def syncmodactions(interaction: discord.Interaction):
         await interaction.followup.send(f"Couldn't read the audit log: {e}", ephemeral=True)
         return
 
+    # Pull each role-holder's own Dyno ?modstats report too — this is the only way to
+    # include warn counts, since Dyno never writes those to Discord's audit log.
+    modstats_channel = interaction.guild.get_channel(DYNO_MODSTATS_CHANNEL_ID) or bot.get_channel(
+        DYNO_MODSTATS_CHANNEL_ID
+    )
+    if modstats_channel is None:
+        try:
+            modstats_channel = await bot.fetch_channel(DYNO_MODSTATS_CHANNEL_ID)
+        except discord.HTTPException:
+            modstats_channel = None
+
+    dyno_modstats = {}
+    if modstats_channel is None:
+        dyno_modstats["_error"] = "couldn't find DYNO_MODSTATS_CHANNEL_ID — modstats step skipped entirely"
+    else:
+        mod_members = [m for m in role.members if not m.bot]
+        for member in mod_members:
+            result = await fetch_dyno_modstats(modstats_channel, member)
+            dyno_modstats[str(member.id)] = {"name": str(member), **result}
+            await asyncio.sleep(DYNO_MODSTATS_DELAY_SECONDS)
+
     now = discord.utils.utcnow()
     payload = {
         "role_filter_id": MOD_ACTIONS_ROLE_ID,
@@ -2950,15 +3013,21 @@ async def syncmodactions(interaction: discord.Interaction):
         "synced_by": interaction.user.id,
         "action_count": len(actions),
         "actions": actions,
+        "dyno_modstats": dyno_modstats,
     }
 
     filename = f"mod_actions_{int(now.timestamp())}.json"
     file_bytes = json.dumps(payload, indent=2).encode("utf-8")
 
+    modstats_ok = sum(1 for v in dyno_modstats.values() if isinstance(v, dict) and "error" not in v)
+    modstats_failed = len(dyno_modstats) - modstats_ok
+
     try:
         await log_channel.send(
-            content=f"🗂️ Mod action sync — {len(actions)} action(s) found (bans/kicks/mutes only; "
-            f"warns aren't included, see note in the file).",
+            content=f"🗂️ Mod action sync — {len(actions)} audit-log action(s) (bans/kicks/mutes) "
+            f"+ Dyno modstats for {modstats_ok} mod(s)"
+            + (f" ({modstats_failed} failed/timed out)" if modstats_failed else "")
+            + ".",
             file=discord.File(io.BytesIO(file_bytes), filename=filename),
         )
     except discord.HTTPException as e:
@@ -2966,9 +3035,14 @@ async def syncmodactions(interaction: discord.Interaction):
         return
 
     await interaction.followup.send(
-        f"✅ Synced {len(actions)} action(s) (bans/kicks/mutes) to {log_channel.mention}.\n"
-        f"⚠️ Warns aren't included — Dyno stores those in its own private database, which "
-        f"isn't accessible to any other bot or through Discord's API.",
+        f"✅ Synced {len(actions)} audit-log action(s) (bans/kicks/mutes) + Dyno modstats "
+        f"for {modstats_ok}/{len(dyno_modstats)} mod(s) to {log_channel.mention}."
+        + (
+            f"\n⚠️ {modstats_failed} mod(s)' modstats failed or timed out — check the JSON "
+            f"file for details on which ones."
+            if modstats_failed
+            else ""
+        ),
         ephemeral=True,
     )
 
