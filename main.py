@@ -3315,8 +3315,67 @@ async def _process_invite_tracker_message(message: discord.Message) -> None:
     await backup_invite_db_to_log_channel()
 
 
+async def generate_member_count_image(member_count: int) -> bytes:
+    """Renders a small rounded 'N members' card (matching Discord's own member-count
+    widget style) to a transparent PNG via a headless Playwright/Chromium page — reused
+    from the same browser already used for Meta version scraping, so no extra font/image
+    dependencies are needed on top of what's already installed."""
+    text_number = f"{member_count:,}"
+    label = "member" if member_count == 1 else "members"
+    html = f"""
+    <html>
+    <head>
+    <style>
+      html, body {{ margin: 0; padding: 0; background: transparent; }}
+      .card {{
+        display: inline-flex;
+        align-items: baseline;
+        gap: 6px;
+        padding: 18px 28px;
+        border-radius: 999px;
+        background: #2b1e18;
+        font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+        white-space: nowrap;
+      }}
+      .count {{ color: #ffffff; font-size: 34px; font-weight: 700; }}
+      .label {{ color: #cbb9ae; font-size: 22px; font-weight: 500; }}
+    </style>
+    </head>
+    <body>
+      <div class="card"><span class="count">{text_number}</span><span class="label">{label}</span></div>
+    </body>
+    </html>
+    """
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page = await browser.new_page(viewport={"width": 800, "height": 200})
+        await page.set_content(html)
+        card = page.locator(".card")
+        png_bytes = await card.screenshot(omit_background=True)
+        await browser.close()
+
+    return png_bytes
+
+
 @bot.event
 async def on_message(message: discord.Message):
+    if (
+        message.guild is not None
+        and not message.author.bot
+        and message.content.strip().lower() == ".membercount"
+    ):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        try:
+            png_bytes = await generate_member_count_image(message.guild.member_count)
+            await message.channel.send(file=discord.File(io.BytesIO(png_bytes), filename="membercount.png"))
+        except Exception as e:  # noqa: BLE001 - don't let a rendering hiccup go unlogged
+            print(f"Failed to generate/send member count image: {e}")
+        return
+
     if message.channel.id == INVITE_TRACKER_CHANNEL_ID and message.author.bot:
         try:
             await _process_invite_tracker_message(message)
