@@ -2496,7 +2496,7 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
 class TeamMembersView(discord.ui.LayoutView):
     """A Components V2 container listing a team's members, styled to match
     MetaUpdateView/MemberCountView elsewhere in the bot — accent-bordered card
-    instead of a plain embed, coloured to match the team's role."""
+    instead of a plain embed."""
 
     def __init__(self, key: str, info: dict, role: discord.Role):
         super().__init__(timeout=None)
@@ -2513,7 +2513,7 @@ class TeamMembersView(discord.ui.LayoutView):
             discord.ui.TextDisplay("\n".join(lines) if lines else "No members with this role yet."),
         ]
 
-        container = discord.ui.Container(*children, accent_colour=role.colour)
+        container = discord.ui.Container(*children)
         self.add_item(container)
 
 
