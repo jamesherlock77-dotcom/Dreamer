@@ -129,6 +129,11 @@ _db_message_cache: dict = {}
 # so the same user can't queue up multiple pending requests.
 pending_team_requests: set = set()
 
+# Leader user ID -> {"team": ..., "invited_user_id": ..., "dm_channel_id": ..., "dm_message_id": ...}
+# for whichever invite (if any) that leader currently has outstanding. Used to stop a
+# leader from having more than one invite pending at the same time.
+pending_invites: dict = {}
+
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
     if channel_id in _db_message_cache:
@@ -1663,19 +1668,89 @@ class ConfirmTeamView(discord.ui.View):
         await interaction.followup.send("Team creation denied.", ephemeral=True)
 
 
+# ---------- Cancel-pending-invite helper + view ----------
+async def _cancel_pending_invite(leader_id: int, note: str = "This invite was cancelled.") -> dict | None:
+    """Clears leader_id's pending-invite record (if any) and, if the DM message can still
+    be reached, edits it to `note` and strips the Yes/No buttons so the invited user can no
+    longer act on it. Returns the popped pending-invite record, or None if there wasn't one."""
+    pending = pending_invites.pop(leader_id, None)
+    if pending is None:
+        return None
+
+    try:
+        dm_channel = bot.get_channel(pending["dm_channel_id"])
+        if dm_channel is None:
+            dm_channel = await bot.fetch_channel(pending["dm_channel_id"])
+        message = await dm_channel.fetch_message(pending["dm_message_id"])
+        await message.edit(content=note, view=None)
+    except discord.HTTPException:
+        pass  # DM/message may already be gone — the record is still cleared either way
+
+    return pending
+
+
+class CancelInviteView(discord.ui.View):
+    """Shown ephemerally to a team leader who already has an invite pending, with a single
+    red button that cancels it so they're free to send a new one."""
+
+    def __init__(self, leader_id: int):
+        super().__init__(timeout=120)
+        self.leader_id = leader_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel Invite", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        pending = await _cancel_pending_invite(
+            self.leader_id, note="This invite was cancelled by the team leader."
+        )
+        for child in self.children:
+            child.disabled = True
+
+        if pending is None:
+            await safe_edit_original_response(
+                interaction,
+                content="That invite is no longer pending — you're free to send a new one.",
+                view=self,
+            )
+            return
+
+        await safe_edit_original_response(
+            interaction,
+            content=f"✅ Cancelled the pending invite to <@{pending['invited_user_id']}>. "
+            f"You can now invite someone else.",
+            view=self,
+        )
+
+
 # ---------- Invite response view (DM'd to the invited user) ----------
 class InviteResponseView(discord.ui.View):
-    def __init__(self, team_name: str, invited_user_id: int, guild_id: int):
+    def __init__(self, team_name: str, invited_user_id: int, guild_id: int, inviter_id: int):
         super().__init__(timeout=86400)  # 24h to respond
         self.team_name = team_name
         self.invited_user_id = invited_user_id
         self.guild_id = guild_id
+        self.inviter_id = inviter_id
+        self.message: discord.Message = None  # set by the caller after sending
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invited_user_id:
             await interaction.response.send_message("This invite isn't for you.", ephemeral=True)
             return False
         return True
+
+    def _clear_pending(self):
+        # Only clear the leader's pending-invite slot if it's still tracking *this* invite —
+        # avoids wiping out a newer invite the leader may have sent after this one resolved.
+        pending = pending_invites.get(self.inviter_id)
+        if pending and pending.get("invited_user_id") == self.invited_user_id and pending.get("team") == self.team_name:
+            pending_invites.pop(self.inviter_id, None)
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1684,6 +1759,7 @@ class InviteResponseView(discord.ui.View):
         db = load_db()
         info = db["teams"].get(self.team_name)
         if info is None:
+            self._clear_pending()
             for child in self.children:
                 child.disabled = True
             await safe_edit_original_response(interaction, content="This team no longer exists.", view=self)
@@ -1694,6 +1770,7 @@ class InviteResponseView(discord.ui.View):
             and not info.get("bypass_member_limit", False)
             and len(info.get("members", [])) >= MAX_TEAM_MEMBERS
         ):
+            self._clear_pending()
             for child in self.children:
                 child.disabled = True
             await safe_edit_original_response(
@@ -1716,6 +1793,8 @@ class InviteResponseView(discord.ui.View):
         save_db(db)
         await backup_db_to_log_channel()
 
+        self._clear_pending()
+
         channel = guild.get_channel(info["channel_id"])
         if channel:
             await channel.send(f"🎉 {member.mention} just joined the team!")
@@ -1726,9 +1805,22 @@ class InviteResponseView(discord.ui.View):
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._clear_pending()
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="Invite declined.", view=self)
+
+    async def on_timeout(self):
+        # The invited user never responded within 24h — free up the leader's pending slot
+        # and disable the stale buttons, same as an explicit decline.
+        self._clear_pending()
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
 # ============================================================
@@ -2385,6 +2477,16 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
         await interaction.followup.send("You must be a team leader to invite people.", ephemeral=True)
         return
 
+    # Only one outstanding invite per leader at a time — if they already have one pending,
+    # give them a way to cancel it instead of letting them queue up another.
+    if interaction.user.id in pending_invites:
+        await interaction.followup.send(
+            "You already have a pending invite. Click the red button below to cancel.",
+            view=CancelInviteView(interaction.user.id),
+            ephemeral=True,
+        )
+        return
+
     if user.bot:
         await interaction.followup.send("You can't invite bots.", ephemeral=True)
         return
@@ -2402,9 +2504,9 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
         )
         return
 
-    view = InviteResponseView(team_key, user.id, interaction.guild.id)
+    view = InviteResponseView(team_key, user.id, interaction.guild.id, interaction.user.id)
     try:
-        await user.send(
+        sent = await user.send(
             f"{interaction.user.mention} invited you to join **{team_key}** {info['emoji']}! "
             f"Would you like to join?",
             view=view,
@@ -2414,6 +2516,14 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
             "Couldn't DM that user (they may have DMs off).", ephemeral=True
         )
         return
+
+    view.message = sent
+    pending_invites[interaction.user.id] = {
+        "team": team_key,
+        "invited_user_id": user.id,
+        "dm_channel_id": sent.channel.id,
+        "dm_message_id": sent.id,
+    }
 
     await interaction.followup.send(f"Invite sent to {user.mention}.", ephemeral=True)
 
@@ -2776,6 +2886,75 @@ async def cleanuporphanteams(interaction: discord.Interaction):
         f"Found **{len(orphans)}** channel(s) across both team categories with no matching "
         f"database entry:\n" + "\n".join(lines) + "\n\nDelete them (and their linked roles)? This can't be undone.",
         view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="syncteammembers",
+    description="(Staff) Remove database members from a team if they no longer hold that team's role",
+)
+async def syncteammembers(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    if not db["teams"]:
+        await interaction.followup.send("There are no teams to sync.", ephemeral=True)
+        return
+
+    report_lines = []
+    total_removed = 0
+    changed = False
+
+    for team_name, info in db["teams"].items():
+        role = interaction.guild.get_role(info.get("role_id"))
+        if role is None:
+            report_lines.append(f"⚠️ **{team_name}**: role no longer exists — skipped")
+            continue
+
+        # role.members reflects who actually currently holds the role right now (relies on
+        # the member cache, which the members intent keeps populated).
+        current_role_member_ids = {member.id for member in role.members}
+        members_list = info.get("members", [])
+        to_remove = [uid for uid in members_list if uid not in current_role_member_ids]
+
+        if not to_remove:
+            continue
+
+        info["members"] = [uid for uid in members_list if uid in current_role_member_ids]
+        for uid in to_remove:
+            clear_team_join(info, uid)
+
+        changed = True
+        total_removed += len(to_remove)
+        mentions = ", ".join(f"<@{uid}>" for uid in to_remove)
+        leader_note = ""
+        if info.get("leader_id") in to_remove:
+            leader_note = " ⚠️ **includes the team leader** — you may want to check this team"
+        report_lines.append(f"**{team_name}**: removed {len(to_remove)} — {mentions}{leader_note}")
+
+    if not changed:
+        await interaction.followup.send(
+            "✅ Everything's already in sync — every database member still holds their team's role.",
+            ephemeral=True,
+        )
+        return
+
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    preview_limit = 15
+    lines = report_lines[:preview_limit]
+    if len(report_lines) > preview_limit:
+        lines.append(f"…and {len(report_lines) - preview_limit} more line(s)")
+
+    await interaction.followup.send(
+        f"🔄 Synced team membership — removed {total_removed} member(s) across the database "
+        f"who no longer hold their team's role:\n" + "\n".join(lines),
         ephemeral=True,
     )
 
