@@ -2493,6 +2493,30 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
     )
 
 
+class TeamMembersView(discord.ui.LayoutView):
+    """A Components V2 container listing a team's members, styled to match
+    MetaUpdateView/MemberCountView elsewhere in the bot — accent-bordered card
+    instead of a plain embed, coloured to match the team's role."""
+
+    def __init__(self, key: str, info: dict, role: discord.Role):
+        super().__init__(timeout=None)
+
+        members = sorted(role.members, key=lambda m: m.id != info["leader_id"])
+        lines = [
+            member.mention + (" (Leader)" if member.id == info["leader_id"] else "")
+            for member in members
+        ]
+
+        children = [
+            discord.ui.TextDisplay(f"# {info['emoji']} {key} Team"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay("\n".join(lines) if lines else "No members with this role yet."),
+        ]
+
+        container = discord.ui.Container(*children, accent_colour=role.colour)
+        self.add_item(container)
+
+
 @bot.tree.command(name="teammembers", description="List a team's members")
 @app_commands.describe(team="Team name")
 async def teammembers(interaction: discord.Interaction, team: str):
@@ -2510,16 +2534,7 @@ async def teammembers(interaction: discord.Interaction, team: str):
         await interaction.followup.send("That team's role no longer exists.", ephemeral=True)
         return
 
-    members = sorted(role.members, key=lambda m: m.id != info["leader_id"])
-    lines = [
-        member.mention + (" (Leader)" if member.id == info["leader_id"] else "")
-        for member in members
-    ]
-    embed = discord.Embed(
-        title=f"{info['emoji']} {key} Team",
-        description="\n".join(lines) if lines else "No members with this role yet.",
-    )
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(view=TeamMembersView(key, info, role))
 
 
 @teammembers.autocomplete("team")
