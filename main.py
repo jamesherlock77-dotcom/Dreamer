@@ -2278,27 +2278,36 @@ async def fetch_meta_version() -> str | None:
         return None
 
 
-def build_meta_update_embed(current: str, previous: str | None, detected_ts: int) -> discord.Embed:
-    """Build the update-detected embed, styled to match the reference "ReTracker v2"
-    panel: a small author eyebrow, "Update Detected!" title, a timestamp + bold game name
-    in the description, and two stacked fields (green dot = new version, red dot = last
-    logged version) each rendered as a code block. The banner image (if one was
-    successfully scraped/attached) is set separately by the caller via set_image."""
-    current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
-    previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
+class MetaUpdateView(discord.ui.LayoutView):
+    """A Components V2 container styled like the old 'Update Detected!' embed — same
+    author eyebrow, title, timestamp/game name, two version fields, and (if the banner
+    was scraped) the banner image, just built out of native container components."""
 
-    embed = discord.Embed(
-        title="Update Detected!",
-        description=f"<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**",
-    )
-    embed.set_author(name=META_EMBED_AUTHOR)
-    embed.add_field(name="🟢 | Updated Version:", value=f"```{current_display}```", inline=False)
-    embed.add_field(name="🔴 | Last Logged:", value=f"```{previous_display}```", inline=False)
-    return embed
+    def __init__(self, current: str, previous: str | None, detected_ts: int, include_banner: bool):
+        super().__init__(timeout=None)
+        current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
+        previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
+
+        children = [
+            discord.ui.TextDisplay(f"-# {META_EMBED_AUTHOR}"),
+            discord.ui.TextDisplay(
+                f"# Update Detected!\n<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**"
+            ),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f"🟢 | **Updated Version:**\n```{current_display}```"),
+            discord.ui.TextDisplay(f"🔴 | **Last Logged:**\n```{previous_display}```"),
+        ]
+        if include_banner:
+            children.append(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
+            )
+
+        container = discord.ui.Container(*children)
+        self.add_item(container)
 
 
 async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
-    """Checks the store for a new version and, if it changed, posts the update embed
+    """Checks the store for a new version and, if it changed, posts the update container
     (with support_banner.png attached, same image used on the ticket panel and giveaway
     embeds) to META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
     previous = load_last_meta_version()
@@ -2310,23 +2319,24 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
         channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
         if channel:
             detected_ts = int(discord.utils.utcnow().timestamp())
-            embed = build_meta_update_embed(current, previous, detected_ts)
 
             file = None
-            if os.path.exists(SUPPORT_BANNER_PATH):
+            include_banner = os.path.exists(SUPPORT_BANNER_PATH)
+            if include_banner:
                 file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-                embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
             else:
-                print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — update embed sent without image.")
+                print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — update message sent without image.")
+
+            view = MetaUpdateView(current, previous, detected_ts, include_banner)
 
             try:
                 if file is not None:
-                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", embed=embed, file=file)
+                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", view=view, file=file)
                 else:
-                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", embed=embed)
+                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", view=view)
             except discord.HTTPException as e:
-                # If embed fails (still too large or otherwise invalid), fall back to a plaintext summary.
-                print(f"[ERROR] Failed to send meta update embed: {e}")
+                # If the container fails (still too large or otherwise invalid), fall back to a plaintext summary.
+                print(f"[ERROR] Failed to send meta update message: {e}")
                 try:
                     short_current = _sanitize_version_text(current, max_len=800)
                     short_previous = _sanitize_version_text(previous or current, max_len=800)
@@ -2371,7 +2381,7 @@ async def checkupdate(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="updateembed",
-    description="(Staff) Preview the update embed's current look — doesn't save anything",
+    description="(Staff) Preview the update message's current look — doesn't save anything",
 )
 async def updateembed(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -2389,17 +2399,18 @@ async def updateembed(interaction: discord.Interaction):
 
     previous = load_last_meta_version()
     detected_ts = int(discord.utils.utcnow().timestamp())
-    embed = build_meta_update_embed(current, previous, detected_ts)
 
     file = None
-    if os.path.exists(SUPPORT_BANNER_PATH):
+    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
+    if include_banner:
         file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-        embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
+
+    view = MetaUpdateView(current, previous, detected_ts, include_banner)
 
     if file is not None:
-        await interaction.followup.send(embed=embed, file=file)
+        await interaction.followup.send(view=view, file=file)
     else:
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(view=view)
 
 
 # ---------- Slash commands ----------
