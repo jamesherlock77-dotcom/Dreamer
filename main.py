@@ -44,6 +44,8 @@ TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a t
 SUPPORT_TICKET_CHANNEL_ID = 1530456581903486996  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
 TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener) whenever a new ticket thread is opened
 TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
+MOD_ACTIONS_ROLE_ID = 1535819394129854474         # only audit-log actions by holders of this role are synced
+MOD_ACTIONS_LOG_CHANNEL_ID = 1535819132287717476  # /syncmodactions posts its JSON export here
 TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can close any ticket, same as staff
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
 TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
@@ -2838,6 +2840,137 @@ async def randomgiverole(
         result += f"\n⚠️ Couldn't assign the role to: {', '.join(m.mention for m in failed)}."
 
     await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(
+    name="syncmodactions",
+    description="(Staff) Export ban/kick/mute actions by role-holders to a JSON file",
+)
+async def syncmodactions(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    role = interaction.guild.get_role(MOD_ACTIONS_ROLE_ID)
+    if role is None:
+        await interaction.followup.send(
+            "Couldn't find the moderator role to filter by — check MOD_ACTIONS_ROLE_ID.", ephemeral=True
+        )
+        return
+
+    log_channel = interaction.guild.get_channel(MOD_ACTIONS_LOG_CHANNEL_ID) or bot.get_channel(
+        MOD_ACTIONS_LOG_CHANNEL_ID
+    )
+    if log_channel is None:
+        try:
+            log_channel = await bot.fetch_channel(MOD_ACTIONS_LOG_CHANNEL_ID)
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "Couldn't find the output channel — check MOD_ACTIONS_LOG_CHANNEL_ID.", ephemeral=True
+            )
+            return
+
+    # NOTE: this can only see bans, kicks, and timeouts (Discord's own native mutes) —
+    # these are the only moderation actions Discord's audit log records. Warns are not
+    # included: Dyno stores warning data in its own private database (viewable only via
+    # Dyno's own dashboard/commands), never in Discord's audit log or API, so no other
+    # bot — including this one — has any way to read that data.
+    _member_role_cache: dict = {}
+
+    async def _executor_has_role(user) -> bool:
+        if user is None:
+            return False
+        if user.id in _member_role_cache:
+            return _member_role_cache[user.id]
+        member = interaction.guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user.id)
+            except discord.HTTPException:
+                member = None
+        result = member is not None and role in member.roles
+        _member_role_cache[user.id] = result
+        return result
+
+    actions = []
+    try:
+        async for entry in interaction.guild.audit_logs(limit=None):
+            if entry.action not in (
+                discord.AuditLogAction.ban,
+                discord.AuditLogAction.kick,
+                discord.AuditLogAction.member_update,
+            ):
+                continue
+
+            if entry.action == discord.AuditLogAction.member_update:
+                # member_update covers a lot of unrelated changes (nickname, roles, etc.)
+                # — only keep entries where a timeout was actually applied (before/after
+                # timed_out_until differ and after is set), i.e. an actual mute.
+                before_timeout = getattr(entry.before, "timed_out_until", None)
+                after_timeout = getattr(entry.after, "timed_out_until", None)
+                if after_timeout is None or before_timeout == after_timeout:
+                    continue
+                action_type = "mute"
+            elif entry.action == discord.AuditLogAction.ban:
+                action_type = "ban"
+            else:
+                action_type = "kick"
+
+            if not await _executor_has_role(entry.user):
+                continue
+
+            actions.append(
+                {
+                    "action": action_type,
+                    "moderator_id": entry.user.id if entry.user else None,
+                    "moderator_name": str(entry.user) if entry.user else None,
+                    "target_id": entry.target.id if entry.target else None,
+                    "target_name": str(entry.target) if entry.target else None,
+                    "reason": entry.reason,
+                    "timestamp": entry.created_at.isoformat(),
+                }
+            )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to view this server's audit log — grant me the "
+            "**View Audit Log** permission and try again.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Couldn't read the audit log: {e}", ephemeral=True)
+        return
+
+    now = discord.utils.utcnow()
+    payload = {
+        "role_filter_id": MOD_ACTIONS_ROLE_ID,
+        "synced_at": now.isoformat(),
+        "synced_by": interaction.user.id,
+        "action_count": len(actions),
+        "actions": actions,
+    }
+
+    filename = f"mod_actions_{int(now.timestamp())}.json"
+    file_bytes = json.dumps(payload, indent=2).encode("utf-8")
+
+    try:
+        await log_channel.send(
+            content=f"🗂️ Mod action sync — {len(actions)} action(s) found (bans/kicks/mutes only; "
+            f"warns aren't included, see note in the file).",
+            file=discord.File(io.BytesIO(file_bytes), filename=filename),
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Found {len(actions)} action(s), but couldn't post the file: {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"✅ Synced {len(actions)} action(s) (bans/kicks/mutes) to {log_channel.mention}.\n"
+        f"⚠️ Warns aren't included — Dyno stores those in its own private database, which "
+        f"isn't accessible to any other bot or through Discord's API.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
