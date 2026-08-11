@@ -4355,6 +4355,59 @@ async def sendtournament(interaction: discord.Interaction, teams: str):
 sendtournament.autocomplete("teams")(multi_team_autocomplete)
 
 
+@bot.tree.command(
+    name="deletetournamentsignup",
+    description="(Staff) Delete the tournament sign-up message posted in this channel",
+)
+async def deletetournamentsignup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_by_channel(db["teams"], interaction.channel_id)
+    if not team_key:
+        await interaction.followup.send(
+            "This doesn't look like a team channel — run this in the team channel that has "
+            "the sign-up message.",
+            ephemeral=True,
+        )
+        return
+
+    info = db["teams"][team_key]
+    message_id = info.get("tournament_message_id")
+    if not message_id:
+        await interaction.followup.send(
+            f"**{team_key}** doesn't currently have a tournament sign-up message posted here.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        msg = await interaction.channel.fetch_message(message_id)
+        await msg.delete()
+    except discord.NotFound:
+        pass  # already gone — still clean up the DB reference below
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Couldn't delete the sign-up message — check the bot's permissions in this channel.",
+            ephemeral=True,
+        )
+        return
+
+    info["tournament_message_id"] = None
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    await interaction.followup.send(
+        f"🗑️ Deleted **{team_key}**'s tournament sign-up message from this channel. It won't be "
+        f"re-stuck until you post it again from the tournament panel dropdown.",
+        ephemeral=True,
+    )
+
+
 # ---------- Question of the Day ----------
 @bot.tree.command(
     name="qotd",
