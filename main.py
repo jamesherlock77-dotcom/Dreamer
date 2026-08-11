@@ -2692,6 +2692,66 @@ async def forcekick(interaction: discord.Interaction, member: discord.Member):
     await interaction.followup.send(f"Force-removed {member.mention} from **{team_key}**.", ephemeral=True)
 
 
+# Extra user allowed to use /forceadd even without the staff role.
+FORCEADD_EXTRA_USER_ID = 1221101672902693005
+
+
+@bot.tree.command(
+    name="forceadd",
+    description="(Staff) Force-add a member to a team, bypassing invites, the member cap, and the join cooldown",
+)
+@app_commands.describe(team="Team to add the member to", user="The member to add")
+async def forceadd(interaction: discord.Interaction, team: str, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    if not (has_staff_role(interaction.user) or interaction.user.id == FORCEADD_EXTRA_USER_ID):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    if user.bot:
+        await interaction.followup.send("You can't add bots to a team.", ephemeral=True)
+        return
+
+    existing_team = find_team_by_member(db["teams"], user.id)
+    if existing_team:
+        if existing_team == team_key:
+            await interaction.followup.send(f"{user.mention} is already on **{team_key}**.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"{user.mention} is already on **{existing_team}** — use `/forcekick` to remove them "
+                f"from it first.",
+                ephemeral=True,
+            )
+        return
+
+    info = db["teams"][team_key]
+
+    role = interaction.guild.get_role(info["role_id"])
+    if role:
+        await user.add_roles(role, reason=f"Force-added to team by staff member {interaction.user}")
+
+    if user.id not in info["members"]:
+        info["members"].append(user.id)
+    record_team_join(info, user.id)
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    channel = interaction.guild.get_channel(info["channel_id"])
+    if channel:
+        try:
+            await channel.send(f"🎉 {user.mention} was just added to the team!")
+        except discord.HTTPException:
+            pass
+
+    await interaction.followup.send(f"Added {user.mention} to **{team_key}**.", ephemeral=True)
+
+
 async def team_name_autocomplete(interaction: discord.Interaction, current: str):
     db = load_db()
     return [
@@ -2868,6 +2928,7 @@ async def staffchangesetting(
 
 
 staffchangesetting.autocomplete("team")(team_name_autocomplete)
+forceadd.autocomplete("team")(team_name_autocomplete)
 
 
 @bot.tree.command(
