@@ -2281,14 +2281,29 @@ async def fetch_meta_version() -> str | None:
 class MetaUpdateView(discord.ui.LayoutView):
     """A Components V2 container styled like the old 'Update Detected!' embed — same
     author eyebrow, title, timestamp/game name, two version fields, and (if the banner
-    was scraped) the banner image, just built out of native container components."""
+    was scraped) the banner image, just built out of native container components.
+    If ping_role_id is given, the role mention is included as its own component at the
+    top of the container, since Components V2 messages can't use a top-level content field."""
 
-    def __init__(self, current: str, previous: str | None, detected_ts: int, include_banner: bool):
+    def __init__(
+        self,
+        current: str,
+        previous: str | None,
+        detected_ts: int,
+        include_banner: bool,
+        ping_role_id: int | None = None,
+    ):
         super().__init__(timeout=None)
         current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
         previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
 
-        children = [
+        children = []
+        if ping_role_id is not None:
+            # Components V2 messages can't carry a top-level `content` field, so the
+            # role ping has to live inside the container as its own text component —
+            # putting it in `content` alongside a LayoutView makes Discord reject the send.
+            children.append(discord.ui.TextDisplay(f"<@&{ping_role_id}>"))
+        children += [
             discord.ui.TextDisplay(f"-# {META_EMBED_AUTHOR}"),
             discord.ui.TextDisplay(
                 f"# Update Detected!\n<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**"
@@ -2327,13 +2342,13 @@ async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
             else:
                 print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — update message sent without image.")
 
-            view = MetaUpdateView(current, previous, detected_ts, include_banner)
+            view = MetaUpdateView(current, previous, detected_ts, include_banner, ping_role_id=META_UPDATE_PING_ROLE_ID)
 
             try:
                 if file is not None:
-                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", view=view, file=file)
+                    await channel.send(view=view, file=file)
                 else:
-                    await channel.send(content=f"<@&{META_UPDATE_PING_ROLE_ID}>", view=view)
+                    await channel.send(view=view)
             except discord.HTTPException as e:
                 # If the container fails (still too large or otherwise invalid), fall back to a plaintext summary.
                 print(f"[ERROR] Failed to send meta update message: {e}")
