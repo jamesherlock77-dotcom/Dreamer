@@ -31,6 +31,7 @@ CONFIRM_CHANNEL_ID = 1528146431138074624   # admins confirm new teams here
 TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are created in
 TEAM_CATEGORY_OVERFLOW_ID = 1534991567486714026  # used once TEAM_CATEGORY_ID hits Discord's 50-channel cap
 TEAM_LOG_CHANNEL_ID = 1530008905663512626  # teams JSON "database" message lives here
+TEAM_ACTIVITY_LOG_CHANNEL_ID = 1536846101657690242  # human-readable embed log of every team event (create/delete/join/leave/invite/etc)
 GIVEAWAY_LOG_CHANNEL_ID = 1530009058294370476  # giveaways JSON "database" message lives here
 LOG_CHANNEL_ID = 1528147225799037008       # legacy combined database channel — kept only so
                                             # old data can be migrated into the two channels above
@@ -172,6 +173,35 @@ async def backup_db_to_log_channel():
     up in GIVEAWAY_LOG_CHANNEL_ID, each as its own auto-updated message."""
     await _backup_file_to_channel(TEAM_LOG_CHANNEL_ID, TEAMS_DB_FILE, TEAMS_DB_FILE)
     await _backup_file_to_channel(GIVEAWAY_LOG_CHANNEL_ID, GIVEAWAYS_DB_FILE, GIVEAWAYS_DB_FILE)
+
+
+async def log_team_event(
+    title: str,
+    description: str = "",
+    colour: discord.Colour = discord.Colour.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> None:
+    """Sends one standardized embed to TEAM_ACTIVITY_LOG_CHANNEL_ID for every team-related
+    event — creation, deletion, joins, leaves, invites (sent/accepted/declined/cancelled/
+    expired/failed), kicks, force-adds, leader promotions, and setting changes. This is a
+    human-readable activity feed, separate from the raw JSON "database" backup kept in
+    TEAM_LOG_CHANNEL_ID. Fire-and-forget: any failure here is printed and swallowed so a
+    logging hiccup never breaks the actual team action that triggered it."""
+    try:
+        channel = bot.get_channel(TEAM_ACTIVITY_LOG_CHANNEL_ID) or await bot.fetch_channel(TEAM_ACTIVITY_LOG_CHANNEL_ID)
+        if channel is None:
+            return
+        embed = discord.Embed(
+            title=title,
+            description=description or None,
+            colour=colour,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, value, inline in (fields or []):
+            embed.add_field(name=name, value=value or "—", inline=inline)
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[ERROR] Failed to send team activity log: {e}")
 
 
 async def _restore_file_from_channel(channel_id: int, file_path: str, filename: str) -> bool:
@@ -1129,6 +1159,16 @@ async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: disco
     save_db(db)
     await backup_db_to_log_channel()
 
+    await log_team_event(
+        "👢 Member Removed From Team",
+        colour=discord.Colour.red(),
+        fields=[
+            ("Team", team_name, True),
+            ("Member", f"<@{user_id}> (`{user_id}`)", True),
+            ("Reason", reason, False),
+        ],
+    )
+
     channel = guild.get_channel(info["channel_id"])
     if channel is not None:
         try:
@@ -1166,6 +1206,17 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
 
     save_db(db)
     await backup_db_to_log_channel()
+
+    await log_team_event(
+        "🗑️ Team Deleted",
+        colour=discord.Colour.dark_red(),
+        fields=[
+            ("Team", team_name, True),
+            ("Leader", f"<@{leader_id}> (`{leader_id}`)" if leader_id is not None else "Unknown", True),
+            ("Members", str(len(info.get("members", []))), True),
+            ("Reason", reason, False),
+        ],
+    )
     return True
 
 
@@ -1231,6 +1282,21 @@ async def perform_leader_promotion(
 
     save_db(db)
     await backup_db_to_log_channel()
+
+    await log_team_event(
+        "👑 Team Leader Changed",
+        colour=discord.Colour.gold(),
+        fields=[
+            ("Team", team_name, True),
+            ("New Leader", f"<@{new_leader_id}> (`{new_leader_id}`)", True),
+            (
+                "Old Leader",
+                f"<@{old_leader_id}> (`{old_leader_id}`)" if old_leader_id is not None else "Unknown",
+                True,
+            ),
+            ("Reason", reason, False),
+        ],
+    )
     return True
 
 
@@ -1708,6 +1774,18 @@ class ConfirmTeamView(discord.ui.View):
         await backup_db_to_log_channel()
         pending_team_requests.discard(self.requester_id)
 
+        await log_team_event(
+            "🆕 Team Created",
+            colour=discord.Colour.green(),
+            fields=[
+                ("Team", f"{self.emoji} {self.team_name}", True),
+                ("Leader", f"{leader.mention} (`{leader.id}`)", True),
+                ("Confirmed By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Channel", team_channel.mention, True),
+                ("Role", role.mention, True),
+            ],
+        )
+
         await interaction.followup.send(
             f"✅ Team **{self.team_name}** {self.emoji} created — {team_channel.mention}"
         )
@@ -1720,6 +1798,15 @@ class ConfirmTeamView(discord.ui.View):
         except discord.HTTPException:
             pass
         pending_team_requests.discard(self.requester_id)
+        await log_team_event(
+            "🚫 Team Creation Denied",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team", f"{self.emoji} {self.team_name}", True),
+                ("Requester", f"<@{self.requester_id}> (`{self.requester_id}`)", True),
+                ("Denied By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
         await interaction.followup.send("Team creation denied.", ephemeral=True)
 
 
@@ -1775,6 +1862,16 @@ class CancelInviteView(discord.ui.View):
                 view=self,
             )
             return
+
+        await log_team_event(
+            "🚫 Invite Cancelled",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team", pending.get("team", "Unknown"), True),
+                ("Invited User", f"<@{pending['invited_user_id']}> (`{pending['invited_user_id']}`)", True),
+                ("Cancelled By", f"<@{self.leader_id}> (`{self.leader_id}`)", True),
+            ],
+        )
 
         await safe_edit_original_response(
             interaction,
@@ -1854,6 +1951,16 @@ class InviteResponseView(discord.ui.View):
         if channel:
             await channel.send(f"🎉 {member.mention} just joined the team!")
 
+        await log_team_event(
+            "✅ Invite Accepted — Member Joined",
+            colour=discord.Colour.green(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("New Member", f"{member.mention} (`{member.id}`)", True),
+                ("Invited By", f"<@{self.inviter_id}> (`{self.inviter_id}`)", True),
+            ],
+        )
+
         for child in self.children:
             child.disabled = True
         await safe_edit_original_response(interaction, content=f"You joined **{self.team_name}**! 🎉", view=self)
@@ -1863,6 +1970,15 @@ class InviteResponseView(discord.ui.View):
         self._clear_pending()
         for child in self.children:
             child.disabled = True
+        await log_team_event(
+            "❌ Invite Declined",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("Invited User", f"<@{self.invited_user_id}> (`{self.invited_user_id}`)", True),
+                ("Invited By", f"<@{self.inviter_id}> (`{self.inviter_id}`)", True),
+            ],
+        )
         await interaction.response.edit_message(content="Invite declined.", view=self)
 
     async def on_timeout(self):
@@ -1871,6 +1987,15 @@ class InviteResponseView(discord.ui.View):
         self._clear_pending()
         for child in self.children:
             child.disabled = True
+        await log_team_event(
+            "⌛ Invite Expired",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("Invited User", f"<@{self.invited_user_id}> (`{self.invited_user_id}`)", True),
+                ("Invited By", f"<@{self.inviter_id}> (`{self.inviter_id}`)", True),
+            ],
+        )
         if self.message is not None:
             try:
                 await self.message.edit(view=self)
@@ -2608,10 +2733,29 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
             view=view,
         )
     except discord.Forbidden:
+        await log_team_event(
+            "⚠️ Invite Failed (DMs Closed)",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team", team_key, True),
+                ("Invited User", f"{user.mention} (`{user.id}`)", True),
+                ("Invited By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
         await interaction.followup.send(
             "Couldn't DM that user (they may have DMs off).", ephemeral=True
         )
         return
+
+    await log_team_event(
+        "📨 Invite Sent",
+        colour=discord.Colour.blue(),
+        fields=[
+            ("Team", team_key, True),
+            ("Invited User", f"{user.mention} (`{user.id}`)", True),
+            ("Invited By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
 
     view.message = sent
     pending_invites[interaction.user.id] = {
@@ -2662,6 +2806,15 @@ async def leaveteam(interaction: discord.Interaction):
     clear_team_join(info, interaction.user.id)
     save_db(db)
     await backup_db_to_log_channel()
+
+    await log_team_event(
+        "🚪 Member Left Team",
+        colour=discord.Colour.orange(),
+        fields=[
+            ("Team", team_key, True),
+            ("Member", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
 
     channel = interaction.guild.get_channel(info["channel_id"])
     if channel is not None:
@@ -2756,6 +2909,16 @@ async def forceadd(interaction: discord.Interaction, team: str, user: discord.Me
     record_team_join(info, user.id)
     save_db(db)
     await backup_db_to_log_channel()
+
+    await log_team_event(
+        "➕ Member Force-Added To Team",
+        colour=discord.Colour.green(),
+        fields=[
+            ("Team", team_key, True),
+            ("Member", f"{user.mention} (`{user.id}`)", True),
+            ("Added By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
 
     channel = interaction.guild.get_channel(info["channel_id"])
     if channel:
@@ -2936,6 +3099,17 @@ async def staffchangesetting(
     if kick is not None:
         changes.append(f"kicked {kick.mention}")
 
+    if changename or changecolour or changeicon:
+        await log_team_event(
+            "⚙️ Team Settings Changed (Staff)",
+            colour=discord.Colour.blue(),
+            fields=[
+                ("Team", team_key, True),
+                ("Changed By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Changes", ", ".join(c for c in changes if not c.startswith("kicked")), False),
+            ],
+        )
+
     message = f"✅ Updated **{team_key}**: " + ", ".join(changes)
     if icon_warning:
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
@@ -2971,6 +3145,16 @@ async def bypassteamlimit(interaction: discord.Interaction, team: str, enabled: 
     info["bypass_member_limit"] = enabled
     save_db(db)
     await backup_db_to_log_channel()
+
+    await log_team_event(
+        "🔧 Member Cap Bypass Toggled",
+        colour=discord.Colour.blue(),
+        fields=[
+            ("Team", team_key, True),
+            ("Bypass Enabled", str(enabled), True),
+            ("Changed By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
 
     if enabled:
         await interaction.followup.send(
@@ -3861,6 +4045,17 @@ async def changeteamsettings(
         changes.append(f"icon → {new_emoji}")
     if kick is not None:
         changes.append(f"kicked {kick.mention}")
+
+    if changename or changecolour or changeicon:
+        await log_team_event(
+            "⚙️ Team Settings Changed",
+            colour=discord.Colour.blue(),
+            fields=[
+                ("Team", team_key, True),
+                ("Changed By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Changes", ", ".join(c for c in changes if not c.startswith("kicked")), False),
+            ],
+        )
 
     message = f"✅ Updated **{team_key}**: " + ", ".join(changes)
     if icon_warning:
