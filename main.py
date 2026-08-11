@@ -6,6 +6,7 @@ import re
 import json
 import logging
 import asyncio
+import time
 from datetime import timedelta, datetime, timezone
 
 import aiohttp
@@ -49,8 +50,10 @@ TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can clo
 INVITE_TRACKER_CHANNEL_ID = 1528160701955313722   # channel where the Invite Tracker app posts join/leave messages
 INVITE_LOG_CHANNEL_ID = 1535819132287717476       # /syncinvites and the live listener keep an auto-updated JSON "database" message here
 TOURNAMENT_PANEL_CHANNEL_ID = 1528515043992404150  # the tournament team-select panel is posted/refreshed here
-TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone listed on a submitted tournament sheet
+TOURNAMENT_SUBMISSION_ROLE_ID = 1533580965094359211  # granted to everyone signed up for the tournament
 TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the panel's Clear button is used
+TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the sticky tournament message
+TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
 
@@ -739,332 +742,198 @@ async def refresh_support_ticket_panel():
     await channel.send(embed=embed, file=file, view=view)
 
 
-# ---------- Tournament submission panel ----------
-TOURNAMENT_PANEL_TITLE = "Tournament Submissions"
-TOURNAMENT_COMPETITOR_EMOJI = "<:SilverTrophy:1528216893297791098>"
+# ---------- Tournament sticky sign-up message ----------
+TOURNAMENT_PANEL_TITLE = "Tournament Admin"
 TOURNAMENT_SUB_EMOJI = "<:Revolver:1528216974973210747>"
 
-# Matches a slot line like "`1.` " (empty) or "`1.` <@123456789012345678>" (filled)
-_TOURNAMENT_SLOT_LINE_RE = re.compile(r"^`(\d+)\.`\s*(?:<@!?(\d+)>)?\s*$")
+# In-memory cache of every team's channel_id, kept in sync on team create/delete so
+# on_message can cheaply check "is this a team channel?" without a load_db() call on
+# every single message sent anywhere in the server.
+_team_channel_ids: set = set()
+
+# In-memory per-channel cooldown so a burst of chat doesn't cause the sticky sign-up
+# message to be deleted and reposted on every single message — not persisted, resets
+# on restart, which is harmless (worst case: one extra repost right after a restart).
+_tournament_sticky_last_repost: dict = {}
 
 
-def build_tournament_submission_content(
-    competitor_count: int, sub_count: int, competitors: list = None, subs: list = None
-) -> str:
-    """Builds the '**Tournament Submission**' message body. `competitors`/`subs` are lists of
-    user IDs (or None for an empty slot); if omitted, all slots start empty."""
-    competitors = list(competitors) if competitors is not None else [None] * competitor_count
-    subs = list(subs) if subs is not None else [None] * sub_count
-
-    lines = ["**Tournament Submission**", f"{TOURNAMENT_COMPETITOR_EMOJI} Competitors :"]
-    for i in range(competitor_count):
-        filler = f"<@{competitors[i]}>" if i < len(competitors) and competitors[i] else ""
-        lines.append(f"`{i + 1}.` {filler}".rstrip())
-
-    lines.append(f"{TOURNAMENT_SUB_EMOJI}  Subs :")
-    for i in range(sub_count):
-        filler = f"<@{subs[i]}>" if i < len(subs) and subs[i] else ""
-        lines.append(f"`{i + 1}.` {filler}".rstrip())
-
+def build_tournament_signup_content(signups: list) -> str:
+    """Builds the sticky '🏆 Tournament Sign-Ups' message body for a team channel.
+    `signups` is a list of user IDs, capped at TOURNAMENT_SIGNUP_CAP."""
+    lines = [
+        "# 🏆 Tournament Sign-Ups",
+        "Click the button below if you would like to play for the tournament!",
+        "",
+        f"**Signed up:** `{len(signups)}/{TOURNAMENT_SIGNUP_CAP}`",
+    ]
+    if signups:
+        lines += [f"• <@{uid}>" for uid in signups]
+    else:
+        lines.append("*Nobody's signed up yet.*")
     return "\n".join(lines)
 
 
-def parse_tournament_submission_content(content: str):
-    """Reads a tournament submission message back into (competitor_ids, sub_ids) lists,
-    where each entry is a user ID or None for an empty slot."""
-    competitors, subs = [], []
-    section = None
-    for line in content.split("\n"):
-        if line.startswith(TOURNAMENT_COMPETITOR_EMOJI):
-            section = "competitors"
-            continue
-        if line.startswith(TOURNAMENT_SUB_EMOJI):
-            section = "subs"
-            continue
-        match = _TOURNAMENT_SLOT_LINE_RE.match(line)
-        if not match:
-            continue
-        user_id = int(match.group(2)) if match.group(2) else None
-        if section == "competitors":
-            competitors.append(user_id)
-        elif section == "subs":
-            subs.append(user_id)
-    return competitors, subs
-
-
-class TournamentSubmissionView(discord.ui.View):
-    """Attached to each '**Tournament Submission**' message. Reads/writes its state straight
-    from the message content, so it works for any number of these messages with one
-    persistent, restart-proof view."""
+class TournamentSignupView(discord.ui.View):
+    """Attached to the sticky sign-up message kept at the bottom of every team channel.
+    One button toggles the clicking user on/off their team's sign-up list (capped at
+    TOURNAMENT_SIGNUP_CAP) and grants/revokes TOURNAMENT_SUBMISSION_ROLE_ID to match.
+    State lives in the teams DB (not the message content), since the sticky message
+    itself gets deleted and reposted every time new chat buries it."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _update_signup(self, interaction: discord.Interaction, target: str):
-        message = interaction.message
-        competitors, subs = parse_tournament_submission_content(message.content)
-        user_id = interaction.user.id
-        in_competitors = user_id in competitors
-        in_subs = user_id in subs
-
-        if target == "remove":
-            if not in_competitors and not in_subs:
-                await interaction.response.send_message(
-                    "You're not currently signed up on this sheet.", ephemeral=True
-                )
-                return
-            if in_competitors:
-                competitors[competitors.index(user_id)] = None
-            if in_subs:
-                subs[subs.index(user_id)] = None
-        else:
-            target_list = competitors if target == "competitors" else subs
-            label = "competitor" if target == "competitors" else "sub"
-
-            if user_id in target_list:
-                await interaction.response.send_message(
-                    f"You're already signed up as a {label}.", ephemeral=True
-                )
-                return
-            if None not in target_list:
-                await interaction.response.send_message(
-                    f"There are no open {label} slots.", ephemeral=True
-                )
-                return
-
-            # moving from the other list, if they were on it
-            if in_competitors:
-                competitors[competitors.index(user_id)] = None
-            if in_subs:
-                subs[subs.index(user_id)] = None
-
-            target_list[target_list.index(None)] = user_id
-
-        new_content = build_tournament_submission_content(len(competitors), len(subs), competitors, subs)
-        await interaction.response.edit_message(content=new_content)
-
     @discord.ui.button(
-        label="Competitors", style=discord.ButtonStyle.primary, custom_id="tournament_submission_competitors"
+        label="Join Tournament", style=discord.ButtonStyle.success, custom_id="tournament_signup_toggle"
     )
-    async def competitors_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update_signup(interaction, "competitors")
-
-    @discord.ui.button(
-        label="Subs", style=discord.ButtonStyle.primary, custom_id="tournament_submission_subs"
-    )
-    async def subs_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update_signup(interaction, "subs")
-
-    @discord.ui.button(
-        label="Remove", style=discord.ButtonStyle.danger, custom_id="tournament_submission_remove"
-    )
-    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update_signup(interaction, "remove")
-
-    @discord.ui.button(
-        label="Submit", style=discord.ButtonStyle.success, custom_id="tournament_submission_submit"
-    )
-    async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
         db = load_db()
         team_key = find_team_by_channel(db["teams"], interaction.channel_id)
         if not team_key:
             await interaction.response.send_message(
-                "Couldn't figure out which team this submission sheet belongs to.", ephemeral=True
+                "Couldn't figure out which team this sign-up sheet belongs to.", ephemeral=True
             )
             return
 
         info = db["teams"][team_key]
-        if interaction.user.id != info.get("leader_id"):
-            await interaction.response.send_message(
-                "Only the team leader can submit this.", ephemeral=True
-            )
-            return
+        signups = info.setdefault("tournament_signups", [])
+        user_id = interaction.user.id
+        role = interaction.guild.get_role(TOURNAMENT_SUBMISSION_ROLE_ID)
 
-        competitors, subs = parse_tournament_submission_content(interaction.message.content)
-        recipient_ids = [uid for uid in (competitors + subs) if uid is not None]
-        if not recipient_ids:
-            await interaction.response.send_message(
-                "Nobody has signed up yet — nothing to submit.", ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        guild = interaction.guild
-        role = guild.get_role(TOURNAMENT_SUBMISSION_ROLE_ID)
-
-        granted = 0
-        failed_ids = []
-        for user_id in recipient_ids:
-            member = guild.get_member(user_id)
-            if member is None:
+        if user_id in signups:
+            signups.remove(user_id)
+            save_db(db)
+            await backup_db_to_log_channel()
+            if role:
                 try:
-                    member = await guild.fetch_member(user_id)
+                    await interaction.user.remove_roles(role, reason="Left tournament sign-up")
                 except discord.HTTPException:
-                    member = None
-            if member is None or role is None:
-                failed_ids.append(user_id)
-                continue
-            try:
-                await member.add_roles(role, reason=f"Tournament submission by {interaction.user} ({team_key})")
-                granted += 1
-            except discord.HTTPException:
-                failed_ids.append(user_id)
+                    pass
+            await interaction.response.edit_message(content=build_tournament_signup_content(signups))
+            await interaction.followup.send("You've been removed from the sign-up list.", ephemeral=True)
+            return
 
+        if len(signups) >= TOURNAMENT_SIGNUP_CAP:
+            await interaction.response.send_message(
+                f"Sign-ups are full (`{TOURNAMENT_SIGNUP_CAP}/{TOURNAMENT_SIGNUP_CAP}`).", ephemeral=True
+            )
+            return
+
+        signups.append(user_id)
+        save_db(db)
+        await backup_db_to_log_channel()
+        if role:
+            try:
+                await interaction.user.add_roles(role, reason="Signed up for tournament")
+            except discord.HTTPException:
+                pass
+        await interaction.response.edit_message(content=build_tournament_signup_content(signups))
+        await interaction.followup.send("You're signed up for the tournament! 🏆", ephemeral=True)
+
+
+async def post_tournament_sticky(guild: discord.Guild, team_key: str, info: dict, db: dict) -> None:
+    """Deletes a team's old sticky sign-up message (if any) and posts a fresh one at the
+    bottom of that team's channel, then remembers the new message ID in the DB (and saves
+    it). Safe to call repeatedly — e.g. once per new chat message to keep it "stuck" at
+    the bottom, once on team creation to seed it, and once per team when staff hit Clear."""
+    channel = guild.get_channel(info.get("channel_id"))
+    if channel is None:
+        return
+
+    old_id = info.get("tournament_message_id")
+    if old_id:
         try:
-            await interaction.message.delete()
+            old_msg = await channel.fetch_message(old_id)
+            await old_msg.delete()
         except discord.HTTPException:
             pass
 
-        if role is None:
-            result_message = "⚠️ Submitted, but couldn't find the tournament role to assign — check the role ID."
-        else:
-            result_message = f"✅ Submitted — gave the tournament role to {granted} member(s)."
-            if failed_ids:
-                result_message += f" Couldn't update {len(failed_ids)} member(s)."
-
-        await interaction.followup.send(result_message, ephemeral=True)
-
-
-class TournamentSubmissionModal(discord.ui.Modal):
-    def __init__(self, team_name: str):
-        super().__init__(title=f"Tournament Submission — {team_name}"[:45])
-        self.team_name = team_name
-        self.competitors_input = discord.ui.TextInput(
-            label="How much competitors?", placeholder="e.g. 5", max_length=3
+    signups = info.get("tournament_signups", [])
+    try:
+        new_msg = await channel.send(
+            content=build_tournament_signup_content(signups), view=TournamentSignupView()
         )
-        self.backups_input = discord.ui.TextInput(
-            label="How much backups?", placeholder="e.g. 2", max_length=3
-        )
-        self.add_item(self.competitors_input)
-        self.add_item(self.backups_input)
+    except discord.HTTPException as e:
+        print(f"[ERROR] Failed to post tournament sticky for {team_key}: {e}")
+        return
 
-    async def on_submit(self, interaction: discord.Interaction):
-        competitors_raw = self.competitors_input.value.strip()
-        backups_raw = self.backups_input.value.strip()
-
-        if not competitors_raw.isdigit() or not backups_raw.isdigit():
-            await interaction.response.send_message(
-                "Both fields need to be whole numbers.", ephemeral=True
-            )
-            return
-
-        competitor_count = int(competitors_raw)
-        backup_count = int(backups_raw)
-
-        if not (1 <= competitor_count <= 50) or not (0 <= backup_count <= 50):
-            await interaction.response.send_message(
-                "Use a competitor count between 1–50 and a backup count between 0–50.", ephemeral=True
-            )
-            return
-
-        db = load_db()
-        info = db["teams"].get(self.team_name)
-        if info is None:
-            await interaction.response.send_message(
-                "That team no longer exists — the panel may be out of date.", ephemeral=True
-            )
-            return
-
-        channel = interaction.guild.get_channel(info["channel_id"])
-        if channel is None:
-            await interaction.response.send_message(
-                "That team's channel no longer exists.", ephemeral=True
-            )
-            return
-
-        content = build_tournament_submission_content(competitor_count, backup_count)
-        await channel.send(content=content, view=TournamentSubmissionView())
-
-        await interaction.response.send_message(
-            f"Tournament submission sheet posted in {channel.mention}.", ephemeral=True
-        )
+    info["tournament_message_id"] = new_msg.id
+    save_db(db)
 
 
+async def maybe_restick_tournament_message(message: discord.Message) -> None:
+    """Called from on_message for every non-bot message. If the message landed in a team
+    channel that has a tournament sticky, and the debounce window has passed, re-sticks it
+    (deletes the old one, reposts fresh at the bottom) so it stays visible under new chat."""
+    if message.channel.id not in _team_channel_ids:
+        return
 
-TOURNAMENT_TEAMS_PER_PAGE = 25
-_TOURNAMENT_PAGE_RE = re.compile(r"page (\d+)/(\d+)")
+    now = time.monotonic()
+    last = _tournament_sticky_last_repost.get(message.channel.id, 0)
+    if now - last < TOURNAMENT_STICKY_DEBOUNCE_SECONDS:
+        return
+
+    db = load_db()
+    team_key = find_team_by_channel(db["teams"], message.channel.id)
+    if not team_key:
+        return
+    info = db["teams"][team_key]
+    if not info.get("tournament_message_id"):
+        return  # this team doesn't have a sticky yet (shouldn't normally happen)
+
+    _tournament_sticky_last_repost[message.channel.id] = now
+    try:
+        await post_tournament_sticky(message.guild, team_key, info, db)
+    except Exception as e:
+        print(f"[ERROR] Failed to re-stick tournament sign-up message for {team_key}: {e}")
 
 
-class TournamentTeamSelectView(discord.ui.View):
-    """The dropdown panel itself. Discord caps select menus at 25 options, so teams are
-    split across pages of 25 with Prev/Next buttons once there are more than that.
+async def ensure_tournament_stickies() -> None:
+    """Startup backfill: posts the sticky sign-up message into any existing team channel
+    that doesn't have one yet (e.g. teams created before this feature existed). Idempotent
+    — teams that already have a tournament_message_id are skipped."""
+    db = load_db()
+    if not db["teams"]:
+        return
 
-    Current page isn't kept on the view instance — it's read back from the live message's
-    select placeholder (e.g. "... (page 2/3)") whenever Prev/Next is pressed, since a
-    persistent view's registered instance is shared across every message using it and
-    can't hold per-message state that survives a restart."""
+    guild = None
+    posted = 0
+    for team_key, info in db["teams"].items():
+        _team_channel_ids.add(info.get("channel_id"))
+        if info.get("tournament_message_id"):
+            continue
 
-    def __init__(self, team_names: list = None, page: int = 0, keep_nav_buttons: bool = False):
+        channel_id = info.get("channel_id")
+        if guild is None and channel_id is not None:
+            try:
+                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                guild = seed_channel.guild
+            except discord.HTTPException:
+                continue
+
+        if guild is None:
+            continue
+
+        try:
+            await post_tournament_sticky(guild, team_key, info, db)
+            posted += 1
+        except discord.HTTPException as e:
+            print(f"[ERROR] Failed to backfill tournament sticky for {team_key}: {e}")
+
+    if posted:
+        print(f"Posted the tournament sticky sign-up message in {posted} team channel(s) that didn't have one.")
+
+
+class TournamentAdminPanelView(discord.ui.View):
+    """Staff-only utility panel for the tournament: a single Clear button that strips
+    TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it, resets every team's sign-up
+    list (and re-sticks each team's message to reflect the reset), and purges
+    TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle."""
+
+    def __init__(self):
         super().__init__(timeout=None)
-        all_names = list(team_names or [])
-        total_pages = max(1, -(-len(all_names) // TOURNAMENT_TEAMS_PER_PAGE)) if all_names else 1
-        page = max(0, min(page, total_pages - 1))
-        start = page * TOURNAMENT_TEAMS_PER_PAGE
-        page_names = all_names[start:start + TOURNAMENT_TEAMS_PER_PAGE]
 
-        options = [discord.SelectOption(label=name[:100], value=name[:100]) for name in page_names]
-        if not options:
-            options = [discord.SelectOption(label="No teams yet", value="__none__")]
-        self.team_select.options = options
-
-        placeholder = "Select a team..."
-        if total_pages > 1:
-            placeholder += f" (page {page + 1}/{total_pages})"
-        self.team_select.placeholder = placeholder
-
-        if total_pages <= 1 and not keep_nav_buttons:
-            self.remove_item(self.prev_page)
-            self.remove_item(self.next_page)
-        else:
-            self.prev_page.disabled = page <= 0
-            self.next_page.disabled = page >= total_pages - 1
-
-    @discord.ui.select(
-        placeholder="Select a team...",
-        custom_id="tournament_team_select",
-        options=[discord.SelectOption(label="placeholder", value="placeholder")],
-    )
-    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        team_name = select.values[0]
-        if team_name == "__none__":
-            await interaction.response.send_message("There are no teams yet.", ephemeral=True)
-            return
-
-        db = load_db()
-        if team_name not in db["teams"]:
-            await interaction.response.send_message(
-                "That team no longer exists — the panel may be out of date.", ephemeral=True
-            )
-            return
-
-        await interaction.response.send_modal(TournamentSubmissionModal(team_name))
-
-    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary, custom_id="tournament_team_prev_page", row=1)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, -1)
-
-    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="tournament_team_next_page", row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._go_to_page(interaction, 1)
-
-    async def _go_to_page(self, interaction: discord.Interaction, delta: int):
-        current_page = 0
-        for row in interaction.message.components:
-            for component in row.children:
-                if getattr(component, "custom_id", None) == "tournament_team_select":
-                    match = _TOURNAMENT_PAGE_RE.search(component.placeholder or "")
-                    if match:
-                        current_page = int(match.group(1)) - 1
-
-        db = load_db()
-        team_names = sorted(db["teams"].keys())
-        new_view = TournamentTeamSelectView(team_names, page=current_page + delta)
-        await interaction.response.edit_message(view=new_view)
-
-    @discord.ui.button(
-        label="Clear", style=discord.ButtonStyle.danger, custom_id="tournament_clear_button", row=2
-    )
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.danger, custom_id="tournament_clear_button")
     async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not has_staff_role(interaction.user):
             await interaction.response.send_message(
@@ -1086,6 +955,18 @@ class TournamentTeamSelectView(discord.ui.View):
                 except discord.HTTPException:
                     pass
 
+        db = load_db()
+        for info in db["teams"].values():
+            info["tournament_signups"] = []
+        save_db(db)
+        await backup_db_to_log_channel()
+
+        for team_key, info in db["teams"].items():
+            try:
+                await post_tournament_sticky(guild, team_key, info, db)
+            except Exception as e:
+                print(f"[ERROR] Failed to reset tournament sticky for {team_key}: {e}")
+
         purge_channel = guild.get_channel(TOURNAMENT_CLEAR_PURGE_CHANNEL_ID) or bot.get_channel(
             TOURNAMENT_CLEAR_PURGE_CHANNEL_ID
         )
@@ -1106,35 +987,31 @@ class TournamentTeamSelectView(discord.ui.View):
         channel_mention = purge_channel.mention if purge_channel else "the target channel"
         role_note = "the tournament role" if role is not None else "the tournament role (role not found!)"
         await interaction.followup.send(
-            f"🧹 Cleared — removed {role_note} from {removed} member(s) and purged "
-            f"{purged} message(s) from {channel_mention}.",
+            f"🧹 Cleared — removed {role_note} from {removed} member(s), reset every team's "
+            f"sign-up list, and purged {purged} message(s) from {channel_mention}.",
             ephemeral=True,
         )
 
 
 async def refresh_tournament_panel():
-    """Posts the tournament team-select panel if one isn't already up in the target
-    channel. Unlike before, this does NOT delete and repost the panel on every startup —
-    that would drop the persistent Clear button's state and spam the channel. It only
-    posts a fresh panel the first time (or if the old one was deleted)."""
+    """Posts the tournament admin (Clear-button) panel if one isn't already up in the
+    target channel. Doesn't delete/repost on every startup — only posts a fresh one the
+    first time (or if the old one was deleted)."""
     channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
 
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
             return  # panel already posted — leave it alone
 
-    db = load_db()
-    team_names = sorted(db["teams"].keys())
-
     embed = discord.Embed(
         title=TOURNAMENT_PANEL_TITLE,
         description=(
-            "Select your team below to submit your competitors and backups for the tournament.\n"
-            "Use Prev/Next to page through teams if there are more than 25."
+            "**Clear** removes the tournament role from everyone, resets every team's "
+            "sign-up list, and purges the announcement channel — staff only."
         ),
         colour=discord.Colour.gold(),
     )
-    await channel.send(embed=embed, view=TournamentTeamSelectView(team_names))
+    await channel.send(embed=embed, view=TournamentAdminPanelView())
 
 
 async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: discord.Guild, reason: str) -> bool:
@@ -1192,6 +1069,8 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
     channel = guild.get_channel(info["channel_id"])
     if channel:
         await channel.delete(reason=reason)
+
+    _team_channel_ids.discard(info["channel_id"])
 
     leader_id = info.get("leader_id")
     if leader_id is not None:
@@ -1773,6 +1652,12 @@ class ConfirmTeamView(discord.ui.View):
         save_db(db)
         await backup_db_to_log_channel()
         pending_team_requests.discard(self.requester_id)
+
+        _team_channel_ids.add(team_channel.id)
+        try:
+            await post_tournament_sticky(guild, self.team_name, db["teams"][self.team_name], db)
+        except Exception as e:
+            print(f"[ERROR] Failed to post tournament sticky for new team {self.team_name}: {e}")
 
         await log_team_event(
             "🆕 Team Created",
@@ -3637,6 +3522,10 @@ async def on_message(message: discord.Message):
             await _process_invite_tracker_message(message)
         except discord.HTTPException as e:
             print(f"Failed to process an invite tracker message: {e}")
+
+    if message.guild is not None and not message.author.bot:
+        await maybe_restick_tournament_message(message)
+
     await bot.process_commands(message)
 
 
@@ -4494,8 +4383,8 @@ async def on_ready():
     await restore_invite_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
-    bot.add_view(TournamentTeamSelectView(keep_nav_buttons=True))
-    bot.add_view(TournamentSubmissionView())
+    bot.add_view(TournamentAdminPanelView())
+    bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayJoinView())
     await bot.tree.sync()
     try:
@@ -4510,6 +4399,10 @@ async def on_ready():
         await refresh_tournament_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
+    try:
+        await ensure_tournament_stickies()
+    except Exception as e:
+        print(f"Failed to backfill tournament sticky messages: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
     if not meta_poll_loop.is_running():
