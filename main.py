@@ -773,6 +773,16 @@ def build_tournament_signup_content(signups: list) -> str:
     return "\n".join(lines)
 
 
+def build_tournament_team_select_options(teams: dict) -> list[discord.SelectOption]:
+    """Builds the dropdown options for the tournament admin panel's team-select, one
+    per team (capped at Discord's 25-option limit), sorted alphabetically."""
+    options = [
+        discord.SelectOption(label=f"{info.get('emoji', '')} {name}".strip()[:100], value=name)
+        for name, info in sorted(teams.items(), key=lambda kv: kv[0].lower())
+    ]
+    return options[:25] or [discord.SelectOption(label="No teams yet", value="__none__")]
+
+
 class TournamentSignupView(discord.ui.View):
     """Attached to the sticky sign-up message kept at the bottom of every team channel.
     One button toggles the clicking user on/off their team's sign-up list (capped at
@@ -889,49 +899,71 @@ async def maybe_restick_tournament_message(message: discord.Message) -> None:
 
 
 async def ensure_tournament_stickies() -> None:
-    """Startup backfill: posts the sticky sign-up message into any existing team channel
-    that doesn't have one yet (e.g. teams created before this feature existed). Idempotent
-    — teams that already have a tournament_message_id are skipped."""
+    """Startup housekeeping: just caches every team's channel_id in _team_channel_ids so
+    on_message can cheaply recognize team channels. Sign-up messages are no longer
+    auto-posted to every team — staff pick a specific team from the dropdown on the
+    tournament admin panel instead (see TournamentAdminPanelView)."""
     db = load_db()
-    if not db["teams"]:
-        return
-
-    guild = None
-    posted = 0
-    for team_key, info in db["teams"].items():
+    for info in db["teams"].values():
         _team_channel_ids.add(info.get("channel_id"))
-        if info.get("tournament_message_id"):
-            continue
-
-        channel_id = info.get("channel_id")
-        if guild is None and channel_id is not None:
-            try:
-                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-                guild = seed_channel.guild
-            except discord.HTTPException:
-                continue
-
-        if guild is None:
-            continue
-
-        try:
-            await post_tournament_sticky(guild, team_key, info, db)
-            posted += 1
-        except discord.HTTPException as e:
-            print(f"[ERROR] Failed to backfill tournament sticky for {team_key}: {e}")
-
-    if posted:
-        print(f"Posted the tournament sticky sign-up message in {posted} team channel(s) that didn't have one.")
 
 
 class TournamentAdminPanelView(discord.ui.View):
-    """Staff-only utility panel for the tournament: a single Clear button that strips
-    TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it, resets every team's sign-up
-    list (and re-sticks each team's message to reflect the reset), and purges
-    TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle."""
+    """Staff-only utility panel for the tournament:
+    - A team-select dropdown that posts (or refreshes) the sticky "Join Tournament"
+      sign-up message in ONE chosen team's channel at a time — sign-ups are no longer
+      auto-sent to every team.
+    - A Clear button that strips TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it,
+      resets every team's sign-up list, re-sticks the message for any team that already
+      had one (without creating new ones for teams that were never selected), and purges
+      TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle."""
 
-    def __init__(self):
+    def __init__(self, teams: dict | None = None):
         super().__init__(timeout=None)
+        if teams is None:
+            teams = load_db()["teams"]
+        self.team_select.options = build_tournament_team_select_options(teams)
+
+    @discord.ui.select(
+        placeholder="Select a team to send the sign-up to...",
+        custom_id="tournament_team_select",
+        options=[discord.SelectOption(label="Loading...", value="__none__")],
+    )
+    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+            return
+
+        team_name = select.values[0]
+        if team_name == "__none__":
+            await interaction.response.send_message("There are no teams to select yet.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        db = load_db()
+        info = db["teams"].get(team_name)
+        if info is None:
+            await interaction.followup.send(
+                f"**{team_name}** no longer exists — this panel may be out of date. "
+                f"Try again in a moment or ask staff to re-run the panel refresh.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await post_tournament_sticky(interaction.guild, team_name, info, db)
+        except Exception as e:
+            print(f"[ERROR] Failed to post tournament sign-up for {team_name}: {e}")
+            await interaction.followup.send(
+                f"❌ Couldn't post the sign-up message for **{team_name}**.", ephemeral=True
+            )
+            return
+
+        _team_channel_ids.add(info.get("channel_id"))
+        await interaction.followup.send(
+            f"✅ Posted the tournament sign-up message in **{team_name}**'s channel.", ephemeral=True
+        )
 
     @discord.ui.button(label="Clear", style=discord.ButtonStyle.danger, custom_id="tournament_clear_button")
     async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -962,6 +994,8 @@ class TournamentAdminPanelView(discord.ui.View):
         await backup_db_to_log_channel()
 
         for team_key, info in db["teams"].items():
+            if not info.get("tournament_message_id"):
+                continue  # this team was never selected for sign-ups — leave it alone
             try:
                 await post_tournament_sticky(guild, team_key, info, db)
             except Exception as e:
@@ -993,25 +1027,37 @@ class TournamentAdminPanelView(discord.ui.View):
         )
 
 
-async def refresh_tournament_panel():
-    """Posts the tournament admin (Clear-button) panel if one isn't already up in the
-    target channel. Doesn't delete/repost on every startup — only posts a fresh one the
-    first time (or if the old one was deleted)."""
+async def repost_tournament_panel() -> None:
+    """Deletes the existing tournament admin panel (if any) and posts a fresh one with the
+    team dropdown rebuilt from the current DB. Called on startup and any time the team
+    list changes (create/delete/rename) so the dropdown never goes stale. Safe to call
+    repeatedly, same pattern as post_tournament_sticky."""
     channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
 
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
-            return  # panel already posted — leave it alone
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            break
 
     embed = discord.Embed(
         title=TOURNAMENT_PANEL_TITLE,
         description=(
+            "Pick a team from the dropdown to post (or refresh) the **Join Tournament** "
+            "sign-up message in that team's channel.\n\n"
             "**Clear** removes the tournament role from everyone, resets every team's "
             "sign-up list, and purges the announcement channel — staff only."
         ),
         colour=discord.Colour.gold(),
     )
-    await channel.send(embed=embed, view=TournamentAdminPanelView())
+    db = load_db()
+    await channel.send(embed=embed, view=TournamentAdminPanelView(db["teams"]))
+
+
+# Kept as an alias so the existing on_ready call site doesn't need to change.
+refresh_tournament_panel = repost_tournament_panel
 
 
 async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: discord.Guild, reason: str) -> bool:
@@ -1071,6 +1117,10 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
         await channel.delete(reason=reason)
 
     _team_channel_ids.discard(info["channel_id"])
+    try:
+        await repost_tournament_panel()
+    except Exception as e:
+        print(f"[ERROR] Failed to refresh tournament panel after deleting {team_name}: {e}")
 
     leader_id = info.get("leader_id")
     if leader_id is not None:
@@ -1655,9 +1705,9 @@ class ConfirmTeamView(discord.ui.View):
 
         _team_channel_ids.add(team_channel.id)
         try:
-            await post_tournament_sticky(guild, self.team_name, db["teams"][self.team_name], db)
+            await repost_tournament_panel()
         except Exception as e:
-            print(f"[ERROR] Failed to post tournament sticky for new team {self.team_name}: {e}")
+            print(f"[ERROR] Failed to refresh tournament panel for new team {self.team_name}: {e}")
 
         await log_team_event(
             "🆕 Team Created",
@@ -2964,7 +3014,8 @@ async def staffchangesetting(
             db, team_key, kick.id, interaction.guild, reason=f"Kicked from team by staff member {interaction.user}"
         )
 
-    if changename and new_name.lower() != team_key.lower():
+    renamed = changename and new_name.lower() != team_key.lower()
+    if renamed:
         db["teams"][new_name] = info
         del db["teams"][team_key]
         team_key = new_name
@@ -2973,6 +3024,11 @@ async def staffchangesetting(
 
     save_db(db)
     await backup_db_to_log_channel()
+    if renamed or changeicon:
+        try:
+            await repost_tournament_panel()
+        except Exception as e:
+            print(f"[ERROR] Failed to refresh tournament panel after team settings change: {e}")
 
     changes = []
     if changename:
@@ -3915,7 +3971,8 @@ async def changeteamsettings(
             db, team_key, kick.id, interaction.guild, reason=f"Kicked from team by {interaction.user}"
         )
 
-    if changename and new_name.lower() != team_key.lower():
+    renamed = changename and new_name.lower() != team_key.lower()
+    if renamed:
         db["teams"][new_name] = info
         del db["teams"][team_key]
         team_key = new_name
@@ -3924,6 +3981,11 @@ async def changeteamsettings(
 
     save_db(db)
     await backup_db_to_log_channel()
+    if renamed or changeicon:
+        try:
+            await repost_tournament_panel()
+        except Exception as e:
+            print(f"[ERROR] Failed to refresh tournament panel after team settings change: {e}")
 
     changes = []
     if changename:
