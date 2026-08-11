@@ -4356,10 +4356,10 @@ sendtournament.autocomplete("teams")(multi_team_autocomplete)
 
 
 @bot.tree.command(
-    name="deletetournamentsignup",
-    description="(Staff) Delete the tournament sign-up message posted in this channel",
+    name="deletetournamentsignups",
+    description="(Staff) Delete the tournament sign-up message from every team channel that has one",
 )
-async def deletetournamentsignup(interaction: discord.Interaction):
+async def deletetournamentsignups(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     if not has_staff_role(interaction.user):
@@ -4367,45 +4367,44 @@ async def deletetournamentsignup(interaction: discord.Interaction):
         return
 
     db = load_db()
-    team_key = find_team_by_channel(db["teams"], interaction.channel_id)
-    if not team_key:
-        await interaction.followup.send(
-            "This doesn't look like a team channel — run this in the team channel that has "
-            "the sign-up message.",
-            ephemeral=True,
-        )
+    teams_with_signup = {
+        team_key: info for team_key, info in db["teams"].items() if info.get("tournament_message_id")
+    }
+    if not teams_with_signup:
+        await interaction.followup.send("No teams currently have a tournament sign-up message posted.", ephemeral=True)
         return
 
-    info = db["teams"][team_key]
-    message_id = info.get("tournament_message_id")
-    if not message_id:
-        await interaction.followup.send(
-            f"**{team_key}** doesn't currently have a tournament sign-up message posted here.",
-            ephemeral=True,
-        )
-        return
+    deleted = []
+    failed = []
+    for team_key, info in teams_with_signup.items():
+        channel = interaction.guild.get_channel(info.get("channel_id"))
+        message_id = info.get("tournament_message_id")
 
-    try:
-        msg = await interaction.channel.fetch_message(message_id)
-        await msg.delete()
-    except discord.NotFound:
-        pass  # already gone — still clean up the DB reference below
-    except discord.HTTPException:
-        await interaction.followup.send(
-            "Couldn't delete the sign-up message — check the bot's permissions in this channel.",
-            ephemeral=True,
-        )
-        return
+        if channel is not None:
+            try:
+                msg = await channel.fetch_message(message_id)
+                await msg.delete()
+            except discord.NotFound:
+                pass  # already gone — still clean up the DB reference below
+            except discord.HTTPException:
+                failed.append(team_key)
+                continue
 
-    info["tournament_message_id"] = None
+        info["tournament_message_id"] = None
+        deleted.append(team_key)
+
     save_db(db)
     await backup_db_to_log_channel()
 
-    await interaction.followup.send(
-        f"🗑️ Deleted **{team_key}**'s tournament sign-up message from this channel. It won't be "
-        f"re-stuck until you post it again from the tournament panel dropdown.",
-        ephemeral=True,
+    result = (
+        f"🗑️ Deleted the sign-up message from {len(deleted)} team channel(s): {', '.join(deleted)}."
+        if deleted
+        else "No sign-up messages were deleted."
     )
+    if failed:
+        result += f"\n⚠️ Couldn't delete for: {', '.join(failed)} — check the bot's permissions there."
+    result += "\nThey won't be re-stuck until posted again from the tournament panel dropdown."
+    await interaction.followup.send(result, ephemeral=True)
 
 
 # ---------- Question of the Day ----------
