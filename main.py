@@ -758,19 +758,15 @@ _tournament_sticky_last_repost: dict = {}
 
 
 def build_tournament_signup_content(signups: list) -> str:
-    """Builds the sticky '🏆 Tournament Sign-Ups' message body for a team channel.
-    `signups` is a list of user IDs, capped at TOURNAMENT_SIGNUP_CAP."""
-    lines = [
-        "# 🏆 Tournament Sign-Ups",
-        "Click the button below if you would like to play for the tournament!",
-        "",
-        f"**Signed up:** `{len(signups)}/{TOURNAMENT_SIGNUP_CAP}`",
-    ]
-    if signups:
-        lines += [f"• <@{uid}>" for uid in signups]
-    else:
-        lines.append("*Nobody's signed up yet.*")
-    return "\n".join(lines)
+    """Builds the sticky Tournament Sign-Ups message body for a team channel.
+    `signups` is a list of user IDs, capped at TOURNAMENT_SIGNUP_CAP. Only the count is
+    shown — signed-up players are tracked in the DB, not listed in the message."""
+    coin = "<:CompanyCoins:1528218837030535394>"
+    return (
+        f"{coin} **Tournament Sign-Ups** {coin}\n"
+        "Click the green button below, if you would like to play for the tournament!\n"
+        f"**Signed up: `{len(signups)}/{TOURNAMENT_SIGNUP_CAP}`**"
+    )
 
 
 def build_tournament_team_select_options(teams: dict) -> list[discord.SelectOption]:
@@ -1022,9 +1018,11 @@ class TournamentAdminPanelView(discord.ui.View):
 
 async def repost_tournament_panel() -> None:
     """Deletes the existing tournament admin panel (if any) and posts a fresh one with the
-    team dropdown rebuilt from the current DB. Called on startup and any time the team
-    list changes (create/delete/rename) so the dropdown never goes stale. Safe to call
-    repeatedly, same pattern as post_tournament_sticky."""
+    team dropdown rebuilt from the current DB. Call this whenever the team list changes
+    (create/delete/rename) so the dropdown doesn't go stale. Do NOT call this on every
+    startup/redeploy — use post_tournament_panel_if_missing() there instead, so the panel
+    isn't deleted and reposted (and doesn't lose its position in the channel) on every
+    restart."""
     channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
 
     async for msg in channel.history(limit=50):
@@ -1035,7 +1033,27 @@ async def repost_tournament_panel() -> None:
                 pass
             break
 
-    embed = discord.Embed(
+    db = load_db()
+    await channel.send(embed=_build_tournament_panel_embed(), view=TournamentAdminPanelView(db["teams"]))
+
+
+async def post_tournament_panel_if_missing() -> None:
+    """Posts the tournament admin panel only if one isn't already up in the target channel
+    (e.g. first boot, or the message was deleted). Called on every startup/redeploy instead
+    of repost_tournament_panel() — it deliberately leaves an existing panel (and its
+    dropdown) untouched so nothing gets deleted/resent just because the bot restarted."""
+    channel = bot.get_channel(TOURNAMENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(TOURNAMENT_PANEL_CHANNEL_ID)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
+            return  # panel already posted — leave it alone
+
+    db = load_db()
+    await channel.send(embed=_build_tournament_panel_embed(), view=TournamentAdminPanelView(db["teams"]))
+
+
+def _build_tournament_panel_embed() -> discord.Embed:
+    return discord.Embed(
         title=TOURNAMENT_PANEL_TITLE,
         description=(
             "Pick a team from the dropdown to post (or refresh) the **Join Tournament** "
@@ -1046,12 +1064,6 @@ async def repost_tournament_panel() -> None:
         ),
         colour=discord.Colour.gold(),
     )
-    db = load_db()
-    await channel.send(embed=embed, view=TournamentAdminPanelView(db["teams"]))
-
-
-# Kept as an alias so the existing on_ready call site doesn't need to change.
-refresh_tournament_panel = repost_tournament_panel
 
 
 async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: discord.Guild, reason: str) -> bool:
@@ -4504,7 +4516,7 @@ async def on_ready():
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
     try:
-        await refresh_tournament_panel()
+        await post_tournament_panel_if_missing()
     except discord.HTTPException as e:
         print(f"Failed to refresh tournament panel: {e}")
     try:
