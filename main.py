@@ -914,9 +914,10 @@ class TournamentAdminPanelView(discord.ui.View):
       sign-up message in ONE chosen team's channel at a time — sign-ups are no longer
       auto-sent to every team.
     - A Clear button that strips TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it,
-      resets every team's sign-up list, re-sticks the message for any team that already
-      had one (without creating new ones for teams that were never selected), and purges
-      TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle."""
+      resets every team's sign-up list in the DB, and purges
+      TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle. It does NOT
+      touch any team's sign-up sticky message; those are only posted/refreshed via the
+      dropdown above, or removed via /deletetournamentsignups."""
 
     def __init__(self, teams: dict | None = None):
         super().__init__(timeout=None)
@@ -993,14 +994,6 @@ class TournamentAdminPanelView(discord.ui.View):
         save_db(db)
         await backup_db_to_log_channel()
 
-        for team_key, info in db["teams"].items():
-            if not info.get("tournament_message_id"):
-                continue  # this team was never selected for sign-ups — leave it alone
-            try:
-                await post_tournament_sticky(guild, team_key, info, db)
-            except Exception as e:
-                print(f"[ERROR] Failed to reset tournament sticky for {team_key}: {e}")
-
         purge_channel = guild.get_channel(TOURNAMENT_CLEAR_PURGE_CHANNEL_ID) or bot.get_channel(
             TOURNAMENT_CLEAR_PURGE_CHANNEL_ID
         )
@@ -1048,7 +1041,8 @@ async def repost_tournament_panel() -> None:
             "Pick a team from the dropdown to post (or refresh) the **Join Tournament** "
             "sign-up message in that team's channel.\n\n"
             "**Clear** removes the tournament role from everyone, resets every team's "
-            "sign-up list, and purges the announcement channel — staff only."
+            "sign-up list, and purges the announcement channel — staff only. It doesn't "
+            "touch any posted sign-up messages."
         ),
         colour=discord.Colour.gold(),
     )
