@@ -769,14 +769,28 @@ def build_tournament_signup_content(signups: list) -> str:
     )
 
 
-def build_tournament_team_select_options(teams: dict) -> list[discord.SelectOption]:
-    """Builds the dropdown options for the tournament admin panel's team-select, one
-    per team (capped at Discord's 25-option limit), sorted alphabetically."""
-    options = [
+TOURNAMENT_TEAM_SELECT_PAGES = 2  # number of team-select dropdowns on the admin panel (25 teams each)
+
+
+def build_tournament_team_select_pages(teams: dict) -> list[list[discord.SelectOption]]:
+    """Splits every team into pages of up to 25 SelectOptions each (Discord's per-select
+    limit), sorted alphabetically. Always returns exactly TOURNAMENT_TEAM_SELECT_PAGES
+    pages (padding with an unselectable placeholder if there aren't enough teams to fill
+    them) so every dropdown's custom_id is always present on the panel — that keeps them
+    working across restarts even if the team count crosses a page boundary later. If you
+    ever have more teams than TOURNAMENT_TEAM_SELECT_PAGES * 25, add another page below."""
+    all_options = [
         discord.SelectOption(label=f"{info.get('emoji', '')} {name}".strip()[:100], value=name)
         for name, info in sorted(teams.items(), key=lambda kv: kv[0].lower())
     ]
-    return options[:25] or [discord.SelectOption(label="No teams yet", value="__none__")]
+    page_size = 25
+    pages = [all_options[i : i + page_size] for i in range(0, len(all_options), page_size)] or [[]]
+    while len(pages) < TOURNAMENT_TEAM_SELECT_PAGES:
+        pages.append([])
+    for page in pages:
+        if not page:
+            page.append(discord.SelectOption(label="— no teams on this page —", value="__none__"))
+    return pages[:TOURNAMENT_TEAM_SELECT_PAGES]
 
 
 class TournamentSignupView(discord.ui.View):
@@ -887,6 +901,9 @@ async def maybe_restick_tournament_message(message: discord.Message) -> None:
     if not info.get("tournament_message_id"):
         return  # this team doesn't have a sticky yet (shouldn't normally happen)
 
+    if len(info.get("tournament_signups", [])) >= TOURNAMENT_SIGNUP_CAP:
+        return  # full — leave it wherever it is instead of re-sticking; resumes once a spot opens up
+
     _tournament_sticky_last_repost[message.channel.id] = now
     try:
         await post_tournament_sticky(message.guild, team_key, info, db)
@@ -906,34 +923,50 @@ async def ensure_tournament_stickies() -> None:
 
 class TournamentAdminPanelView(discord.ui.View):
     """Staff-only utility panel for the tournament:
-    - A team-select dropdown that posts (or refreshes) the sticky "Join Tournament"
-      sign-up message in ONE chosen team's channel at a time — sign-ups are no longer
-      auto-sent to every team.
+    - Two team-select dropdowns (each covering up to 25 teams, so 50+ teams are covered
+      between the two) that post/refresh the sticky "Join Tournament" sign-up message in
+      ONE chosen team's channel at a time — sign-ups are no longer auto-sent to every team.
     - A Clear button that strips TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it,
       resets every team's sign-up list in the DB, and purges
       TOURNAMENT_CLEAR_PURGE_CHANNEL_ID — ready for the next tournament cycle. It does NOT
       touch any team's sign-up sticky message; those are only posted/refreshed via the
-      dropdown above, or removed via /deletetournamentsignups."""
+      dropdowns above, or removed via /deletetournamentsignups."""
 
     def __init__(self, teams: dict | None = None):
         super().__init__(timeout=None)
         if teams is None:
             teams = load_db()["teams"]
-        self.team_select.options = build_tournament_team_select_options(teams)
 
-    @discord.ui.select(
-        placeholder="Select a team to send the sign-up to...",
-        custom_id="tournament_team_select",
-        options=[discord.SelectOption(label="Loading...", value="__none__")],
-    )
-    async def team_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        pages = build_tournament_team_select_pages(teams)
+        for idx, page_options in enumerate(pages):
+            placeholder = (
+                "Select a team to send the sign-up to..."
+                if len(pages) == 1
+                else f"Select a team — dropdown {idx + 1} of {len(pages)}..."
+            )
+            select = discord.ui.Select(
+                placeholder=placeholder,
+                custom_id=f"tournament_team_select_{idx + 1}",
+                options=page_options,
+                min_values=1,
+                max_values=1,
+            )
+            select.callback = self._make_team_select_callback(select)
+            self.add_item(select)
+
+    def _make_team_select_callback(self, select: discord.ui.Select):
+        async def callback(interaction: discord.Interaction):
+            await self._handle_team_select(interaction, select.values[0] if select.values else "__none__")
+
+        return callback
+
+    async def _handle_team_select(self, interaction: discord.Interaction, team_name: str):
         if not has_staff_role(interaction.user):
             await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
             return
 
-        team_name = select.values[0]
         if team_name == "__none__":
-            await interaction.response.send_message("There are no teams to select yet.", ephemeral=True)
+            await interaction.response.send_message("There's nothing to select there.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
