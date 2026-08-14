@@ -3624,6 +3624,57 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+async def disable_team_premium(guild: discord.Guild, team_key: str, info: dict, reason: str) -> None:
+    """Reverts a team's role to its default (non-premium) look — drops the gradient
+    secondary colour and swaps the custom role icon back to the team's plain emoji — and
+    posts the disabled notice in the team's channel. Caller is responsible for setting
+    info['premium'] = False, saving the DB, and backing it up."""
+    role = guild.get_role(info.get("role_id"))
+    if role is not None:
+        try:
+            await role.edit(secondary_colour=None, display_icon=info.get("emoji"), reason=reason)
+        except discord.HTTPException:
+            try:
+                await role.edit(secondary_colour=None, reason=reason)
+            except discord.HTTPException as e:
+                print(f"[ERROR] Failed to revert role styling for {team_key}: {e}")
+
+    channel = guild.get_channel(info.get("channel_id"))
+    if channel is not None:
+        try:
+            await channel.send("<:SeaBanditPug:1528566122440294471> **Premium has been disabled.**")
+        except discord.HTTPException:
+            pass
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    had_premium_role = any(r.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2) for r in before.roles)
+    has_premium_role = any(r.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2) for r in after.roles)
+    if not (had_premium_role and not has_premium_role):
+        return  # nothing relevant changed (covers losing a boost, since that also drops the role)
+
+    db = load_db()
+    team_key = find_team_by_leader(db["teams"], after.id)
+    if not team_key:
+        return
+
+    info = db["teams"][team_key]
+    if not info.get("premium"):
+        return  # team never had premium styling applied — nothing to revert
+
+    info["premium"] = False
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    try:
+        await disable_team_premium(
+            after.guild, team_key, info, reason=f"{after} lost their premium role — team downgraded"
+        )
+    except Exception as e:
+        print(f"[ERROR] Failed to downgrade premium for {team_key}: {e}")
+
+
 @bot.tree.command(
     name="syncinvites",
     description="(Staff) Rebuild the invite database by rescanning the Invite Tracker channel's history",
