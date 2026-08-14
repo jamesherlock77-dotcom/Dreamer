@@ -3639,12 +3639,76 @@ async def disable_team_premium(guild: discord.Guild, team_key: str, info: dict, 
             except discord.HTTPException as e:
                 print(f"[ERROR] Failed to revert role styling for {team_key}: {e}")
 
+        reference_role = guild.get_role(REFERENCE_ROLE_ID)
+        if reference_role is not None:
+            try:
+                await role.edit(position=reference_role.position + 1, reason=reason)
+            except discord.HTTPException:
+                pass  # bot's own top role may be too low to move things this high; skip silently
+
     channel = guild.get_channel(info.get("channel_id"))
     if channel is not None:
         try:
             await channel.send("<:SeaBanditPug:1528566122440294471> **Premium has been disabled.**")
         except discord.HTTPException:
             pass
+
+
+async def audit_premium_teams() -> None:
+    """Startup pass: for every team with premium styling active, verifies the team leader
+    still holds one of the premium-granting roles (PREMIUM_ROLE_ID / PREMIUM_ROLE_ID_2). If
+    they don't — e.g. they unboosted, lost the role, or left the server while the bot was
+    offline — downgrades the team back to default, same as the live on_member_update check
+    below. This just catches anything missed while the bot wasn't running."""
+    db = load_db()
+    if not db["teams"]:
+        return
+
+    guild = None
+    downgraded = 0
+    for team_key, info in db["teams"].items():
+        if not info.get("premium"):
+            continue
+
+        channel_id = info.get("channel_id")
+        if guild is None and channel_id is not None:
+            try:
+                # all teams live in one guild for this bot; grab it from any known channel
+                seed_channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                guild = seed_channel.guild
+            except discord.HTTPException:
+                continue
+        if guild is None:
+            continue
+
+        leader_id = info.get("leader_id")
+        leader = guild.get_member(leader_id) if leader_id is not None else None
+        if leader is None and leader_id is not None:
+            try:
+                leader = await guild.fetch_member(leader_id)
+            except discord.HTTPException:
+                leader = None  # left the server, or otherwise unresolvable — treat as no access
+
+        has_premium_role = leader is not None and any(
+            r.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2) for r in leader.roles
+        )
+        if has_premium_role:
+            continue
+
+        info["premium"] = False
+        try:
+            await disable_team_premium(
+                guild, team_key, info,
+                reason="Team leader no longer holds a premium role (checked on startup)",
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to downgrade premium for {team_key} on startup: {e}")
+        downgraded += 1
+
+    if downgraded:
+        save_db(db)
+        await backup_db_to_log_channel()
+        print(f"Downgraded premium styling for {downgraded} team(s) whose leader no longer has a premium role.")
 
 
 @bot.event
@@ -4595,6 +4659,10 @@ async def on_ready():
         await sync_existing_teams()
     except discord.HTTPException as e:
         print(f"Failed to sync existing teams (leader role/permissions): {e}")
+    try:
+        await audit_premium_teams()
+    except Exception as e:
+        print(f"Failed to audit premium teams: {e}")
     try:
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
