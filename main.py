@@ -61,12 +61,19 @@ TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission excep
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
 
+SCRIM_CATEGORY_ID = 1537952629131444244     # category /startscrim channels are created in
+SCRIM_LOG_CHANNEL_ID = 1537897056218386462  # scrims JSON "database" message lives here
+SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
+SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
+SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
+
 TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
 GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
+SCRIMS_DB_FILE = "scrims_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -137,6 +144,11 @@ pending_team_requests: set = set()
 # for whichever invite (if any) that leader currently has outstanding. Used to stop a
 # leader from having more than one invite pending at the same time.
 pending_invites: dict = {}
+
+# Challenger leader user ID -> {"opponent_team": ..., "opponent_leader_id": ..., "dm_channel_id": ...,
+# "dm_message_id": ...} for whichever /startscrim request (if any) that leader currently has
+# outstanding. Used to stop a leader from having more than one scrim request pending at once.
+pending_scrim_requests: dict = {}
 
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
@@ -2015,6 +2027,230 @@ class InviteResponseView(discord.ui.View):
                 pass
 
 
+async def _cancel_pending_scrim_request(leader_id: int, note: str = "This scrim request was cancelled.") -> dict | None:
+    """Clears leader_id's pending-scrim-request record (if any) and, if the DM message can
+    still be found, disables its buttons and appends note to it. Returns the cleared record,
+    or None if there wasn't one."""
+    pending = pending_scrim_requests.pop(leader_id, None)
+    if pending is None:
+        return None
+    try:
+        channel = bot.get_channel(pending["dm_channel_id"]) or await bot.fetch_channel(pending["dm_channel_id"])
+        msg = await channel.fetch_message(pending["dm_message_id"])
+        view = discord.ui.View.from_message(msg)
+        for child in view.children:
+            child.disabled = True
+        await msg.edit(content=f"{msg.content}\n\n_{note}_", view=view)
+    except discord.HTTPException:
+        pass
+    return pending
+
+
+class ScrimResponseView(discord.ui.View):
+    def __init__(self, challenger_team: str, challenger_leader_id: int, opponent_team: str, opponent_leader_id: int, guild_id: int):
+        super().__init__(timeout=86400)  # 24h to respond
+        self.challenger_team = challenger_team
+        self.challenger_leader_id = challenger_leader_id
+        self.opponent_team = opponent_team
+        self.opponent_leader_id = opponent_leader_id
+        self.guild_id = guild_id
+        self.message: discord.Message = None  # set by the caller after sending
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.opponent_leader_id:
+            await interaction.response.send_message("This scrim request isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    def _clear_pending(self):
+        # Only clear the challenger's pending slot if it's still tracking *this* request —
+        # avoids wiping out a newer request the challenger may have sent after this resolved.
+        pending = pending_scrim_requests.get(self.challenger_leader_id)
+        if pending and pending.get("opponent_team") == self.opponent_team:
+            pending_scrim_requests.pop(self.challenger_leader_id, None)
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        db = load_db()
+        challenger_info = db["teams"].get(self.challenger_team)
+        opponent_info = db["teams"].get(self.opponent_team)
+        if challenger_info is None or opponent_info is None:
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(interaction, content="One of these teams no longer exists.", view=self)
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        category = guild.get_channel(SCRIM_CATEGORY_ID)
+        if category is None:
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(interaction, content="The scrim category no longer exists — ask staff to check the bot config.", view=self)
+            return
+
+        challenger_role = guild.get_role(challenger_info["role_id"])
+        opponent_role = guild.get_role(opponent_info["role_id"])
+        challenger_leader = guild.get_member(self.challenger_leader_id) or await guild.fetch_member(self.challenger_leader_id)
+        opponent_leader = guild.get_member(self.opponent_leader_id) or await guild.fetch_member(self.opponent_leader_id)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, manage_channels=True, mention_everyone=True
+            ),
+        }
+        if challenger_role is not None:
+            overwrites[challenger_role] = scrim_member_channel_overwrite()
+        if opponent_role is not None:
+            overwrites[opponent_role] = scrim_member_channel_overwrite()
+        if challenger_leader is not None:
+            overwrites[challenger_leader] = scrim_leader_channel_overwrite()
+        if opponent_leader is not None:
+            overwrites[opponent_leader] = scrim_leader_channel_overwrite()
+
+        try:
+            scrim_channel = await guild.create_text_channel(
+                name=SCRIM_CHANNEL_NAME,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Scrim accepted between {self.challenger_team} and {self.opponent_team}",
+            )
+        except discord.HTTPException as e:
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(interaction, content=f"Failed to create the scrim channel: {e}", view=self)
+            return
+
+        created_dt = discord.utils.utcnow()
+        delete_dt = created_dt + timedelta(days=SCRIM_DURATION_DAYS)
+
+        ping_bits = []
+        if challenger_role is not None:
+            ping_bits.append(challenger_role.mention)
+        if opponent_role is not None:
+            ping_bits.append(opponent_role.mention)
+
+        await scrim_channel.send(
+            f"{' '.join(ping_bits)}\n"
+            f"🎯 **{self.challenger_team}** vs **{self.opponent_team}** — the scrim is on!\n"
+            f"This channel will automatically be deleted "
+            f"{discord.utils.format_dt(delete_dt, style='F')} ({discord.utils.format_dt(delete_dt, style='R')}).",
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
+
+        scrim_db = load_scrim_db()
+        scrim_db["scrims"][str(scrim_channel.id)] = {
+            "channel_id": scrim_channel.id,
+            "guild_id": guild.id,
+            "team_a": self.challenger_team,
+            "team_a_leader_id": self.challenger_leader_id,
+            "team_b": self.opponent_team,
+            "team_b_leader_id": self.opponent_leader_id,
+            "created_ts": int(created_dt.timestamp()),
+            "delete_ts": int(delete_dt.timestamp()),
+        }
+        save_scrim_db(scrim_db)
+        await backup_scrim_db_to_log_channel()
+
+        self._clear_pending()
+
+        await log_team_event(
+            "🎯 Scrim Accepted",
+            colour=discord.Colour.green(),
+            fields=[
+                ("Team A", self.challenger_team, True),
+                ("Team B", self.opponent_team, True),
+                ("Channel", scrim_channel.mention, True),
+                ("Deletes", discord.utils.format_dt(delete_dt, style='F'), True),
+            ],
+        )
+
+        for child in self.children:
+            child.disabled = True
+        await safe_edit_original_response(
+            interaction,
+            content=f"Scrim accepted! Channel created: {scrim_channel.mention}",
+            view=self,
+        )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._clear_pending()
+        for child in self.children:
+            child.disabled = True
+        await log_team_event(
+            "❌ Scrim Declined",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team A", self.challenger_team, True),
+                ("Team B", self.opponent_team, True),
+            ],
+        )
+        await interaction.response.edit_message(content="Scrim declined.", view=self)
+
+        challenger_leader = bot.get_user(self.challenger_leader_id)
+        try:
+            if challenger_leader is not None:
+                await challenger_leader.send(f"**{self.opponent_team}** declined your scrim request.")
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self):
+        # The opponent leader never responded within 24h — free up the challenger's pending
+        # slot and disable the stale buttons, same as an explicit decline.
+        self._clear_pending()
+        for child in self.children:
+            child.disabled = True
+        await log_team_event(
+            "⌛ Scrim Request Expired",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team A", self.challenger_team, True),
+                ("Team B", self.opponent_team, True),
+            ],
+        )
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+class CancelScrimRequestView(discord.ui.View):
+    """Shown ephemerally to a leader who tries to send a second scrim request while one is
+    already pending — lets them cancel the outstanding one instead."""
+
+    def __init__(self, leader_id: int):
+        super().__init__(timeout=60)
+        self.leader_id = leader_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message("This isn't your scrim request to cancel.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel Request", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pending = await _cancel_pending_scrim_request(
+            self.leader_id, note="This scrim request was cancelled by the challenger."
+        )
+        if pending is None:
+            await interaction.response.edit_message(content="That request was already resolved.", view=None)
+            return
+        await log_team_event(
+            "🚫 Scrim Request Cancelled",
+            colour=discord.Colour.orange(),
+            fields=[("Cancelled By", f"<@{self.leader_id}> (`{self.leader_id}`)", True)],
+        )
+        await interaction.response.edit_message(content="Scrim request cancelled.", view=None)
+
+
 # ============================================================
 # GIVEAWAYS — state, embed, join button, and background ender
 # ============================================================
@@ -2222,6 +2458,50 @@ async def check_giveaways():
 
 @check_giveaways.before_loop
 async def before_check_giveaways():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=SCRIM_CHECK_INTERVAL_MINUTES)
+async def check_scrim_expiry():
+    scrim_db = load_scrim_db()
+    scrims = scrim_db.get("scrims", {})
+    if not scrims:
+        return
+
+    now_ts = int(discord.utils.utcnow().timestamp())
+    changed = False
+
+    for channel_id_str, info in list(scrims.items()):
+        if info.get("delete_ts", 0) > now_ts:
+            continue
+
+        guild = bot.get_guild(info.get("guild_id"))
+        channel = guild.get_channel(info["channel_id"]) if guild else bot.get_channel(info["channel_id"])
+        if channel is not None:
+            try:
+                await channel.delete(reason=f"Scrim between {info.get('team_a')} and {info.get('team_b')} expired")
+            except discord.HTTPException:
+                pass
+
+        scrims.pop(channel_id_str, None)
+        changed = True
+
+        await log_team_event(
+            "🗑️ Scrim Channel Auto-Deleted",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team A", info.get("team_a", "Unknown"), True),
+                ("Team B", info.get("team_b", "Unknown"), True),
+            ],
+        )
+
+    if changed:
+        save_scrim_db(scrim_db)
+        await backup_scrim_db_to_log_channel()
+
+
+@check_scrim_expiry.before_loop
+async def before_check_scrim_expiry():
     await bot.wait_until_ready()
 
 
@@ -2778,6 +3058,98 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
     }
 
     await interaction.followup.send(f"Invite sent to {user.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="startscrim", description="Challenge another team's leader to a scrim")
+@app_commands.describe(team="The team you want to scrim")
+async def startscrim(interaction: discord.Interaction, team: str):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+    challenger_team = find_team_by_leader(db["teams"], interaction.user.id)
+    if not challenger_team:
+        await interaction.followup.send("You must be a team leader to start a scrim.", ephemeral=True)
+        return
+
+    opponent_team = find_team_key_ci(db["teams"], team)
+    if not opponent_team:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    if opponent_team == challenger_team:
+        await interaction.followup.send("You can't scrim your own team.", ephemeral=True)
+        return
+
+    # Only one outstanding scrim request per leader at a time — if they already have one
+    # pending, give them a way to cancel it instead of letting them queue up another.
+    if interaction.user.id in pending_scrim_requests:
+        await interaction.followup.send(
+            "You already have a pending scrim request. Click the red button below to cancel.",
+            view=CancelScrimRequestView(interaction.user.id),
+            ephemeral=True,
+        )
+        return
+
+    opponent_info = db["teams"][opponent_team]
+    opponent_leader_id = opponent_info.get("leader_id")
+    if opponent_leader_id is None:
+        await interaction.followup.send(f"**{opponent_team}** doesn't have a leader on record.", ephemeral=True)
+        return
+
+    opponent_leader = interaction.guild.get_member(opponent_leader_id) or await interaction.guild.fetch_member(opponent_leader_id)
+
+    view = ScrimResponseView(challenger_team, interaction.user.id, opponent_team, opponent_leader_id, interaction.guild.id)
+    try:
+        sent = await opponent_leader.send(
+            f"**{challenger_team}** (challenged by {interaction.user.mention}) wants to scrim your team, "
+            f"**{opponent_team}**! Would you like to accept?",
+            view=view,
+        )
+    except discord.Forbidden:
+        await log_team_event(
+            "⚠️ Scrim Request Failed (DMs Closed)",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team A", challenger_team, True),
+                ("Team B", opponent_team, True),
+                ("Requested By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
+        await interaction.followup.send(
+            f"Couldn't DM {opponent_team}'s leader (they may have DMs off).", ephemeral=True
+        )
+        return
+
+    await log_team_event(
+        "📨 Scrim Request Sent",
+        colour=discord.Colour.blue(),
+        fields=[
+            ("Team A", challenger_team, True),
+            ("Team B", opponent_team, True),
+            ("Requested By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
+
+    view.message = sent
+    pending_scrim_requests[interaction.user.id] = {
+        "opponent_team": opponent_team,
+        "opponent_leader_id": opponent_leader_id,
+        "dm_channel_id": sent.channel.id,
+        "dm_message_id": sent.id,
+    }
+
+    await interaction.followup.send(f"Scrim request sent to {opponent_team}'s leader.", ephemeral=True)
+
+
+@startscrim.autocomplete("team")
+async def startscrim_team_autocomplete(interaction: discord.Interaction, current: str):
+    db = load_db()
+    own_team = find_team_by_leader(db["teams"], interaction.user.id)
+    return [
+        app_commands.Choice(name=key, value=key)
+        for key in db["teams"].keys()
+        if current.lower() in key.lower() and key != own_team
+    ][:25]
 
 
 @bot.tree.command(name="leaveteam", description="Leave your current team")
@@ -3600,6 +3972,77 @@ async def restore_invite_db_from_log_channel():
         print("Restored invite db from log channel backup.")
     else:
         print("No existing invite db backup found — starting fresh.")
+
+
+# ============================================================
+# SCRIMS — /startscrim challenges another team's leader by DM;
+# if they accept, a temporary 🎯┃scrim channel is created that
+# both teams can see and type in, and it auto-deletes itself
+# SCRIM_DURATION_DAYS days after creation.
+# ============================================================
+
+def load_scrim_db() -> dict:
+    if not os.path.exists(SCRIMS_DB_FILE):
+        return {"scrims": {}}
+    with open(SCRIMS_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("scrims", {})
+    return data
+
+
+def save_scrim_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(SCRIMS_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_scrim_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(SCRIM_LOG_CHANNEL_ID, SCRIMS_DB_FILE, SCRIMS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up scrim db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill anything else
+        print(f"Unexpected error backing up scrim db: {e}")
+
+
+async def restore_scrim_db_from_log_channel():
+    if os.path.exists(SCRIMS_DB_FILE):
+        # Local data already present (e.g. a crash-restart, not a fresh container) — push
+        # it straight to the log channel so the backup there is confirmed up to date.
+        await backup_scrim_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(SCRIM_LOG_CHANNEL_ID, SCRIMS_DB_FILE, SCRIMS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore scrim db from log channel: {e}")
+        found = False
+    if found:
+        print("Restored scrim db from log channel backup.")
+    else:
+        print("No existing scrim db backup found — starting fresh.")
+
+
+def scrim_leader_channel_overwrite() -> discord.PermissionOverwrite:
+    """Permissions granted to each team's leader in their scrim channel: on top of
+    viewing/sending, mention_everyone lets them ping their own team's role even though
+    the role itself isn't set to be mentionable."""
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        mention_everyone=True,
+    )
+
+
+def scrim_member_channel_overwrite() -> discord.PermissionOverwrite:
+    """Basic permissions granted to every other member of both teams in a scrim
+    channel: they can see it, type in it, and read history, but not ping roles."""
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        add_reactions=True,
+    )
 
 
 async def _process_invite_tracker_message(message: discord.Message) -> None:
@@ -4687,6 +5130,7 @@ async def on_ready():
     await restore_ticket_db_from_log_channel()
     await restore_meta_version_from_log_channel()
     await restore_invite_db_from_log_channel()
+    await restore_scrim_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
     bot.add_view(TournamentAdminPanelView())
@@ -4717,6 +5161,8 @@ async def on_ready():
         check_giveaways.start()
     if not meta_poll_loop.is_running():
         meta_poll_loop.start()
+    if not check_scrim_expiry.is_running():
+        check_scrim_expiry.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
