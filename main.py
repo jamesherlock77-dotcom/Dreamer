@@ -56,6 +56,7 @@ TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the stick
 TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
+TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission except channel/permission management in every team channel
 
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
@@ -465,6 +466,22 @@ def team_channel_full_access_overwrite() -> discord.PermissionOverwrite:
     """Every permission, allowed — granted to TEAM_CHANNEL_FULL_ACCESS_ROLE_ID in every
     team channel."""
     return discord.PermissionOverwrite.from_pair(discord.Permissions.all(), discord.Permissions.none())
+
+
+def team_channel_viewer_overwrite() -> discord.PermissionOverwrite:
+    """Every permission except channel/permission management, allowed — granted to
+    TEAM_CHANNEL_VIEWER_ROLE_ID in every team channel. Lets holders see and fully interact
+    with every team channel without being able to manage the channel, its permissions, or
+    webhooks."""
+    allow = discord.Permissions.all()
+    allow.update(
+        administrator=False,
+        manage_channels=False,
+        manage_permissions=False,
+        manage_roles=False,
+        manage_webhooks=False,
+    )
+    return discord.PermissionOverwrite.from_pair(allow, discord.Permissions.none())
 
 
 # Preset palette offered in /premiumteamsettings' colour1/colour2 dropdowns (Discord caps choices at 25).
@@ -1271,10 +1288,11 @@ async def perform_leader_promotion(
 async def sync_existing_teams():
     """Backfill pass run on every startup: makes sure every current team leader holds
     TEAM_LEADER_ROLE_ID and has the manage-messages/mention-everyone overrides in their
-    own team channel (so they can ping the team, delete messages, and pin messages), and
-    that TEAM_CHANNEL_FULL_ACCESS_ROLE_ID has every permission in every team channel.
-    Idempotent — cheap after the first run, and self-heals if a permission or role is
-    ever reverted manually."""
+    own team channel (so they can ping the team, delete messages, and pin messages), that
+    TEAM_CHANNEL_FULL_ACCESS_ROLE_ID has every permission in every team channel, and that
+    TEAM_CHANNEL_VIEWER_ROLE_ID has every permission except channel/permission management
+    in every team channel. Idempotent — cheap after the first run, and self-heals if a
+    permission or role is ever reverted manually."""
     db = load_db()
     if not db["teams"]:
         return
@@ -1283,6 +1301,7 @@ async def sync_existing_teams():
     leader_role_granted = 0
     perms_updated = 0
     full_access_updated = 0
+    viewer_access_updated = 0
 
     for team_name, info in db["teams"].items():
         leader_id = info.get("leader_id")
@@ -1314,6 +1333,20 @@ async def sync_existing_teams():
                             reason=f"Backfilled full-access role permissions for existing team {team_name}",
                         )
                         full_access_updated += 1
+                    except discord.HTTPException:
+                        pass
+
+            viewer_role = guild.get_role(TEAM_CHANNEL_VIEWER_ROLE_ID)
+            if viewer_role is not None:
+                allow, _deny = channel.overwrites_for(viewer_role).pair()
+                if allow != team_channel_viewer_overwrite().pair()[0]:
+                    try:
+                        await channel.set_permissions(
+                            viewer_role,
+                            overwrite=team_channel_viewer_overwrite(),
+                            reason=f"Backfilled viewer role permissions for existing team {team_name}",
+                        )
+                        viewer_access_updated += 1
                     except discord.HTTPException:
                         pass
 
@@ -1350,11 +1383,12 @@ async def sync_existing_teams():
                 except discord.HTTPException:
                     pass
 
-    if leader_role_granted or perms_updated or full_access_updated:
+    if leader_role_granted or perms_updated or full_access_updated or viewer_access_updated:
         print(
             f"Backfilled team-leader role onto {leader_role_granted} leader(s), channel "
-            f"permissions onto {perms_updated} leader(s), and full-access role permissions "
-            f"onto {full_access_updated} team channel(s)."
+            f"permissions onto {perms_updated} leader(s), full-access role permissions "
+            f"onto {full_access_updated} team channel(s), and viewer role permissions onto "
+            f"{viewer_access_updated} team channel(s)."
         )
 
 
@@ -1684,6 +1718,10 @@ class ConfirmTeamView(discord.ui.View):
         full_access_role = guild.get_role(TEAM_CHANNEL_FULL_ACCESS_ROLE_ID)
         if full_access_role is not None:
             overwrites[full_access_role] = team_channel_full_access_overwrite()
+
+        viewer_role = guild.get_role(TEAM_CHANNEL_VIEWER_ROLE_ID)
+        if viewer_role is not None:
+            overwrites[viewer_role] = team_channel_viewer_overwrite()
 
         channel_name = f"{self.emoji}┃{self.team_name}-Team"
         try:
