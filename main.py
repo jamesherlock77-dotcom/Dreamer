@@ -4804,7 +4804,7 @@ async def startgiveaway(
     description="(Staff) Send a message to every team's channel",
 )
 @app_commands.describe(
-    message="The message to send to every team channel",
+    message="The message to send to every team channel. Use (team) to ping that team's role, e.g. '(team) hi'",
     exclude1="Team to exclude from this broadcast (optional)",
     exclude2="Team to exclude from this broadcast (optional)",
     exclude3="Team to exclude from this broadcast (optional)",
@@ -4855,8 +4855,13 @@ async def globalteammessage(
         if channel is None:
             failed_teams.append(team_name)
             continue
+
+        role = interaction.guild.get_role(info.get("role_id"))
+        role_mention = role.mention if role is not None else f"**{team_name}**"
+        text = message.replace("(team)", role_mention)
+
         try:
-            await channel.send(content=message)
+            await channel.send(content=text, allowed_mentions=discord.AllowedMentions(roles=True))
             sent += 1
         except discord.HTTPException:
             failed_teams.append(team_name)
