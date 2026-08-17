@@ -776,27 +776,41 @@ async def refresh_support_ticket_panel():
 # ---------- Roles panel (self-role dropdown) ----------
 ROLES_PANEL_TITLE = "Animal Company: Arena Hub Roles"
 
+# value -> (label, PartialEmoji, role_id)
+ROLES_PANEL_OPTIONS = {
+    "announcements": ("Announcements", discord.PartialEmoji(name="Trophy", id=1528217005390565429), 1528140386197831800),
+    "social_media": ("Social Media", discord.PartialEmoji(name="Ogre", id=1538745742192021605), 1528141360182333491),
+    "tournaments": ("Tournaments", discord.PartialEmoji(name="CompanyCoins", id=1528218837030535394), 1528140502665531543),
+    "qotd": ("Question Of The Day", discord.PartialEmoji(name="Pineapple", id=1528219371263234222), 1535432839548506163),
+    "ac_leaks": ("AC Leaks", discord.PartialEmoji(name="Ruby", id=1528216929259753575), 1528140437573996724),
+}
+
 
 class RolesPanelView(discord.ui.LayoutView):
     """A Components V2 container styled like MetaUpdateView/TeamMembersView elsewhere in
     the bot — accent-bordered card with a title, description, self-role dropdown, and the
-    hub banner, instead of a plain embed. Placeholder option only for now — swap the
-    `options=[...]` list below for the real roles once they're decided, and give
-    `select_roles_callback` real add/remove-role logic instead of the "not configured yet"
-    reply."""
+    hub banner, instead of a plain embed. The dropdown is a toggle-style multi-select: ping
+    roles the user already has come up selected implicitly by them re-picking them, and
+    submitting adds every checked role + removes every unchecked one from ROLES_PANEL_OPTIONS."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
         description = (
             "Here you can pick up roles for pings, notifications, and more. Use the "
-            "dropdown below to add or remove roles for yourself.\n\n"
+            "dropdown below to add or remove roles for yourself — pick everything you "
+            "want pings for and submit; anything you leave unchecked gets removed.\n\n"
             "Not sure what a role does? Ask staff before grabbing one."
         )
 
         select = discord.ui.Select(
             placeholder="Choose an option",
-            options=[discord.SelectOption(label="Roles coming soon", value="__none__")],
+            min_values=0,
+            max_values=len(ROLES_PANEL_OPTIONS),
+            options=[
+                discord.SelectOption(label=label, value=value, emoji=emoji)
+                for value, (label, emoji, _role_id) in ROLES_PANEL_OPTIONS.items()
+            ],
             custom_id="roles_panel_select",
         )
         select.callback = self._make_select_callback(select)
@@ -817,13 +831,40 @@ class RolesPanelView(discord.ui.LayoutView):
 
     def _make_select_callback(self, select: discord.ui.Select):
         async def callback(interaction: discord.Interaction):
-            if select.values and select.values[0] == "__none__":
-                await interaction.response.send_message(
-                    "Roles haven't been set up here yet — check back soon!", ephemeral=True
-                )
-                return
-            # TODO: once real options are added above, toggle the corresponding role(s) here.
-            await interaction.response.send_message("Roles aren't configured yet.", ephemeral=True)
+            member = interaction.user
+            selected = set(select.values)
+
+            to_add = []
+            to_remove = []
+            missing_roles = []
+            for value, (label, _emoji, role_id) in ROLES_PANEL_OPTIONS.items():
+                role = interaction.guild.get_role(role_id)
+                if not role:
+                    missing_roles.append(label)
+                    continue
+                has_role = role in member.roles
+                wants_role = value in selected
+                if wants_role and not has_role:
+                    to_add.append(role)
+                elif not wants_role and has_role:
+                    to_remove.append(role)
+
+            if to_add:
+                await member.add_roles(*to_add, reason="Self-role panel selection")
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Self-role panel selection")
+
+            parts = []
+            if to_add:
+                parts.append("✅ Added: " + ", ".join(r.mention for r in to_add))
+            if to_remove:
+                parts.append("➖ Removed: " + ", ".join(r.mention for r in to_remove))
+            if missing_roles:
+                parts.append("⚠️ Couldn't find these roles on the server (ask staff): " + ", ".join(missing_roles))
+            if not parts:
+                parts.append("No changes made.")
+
+            await interaction.response.send_message("\n".join(parts), ephemeral=True)
 
         return callback
 
