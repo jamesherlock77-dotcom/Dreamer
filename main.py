@@ -15,6 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from playwright.async_api import async_playwright
+from PIL import Image, ImageDraw, ImageFont
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
 # the interaction (e.g. the user typed another character before the bot replied).
@@ -60,6 +61,14 @@ TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission excep
 
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
+
+# ---------- All-Time Champions leaderboard config ----------
+LEADERBOARD_CHANNEL_ID = 1538760552585895936        # TODO: set this — channel where the leaderboard image + staff panel are posted
+LEADERBOARD_LOG_CHANNEL_ID = 1538314631938965517    # TODO: set this — channel where the win-count JSON "database" message lives
+LEADERBOARD_DB_FILE = "leaderboard_data.json"
+LEADERBOARD_TITLE = "All-Time Champions"
+LEADERBOARD_IMAGE_FILENAME = "leaderboard.png"
+LEADERBOARD_MAX_ENTRIES = 10  # how many teams are shown on the graphic (2 columns of 5)
 
 SCRIM_CATEGORY_ID = 1537952629131444244     # category /startscrim channels are created in
 SCRIM_LOG_CHANNEL_ID = 1537897056218386462  # scrims JSON "database" message lives here
@@ -5047,6 +5056,331 @@ async def deletetournamentsignups(interaction: discord.Interaction):
     await interaction.followup.send(result, ephemeral=True)
 
 
+# ============================================================
+# All-Time Champions leaderboard — a manually-maintained, staff-updated image
+# leaderboard of team win totals. Teams here are freeform (typed by staff), NOT
+# pulled from the bot's live /createteam roster, since "all-time" winners may
+# include teams that no longer exist. Wins are set by hand via the staff panel.
+#
+# NOTE ON THE ARTWORK: this renders a close visual approximation of the
+# reference design (dark rounded rows, numbered badges, orange-toned backdrop)
+# using Pillow — it does NOT include the specific "Animal Company Arena"
+# character/background art from the reference image, since that asset wasn't
+# provided. Drop a background image at LEADERBOARD_BACKGROUND_PATH (see below)
+# and it'll be used automatically; otherwise a generated gradient is used.
+# ============================================================
+
+LEADERBOARD_BACKGROUND_PATH = os.path.join(BASE_DIR, "leaderboard_background.png")
+
+# Pillow ships without any font files, so we look for a common system font first
+# and fall back to Pillow's built-in bitmap font (functional but plain) if none
+# of these paths exist on the host. Drop a .ttf next to this file and add its
+# path here (first in the list) to use a specific brand font.
+_LEADERBOARD_FONT_CANDIDATES = [
+    os.path.join(BASE_DIR, "leaderboard_font.ttf"),  # optional: bring your own bold font
+    os.path.join(BASE_DIR, "leaderboard_font_bold.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
+def _load_leaderboard_font(size: int) -> ImageFont.FreeTypeFont:
+    for path in _LEADERBOARD_FONT_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default(size=size)
+
+
+def load_leaderboard_db() -> dict:
+    if not os.path.exists(LEADERBOARD_DB_FILE):
+        return {"teams": {}}
+    with open(LEADERBOARD_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("teams", {})
+    return data
+
+
+def save_leaderboard_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    with open(LEADERBOARD_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+async def backup_leaderboard_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(LEADERBOARD_LOG_CHANNEL_ID, LEADERBOARD_DB_FILE, LEADERBOARD_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up leaderboard db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill anything else
+        print(f"Unexpected error backing up leaderboard db: {e}")
+
+
+async def restore_leaderboard_db_from_log_channel():
+    if os.path.exists(LEADERBOARD_DB_FILE):
+        await backup_leaderboard_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(LEADERBOARD_LOG_CHANNEL_ID, LEADERBOARD_DB_FILE, LEADERBOARD_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore leaderboard db from log channel: {e}")
+        found = False
+    if found:
+        print("Restored leaderboard db from log channel backup.")
+    else:
+        print("No existing leaderboard db backup found — starting fresh.")
+
+
+def _ranked_leaderboard_teams(teams: dict) -> list[tuple[str, int]]:
+    """Sorted (team_name, wins) pairs, highest wins first, ties broken alphabetically
+    for a stable/predictable order."""
+    return sorted(teams.items(), key=lambda kv: (-int(kv[1]), kv[0].lower()))
+
+
+def render_leaderboard_image(teams: dict) -> io.BytesIO:
+    """Draws the All-Time Champions graphic (top LEADERBOARD_MAX_ENTRIES teams, two
+    columns of five) and returns it as an in-memory PNG."""
+    width, height = 952, 556
+    gold = (247, 197, 72)
+    white = (255, 255, 255)
+    row_fill = (25, 22, 30, 175)  # semi-transparent dark rows, like the reference
+
+    if os.path.exists(LEADERBOARD_BACKGROUND_PATH):
+        base = Image.open(LEADERBOARD_BACKGROUND_PATH).convert("RGBA").resize((width, height))
+    else:
+        # Generated approximation: a warm orange-to-dark gradient backdrop.
+        base = Image.new("RGBA", (width, height), (30, 20, 15, 255))
+        grad = Image.new("RGBA", (width, height))
+        gdraw = ImageDraw.Draw(grad)
+        top = (214, 120, 30)
+        bottom = (40, 24, 16)
+        for y in range(height):
+            t = y / max(height - 1, 1)
+            r = int(top[0] + (bottom[0] - top[0]) * t)
+            g = int(top[1] + (bottom[1] - top[1]) * t)
+            b = int(top[2] + (bottom[2] - top[2]) * t)
+            gdraw.line([(0, y), (width, y)], fill=(r, g, b, 255))
+        base = Image.alpha_composite(base, grad)
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Dark translucent title bar
+    draw.rectangle([0, 0, width, 108], fill=(20, 16, 20, 200))
+    title_font = _load_leaderboard_font(46)
+    draw.text((36, 28), LEADERBOARD_TITLE, font=title_font, fill=white)
+    draw.line([(36, 100), (width - 36, 100)], fill=(255, 255, 255, 120), width=2)
+
+    ranked = _ranked_leaderboard_teams(teams)[:LEADERBOARD_MAX_ENTRIES]
+
+    name_font = _load_leaderboard_font(24)
+    wins_font = _load_leaderboard_font(24)
+    rank_font = _load_leaderboard_font(22)
+
+    col_x = [36, width // 2 + 8]
+    row_h = 76
+    row_w = width // 2 - 44
+    top_y = 132
+
+    for idx, (team_name, wins) in enumerate(ranked):
+        col = idx // 5
+        row = idx % 5
+        x = col_x[col]
+        y = top_y + row * row_h
+
+        draw.rounded_rectangle([x, y, x + row_w, y + 56], radius=14, fill=row_fill)
+
+        badge_cx, badge_cy, badge_r = x + 32, y + 28, 18
+        rank = idx + 1
+        badge_fill = gold if rank <= 3 else (40, 36, 44, 230)
+        badge_text_fill = (30, 20, 10) if rank <= 3 else gold
+        draw.ellipse(
+            [badge_cx - badge_r, badge_cy - badge_r, badge_cx + badge_r, badge_cy + badge_r],
+            fill=badge_fill,
+        )
+        rank_text = str(rank)
+        rbox = draw.textbbox((0, 0), rank_text, font=rank_font)
+        draw.text(
+            (badge_cx - (rbox[2] - rbox[0]) / 2, badge_cy - (rbox[3] - rbox[1]) / 2 - rbox[1]),
+            rank_text,
+            font=rank_font,
+            fill=badge_text_fill,
+        )
+
+        wins_text = f"{wins:,} wins"
+        wbox = draw.textbbox((0, 0), wins_text, font=wins_font)
+        wins_x = x + row_w - 20 - (wbox[2] - wbox[0])
+
+        name_x = x + 64
+        max_name_width = wins_x - name_x - 16  # leave a gap before the wins text
+        name_display = team_name
+        while name_display:
+            nbox = draw.textbbox((0, 0), name_display, font=name_font)
+            if (nbox[2] - nbox[0]) <= max_name_width:
+                break
+            name_display = name_display[:-1]
+        if name_display != team_name:
+            name_display = (name_display[:-1] + "…") if len(name_display) > 1 else name_display
+
+        draw.text((name_x, y + 15), name_display, font=name_font, fill=white)
+        draw.text((wins_x, y + 15), wins_text, font=wins_font, fill=gold)
+
+    out = Image.alpha_composite(base, overlay).convert("RGB")
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+async def refresh_leaderboard_message(guild: discord.Guild | None = None) -> None:
+    """Regenerates the leaderboard image from the current DB and edits it in place in
+    LEADERBOARD_CHANNEL_ID, posting a fresh one if none exists yet."""
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID) or await bot.fetch_channel(LEADERBOARD_CHANNEL_ID)
+    db = load_leaderboard_db()
+    buf = render_leaderboard_image(db["teams"])
+    new_file = discord.File(buf, filename=LEADERBOARD_IMAGE_FILENAME)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == LEADERBOARD_IMAGE_FILENAME:
+            try:
+                await msg.edit(attachments=[new_file])
+                return
+            except discord.HTTPException:
+                break  # fall through and post a fresh one
+
+    await channel.send(file=new_file)
+
+
+async def post_leaderboard_panel_if_missing() -> None:
+    """Posts the staff leaderboard-management panel only if one isn't already up in
+    LEADERBOARD_CHANNEL_ID. Called on every startup, mirroring the tournament panel."""
+    channel = bot.get_channel(LEADERBOARD_CHANNEL_ID) or await bot.fetch_channel(LEADERBOARD_CHANNEL_ID)
+
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == "🏆 Leaderboard Admin Panel":
+            return  # panel already posted — leave it alone
+
+    embed = discord.Embed(
+        title="🏆 Leaderboard Admin Panel",
+        description=(
+            "Use the buttons below to update a team's all-time win total or remove a team "
+            "from the board. The graphic above updates automatically after every change."
+        ),
+        colour=discord.Colour.gold(),
+    )
+    await channel.send(embed=embed, view=LeaderboardAdminPanelView())
+
+
+class SetTeamWinsModal(discord.ui.Modal, title="Set Team Wins"):
+    team_name = discord.ui.TextInput(label="Team name", placeholder="e.g. elozide", max_length=100)
+    wins = discord.ui.TextInput(label="Total wins", placeholder="e.g. 3043", max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        name = self.team_name.value.strip()
+        try:
+            wins_value = int(self.wins.value.strip().replace(",", ""))
+        except ValueError:
+            await interaction.followup.send("Wins has to be a whole number.", ephemeral=True)
+            return
+        if wins_value < 0:
+            await interaction.followup.send("Wins can't be negative.", ephemeral=True)
+            return
+
+        db = load_leaderboard_db()
+        db["teams"][name] = wins_value
+        save_leaderboard_db(db)
+        await backup_leaderboard_db_to_log_channel()
+
+        try:
+            await refresh_leaderboard_message(interaction.guild)
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"✅ Set **{name}** to {wins_value:,} wins, but couldn't refresh the leaderboard "
+                f"image — check the bot's permissions in that channel. ({e})",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(f"✅ Set **{name}** to {wins_value:,} wins.", ephemeral=True)
+
+
+class RemoveTeamFromLeaderboardModal(discord.ui.Modal, title="Remove Team"):
+    team_name = discord.ui.TextInput(label="Team name to remove", placeholder="e.g. elozide", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        name = self.team_name.value.strip()
+        db = load_leaderboard_db()
+        if name not in db["teams"]:
+            await interaction.followup.send(f"**{name}** isn't on the leaderboard.", ephemeral=True)
+            return
+
+        del db["teams"][name]
+        save_leaderboard_db(db)
+        await backup_leaderboard_db_to_log_channel()
+
+        try:
+            await refresh_leaderboard_message(interaction.guild)
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"✅ Removed **{name}**, but couldn't refresh the leaderboard image — check the "
+                f"bot's permissions in that channel. ({e})",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(f"✅ Removed **{name}** from the leaderboard.", ephemeral=True)
+
+
+class LeaderboardAdminPanelView(discord.ui.View):
+    """Staff-only panel for hand-maintaining the All-Time Champions leaderboard."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Set Team Wins",
+        style=discord.ButtonStyle.success,
+        custom_id="leaderboard_set_wins_button",
+        emoji="🏆",
+    )
+    async def set_wins_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SetTeamWinsModal())
+
+    @discord.ui.button(
+        label="Remove Team",
+        style=discord.ButtonStyle.danger,
+        custom_id="leaderboard_remove_team_button",
+        emoji="🗑️",
+    )
+    async def remove_team_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveTeamFromLeaderboardModal())
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Show the current All-Time Champions leaderboard",
+)
+async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    db = load_leaderboard_db()
+    buf = render_leaderboard_image(db["teams"])
+    file = discord.File(buf, filename=LEADERBOARD_IMAGE_FILENAME)
+    await interaction.followup.send(file=file)
+
+
 # ---------- Question of the Day ----------
 @bot.tree.command(
     name="qotd",
@@ -5136,11 +5470,13 @@ async def on_ready():
     await restore_meta_version_from_log_channel()
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
+    await restore_leaderboard_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(TicketCloseView())
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayJoinView())
+    bot.add_view(LeaderboardAdminPanelView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
@@ -5162,6 +5498,11 @@ async def on_ready():
         await ensure_tournament_stickies()
     except Exception as e:
         print(f"Failed to backfill tournament sticky messages: {e}")
+    try:
+        await refresh_leaderboard_message()
+        await post_leaderboard_panel_if_missing()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh leaderboard: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
     if not meta_poll_loop.is_running():
