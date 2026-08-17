@@ -58,8 +58,7 @@ TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team'
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission except channel/permission management in every team channel
 
-ROLES_PANEL_CHANNEL_ID = 0  # TODO: set this to the channel the roles panel should be posted in
-                             # (self-role dropdown — pattern mirrors the support ticket panel below)
+ROLES_PANEL_CHANNEL_ID = 1528008012625743944  # channel the roles panel is posted in
 
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
