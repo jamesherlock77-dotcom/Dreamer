@@ -58,7 +58,7 @@ TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team'
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission except channel/permission management in every team channel
 
-ROLES_PANEL_CHANNEL_ID = 1528008012625743944  # TODO: set this to the channel the roles panel should be posted in
+ROLES_PANEL_CHANNEL_ID = 0  # TODO: set this to the channel the roles panel should be posted in
                              # (self-role dropdown — pattern mirrors the support ticket panel below)
 
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
@@ -778,71 +778,89 @@ async def refresh_support_ticket_panel():
 ROLES_PANEL_TITLE = "Animal Company: Arena Hub Roles"
 
 
-def build_roles_panel_embed() -> discord.Embed:
-    description = (
-        "Here you can pick up roles for pings, notifications, and more. Use the dropdown "
-        "below to add or remove roles for yourself.\n\n"
-        "Not sure what a role does? Ask staff before grabbing one."
-    )
-    embed = discord.Embed(
-        title=ROLES_PANEL_TITLE,
-        description=description,
-        colour=discord.Colour.orange(),
-    )
-    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
-    embed.set_footer(text="Animal Company: Arena Hub")
-    return embed
-
-
-class RolesPanelView(discord.ui.View):
-    """Self-role dropdown, same shape as SupportPanelView. Placeholder option only for now —
-    swap the `options=[...]` list below for the real roles once they're decided, and give
-    `select_roles` real add/remove-role logic instead of the "not configured yet" reply."""
+class RolesPanelView(discord.ui.LayoutView):
+    """A Components V2 container styled like MetaUpdateView/TeamMembersView elsewhere in
+    the bot — accent-bordered card with a title, description, self-role dropdown, and the
+    hub banner, instead of a plain embed. Placeholder option only for now — swap the
+    `options=[...]` list below for the real roles once they're decided, and give
+    `select_roles_callback` real add/remove-role logic instead of the "not configured yet"
+    reply."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.select(
-        placeholder="Choose an option",
-        options=[
-            discord.SelectOption(label="Roles coming soon", value="__none__"),
-        ],
-        custom_id="roles_panel_select",
-    )
-    async def select_roles(self, interaction: discord.Interaction, select: discord.ui.Select):
-        if select.values and select.values[0] == "__none__":
-            await interaction.response.send_message(
-                "Roles haven't been set up here yet — check back soon!", ephemeral=True
+        description = (
+            "Here you can pick up roles for pings, notifications, and more. Use the "
+            "dropdown below to add or remove roles for yourself.\n\n"
+            "Not sure what a role does? Ask staff before grabbing one."
+        )
+
+        select = discord.ui.Select(
+            placeholder="Choose an option",
+            options=[discord.SelectOption(label="Roles coming soon", value="__none__")],
+            custom_id="roles_panel_select",
+        )
+        select.callback = self._make_select_callback(select)
+
+        children = [
+            discord.ui.TextDisplay(f"# {ROLES_PANEL_TITLE}"),
+            discord.ui.TextDisplay(description),
+            discord.ui.ActionRow(select),
+            discord.ui.Separator(),
+        ]
+        if os.path.exists(SUPPORT_BANNER_PATH):
+            children.append(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
             )
-            return
-        # TODO: once real options are added above, toggle the corresponding role(s) here.
-        await interaction.response.send_message("Roles aren't configured yet.", ephemeral=True)
+
+        container = discord.ui.Container(*children)
+        self.add_item(container)
+
+    def _make_select_callback(self, select: discord.ui.Select):
+        async def callback(interaction: discord.Interaction):
+            if select.values and select.values[0] == "__none__":
+                await interaction.response.send_message(
+                    "Roles haven't been set up here yet — check back soon!", ephemeral=True
+                )
+                return
+            # TODO: once real options are added above, toggle the corresponding role(s) here.
+            await interaction.response.send_message("Roles aren't configured yet.", ephemeral=True)
+
+        return callback
 
 
 async def refresh_roles_panel():
     """Posts the roles panel if one isn't already up in the target channel. Like the support
     ticket panel, this does NOT delete and repost on every startup — it only posts a fresh
-    panel the first time (or if the old one was deleted)."""
+    panel the first time (or if the old one was deleted). Components V2 messages don't carry
+    a top-level embed, so "already posted" is detected via the attached banner file instead
+    (same filename-matching approach the JSON db backups use) — or, if no banner is
+    available locally, via the presence of any component-based message from the bot."""
     if not ROLES_PANEL_CHANNEL_ID:
         print("ROLES_PANEL_CHANNEL_ID isn't set — skipping roles panel.")
         return
 
     channel = bot.get_channel(ROLES_PANEL_CHANNEL_ID) or await bot.fetch_channel(ROLES_PANEL_CHANNEL_ID)
+    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
 
     async for msg in channel.history(limit=50):
-        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == ROLES_PANEL_TITLE:
-            return  # panel already posted — leave it alone
+        if msg.author.id != bot.user.id:
+            continue
+        if include_banner:
+            if msg.attachments and msg.attachments[0].filename == SUPPORT_BANNER_FILENAME:
+                return  # panel already posted — leave it alone
+        elif msg.components:
+            return  # panel already posted (best-effort check, no banner to match on)
 
     view = RolesPanelView()
 
-    if not os.path.exists(SUPPORT_BANNER_PATH):
+    if not include_banner:
         print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — roles panel sent without image.")
-        await channel.send(embed=build_roles_panel_embed(), view=view)
+        await channel.send(view=view)
         return
 
-    embed = build_roles_panel_embed()
     file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-    await channel.send(embed=embed, file=file, view=view)
+    await channel.send(view=view, file=file)
 
 
 # ---------- Tournament sticky sign-up message ----------
