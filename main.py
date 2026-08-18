@@ -3445,6 +3445,205 @@ async def syncmessages(interaction: discord.Interaction):
     )
 
 
+# ---------- Personal message-rank card (/messages) ----------
+RANK_CARD_CANVAS_WIDTH = 1000
+RANK_CARD_CANVAS_HEIGHT = 600
+
+
+async def _fetch_leaderboard_avatar_bytes(user_or_member) -> bytes | None:
+    try:
+        asset = user_or_member.display_avatar.replace(size=256, format="png")
+        return await asset.read()
+    except (discord.HTTPException, discord.NotFound):
+        return None
+
+
+def _circular_avatar(avatar_bytes: bytes | None, diameter: int) -> "Image.Image":
+    if avatar_bytes:
+        try:
+            img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            img = img.resize((diameter, diameter))
+        except OSError:
+            img = None
+    else:
+        img = None
+
+    if img is None:
+        # Plain placeholder circle if the avatar couldn't be loaded.
+        img = Image.new("RGBA", (diameter, diameter), (60, 60, 68, 255))
+
+    mask = Image.new("L", (diameter, diameter), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, diameter, diameter), fill=255)
+    out = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def _rank_tier_color(rank: int) -> tuple:
+    if rank == 1:
+        return (255, 217, 102, 255)
+    if rank == 2:
+        return (207, 207, 207, 255)
+    if rank == 3:
+        return (200, 155, 60, 255)
+    return (94, 224, 236, 255)  # cyan — everyone outside the top 3
+
+
+def _render_message_rank_card(
+    target: dict,
+    neighbor_above: dict | None,
+    neighbor_below: dict | None,
+    avatar_bytes: bytes | None,
+) -> bytes:
+    """target/neighbor_above/neighbor_below are dicts: {"rank", "username", "count"}."""
+    W, H = RANK_CARD_CANVAS_WIDTH, RANK_CARD_CANVAS_HEIGHT
+
+    try:
+        bg = Image.open(LEADERBOARD_BG_PATH).convert("RGBA")
+    except (FileNotFoundError, OSError):
+        try:
+            bg = Image.open(LEADERBOARD_BG_FALLBACK_PATH).convert("RGBA")
+        except (FileNotFoundError, OSError):
+            bg = Image.new("RGBA", (W, H), (24, 24, 28, 255))
+    canvas = bg.resize((W, H)).copy()
+
+    # Outer translucent panel
+    panel_box = (40, 40, W - 40, H - 40)
+    _leaderboard_blend_shape(
+        canvas,
+        lambda d: (
+            d.rounded_rectangle(panel_box, radius=22, fill=(0, 0, 0, 140)),
+            d.rounded_rectangle(panel_box, radius=22, outline=(255, 255, 255, 40), width=2),
+        ),
+    )
+
+    top_y0, top_y1 = 40, 150
+    mid_y0, mid_y1 = 150, 450
+    bot_y0, bot_y1 = 450, 560
+
+    _leaderboard_blend_shape(
+        canvas,
+        lambda d: (
+            d.rectangle((60, top_y1, W - 60, top_y1 + 2), fill=(255, 255, 255, 30)),
+            d.rectangle((60, mid_y1, W - 60, mid_y1 + 2), fill=(255, 255, 255, 30)),
+        ),
+    )
+
+    draw = ImageDraw.Draw(canvas)
+    font_neighbor_rank = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 26)
+    font_neighbor_name = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 22)
+    font_neighbor_msgs = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 20)
+
+    def draw_neighbor_row(neighbor: dict | None, y0: int, y1: int, empty_text: str) -> None:
+        cy = (y0 + y1) / 2
+        if neighbor is None:
+            draw.text((70, cy), empty_text, font=font_neighbor_name, fill=(150, 150, 158, 255), anchor="lm")
+            return
+        draw.text(
+            (70, cy),
+            f"#{neighbor['rank']}",
+            font=font_neighbor_rank,
+            fill=_rank_tier_color(neighbor["rank"]),
+            anchor="lm",
+        )
+        draw.text((160, cy), neighbor["username"], font=font_neighbor_name, fill=(230, 230, 230, 255), anchor="lm")
+        draw.text(
+            (W - 70, cy),
+            f"{neighbor['count']} msgs",
+            font=font_neighbor_msgs,
+            fill=(255, 217, 102, 255),
+            anchor="rm",
+        )
+
+    draw_neighbor_row(neighbor_above, top_y0, top_y1, "You're #1 this week! 🏆")
+    draw_neighbor_row(neighbor_below, bot_y0, bot_y1, "Nobody's ranked below you yet.")
+
+    # Avatar
+    avatar_diameter = 180
+    avatar_x, avatar_y = 90, int((mid_y0 + mid_y1) / 2 - avatar_diameter / 2)
+    avatar_img = _circular_avatar(avatar_bytes, avatar_diameter)
+    canvas.paste(avatar_img, (avatar_x, avatar_y), avatar_img)
+    ring_color = _rank_tier_color(target["rank"])
+    draw = ImageDraw.Draw(canvas)
+    draw.ellipse(
+        (avatar_x - 2, avatar_y - 2, avatar_x + avatar_diameter + 2, avatar_y + avatar_diameter + 2),
+        outline=ring_color,
+        width=4,
+    )
+
+    text_x = avatar_x + avatar_diameter + 40
+    username_y = mid_y0 + 65
+
+    font_username = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 42)
+    max_username_width = (W - 70) - text_x
+    username_font_size = 42
+    while font_username.getlength(target["username"]) > max_username_width and username_font_size > 20:
+        username_font_size -= 2
+        font_username = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, username_font_size)
+    draw.text((text_x, username_y), target["username"], font=font_username, fill=(255, 255, 255, 255), anchor="lm")
+
+    font_label = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 20)
+    font_stat = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 56)
+
+    label_y = username_y + 55
+    stat_y = label_y + 55
+
+    col1_x = text_x
+    col2_x = text_x + 350
+
+    draw.text((col1_x, label_y), "Messages This Week", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text((col1_x, stat_y), str(target["count"]), font=font_stat, fill=(255, 217, 102, 255), anchor="lm")
+
+    draw.text((col2_x, label_y), "Weekly Rank", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text((col2_x, stat_y), f"#{target['rank']}", font=font_stat, fill=ring_color, anchor="lm")
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@bot.tree.command(name="messages", description="Show your (or someone else's) weekly message stats")
+@app_commands.describe(user="Whose stats to show — defaults to you")
+async def messages_command(interaction: discord.Interaction, user: discord.Member | None = None):
+    await interaction.response.defer()
+
+    target_member = user or interaction.user
+    target_id = target_member.id
+
+    ranked = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)
+    positions = {uid: i for i, (uid, _count) in enumerate(ranked)}
+
+    if target_id not in positions:
+        who = "You haven't" if target_member.id == interaction.user.id else f"**{target_member.display_name}** hasn't"
+        await interaction.followup.send(f"{who} sent any tracked messages this week yet!")
+        return
+
+    idx = positions[target_id]
+    target_uid, target_count = ranked[idx]
+
+    async def build_entry(i: int) -> dict:
+        uid, count = ranked[i]
+        return {"rank": i + 1, "username": await _resolve_leaderboard_username(interaction.guild, uid), "count": count}
+
+    target_entry = await build_entry(idx)
+    neighbor_above = await build_entry(idx - 1) if idx > 0 else None
+    neighbor_below = await build_entry(idx + 1) if idx < len(ranked) - 1 else None
+
+    avatar_bytes = await _fetch_leaderboard_avatar_bytes(target_member)
+
+    try:
+        image_bytes = await asyncio.to_thread(
+            _render_message_rank_card, target_entry, neighbor_above, neighbor_below, avatar_bytes
+        )
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render message rank card: {e!r}")
+        await interaction.followup.send("Something went wrong generating that card.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="messages.png")
+    await interaction.followup.send(file=file)
+
+
 # ---------- Slash commands ----------
 @bot.tree.command(name="createteam", description="Create a new team")
 @app_commands.describe(
