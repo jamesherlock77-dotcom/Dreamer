@@ -3146,7 +3146,7 @@ def _leaderboard_load_font(path: str, size: int) -> "ImageFont.FreeTypeFont":
     except OSError as e:
         if path not in _leaderboard_font_warned_paths:
             _leaderboard_font_warned_paths.add(path)
-            print(f"[leaderboard] Failed to load font at '{path}': {e!r} — falling back to Pillow's default font.")
+            print(f"[leaderboard] Failed to load font at '{path}': {e!r} — falling back to Pillow's default font.", flush=True)
         return ImageFont.load_default()
 
 
@@ -3160,9 +3160,9 @@ def _leaderboard_log_asset_status() -> None:
         ("Background image", LEADERBOARD_BG_PATH),
     ):
         if os.path.exists(path):
-            print(f"[leaderboard] Found {label} at '{path}'.")
+            print(f"[leaderboard] Found {label} at '{path}'.", flush=True)
         else:
-            print(f"[leaderboard] MISSING {label} — expected at '{path}'.")
+            print(f"[leaderboard] MISSING {label} — expected at '{path}'.", flush=True)
 
 
 async def _resolve_leaderboard_username(guild: discord.Guild | None, user_id: int) -> str:
