@@ -15,6 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from playwright.async_api import async_playwright
+from PIL import Image, ImageDraw, ImageFont
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
 # the interaction (e.g. the user typed another character before the bot replied).
@@ -100,6 +101,18 @@ MESSAGE_LEADERBOARD_DB_FILE = "message_leaderboard_data.json"
 MESSAGE_LEADERBOARD_SAVE_INTERVAL_MINUTES = 5   # how often in-memory counts are flushed to disk + backed up
 MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ... Sunday=6
 MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
+
+# Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
+# next to this file: two Orbitron weights and an optional background image. Falls back to a
+# plain dark canvas if the assets aren't present, so the command still works out of the box.
+LEADERBOARD_ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+LEADERBOARD_BG_PATH = os.path.join(LEADERBOARD_ASSETS_DIR, "leaderboard-bg.png")
+LEADERBOARD_BG_FALLBACK_PATH = os.path.join(LEADERBOARD_ASSETS_DIR, "default-background.png")
+LEADERBOARD_FONT_PATH = os.path.join(BASE_DIR, "Orbitron-Bold.ttf")        # family "Orbitron" in the JS version
+LEADERBOARD_FONT_EXTRABOLD_PATH = os.path.join(BASE_DIR, "Orbitron-ExtraBold.ttf")  # family "OrbitronExtra"
+LEADERBOARD_CANVAS_WIDTH = 900
+LEADERBOARD_CANVAS_HEIGHT = 520
+LEADERBOARD_COOLDOWN_SECONDS = 300  # how long a user must wait between /messageleaderboard runs
 
 
 # ---------- Bot setup ----------
@@ -3107,47 +3120,230 @@ async def before_message_leaderboard_save_loop():
     await bot.wait_until_ready()
 
 
-_LEADERBOARD_RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+# ---------- Leaderboard image card (ported from leaderboard.js) ----------
+# Per-user cooldown, mirroring the JS version's cooldowns Map.
+_leaderboard_cooldowns: dict[int, float] = {}
 
 
-class MessageLeaderboardView(discord.ui.LayoutView):
-    """A Components V2 container styled like the other cards elsewhere in the bot
-    (SupportPanelView / MetaUpdateView / MemberCountView) — an accent-bordered card
-    listing this week's top 10 most active members by message count."""
+def _leaderboard_rounded_rect(draw: "ImageDraw.ImageDraw", box, radius, **kwargs) -> None:
+    draw.rounded_rectangle(box, radius=radius, **kwargs)
 
-    def __init__(self):
-        super().__init__(timeout=None)
 
-        now = discord.utils.utcnow()
-        ranked = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-        next_reset = _message_leaderboard_next_reset(now)
+def _leaderboard_blend_shape(base: "Image.Image", draw_fn) -> None:
+    """Draws onto a fresh transparent layer then alpha-composites it onto `base`, so
+    semi-transparent fills blend with what's already been drawn — matching how the
+    HTML canvas version layers its rgba() fills on top of each other."""
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw_fn(ImageDraw.Draw(overlay))
+    base.alpha_composite(overlay)
 
-        if ranked:
-            lines = [
-                f"{_LEADERBOARD_RANK_EMOJI.get(i, f'`{i}.`')} <@{uid}> — `{count:,}` msgs"
-                for i, (uid, count) in enumerate(ranked, start=1)
-            ]
-            body = "\n".join(lines)
+
+def _leaderboard_load_font(path: str, size: int) -> "ImageFont.FreeTypeFont":
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+async def _resolve_leaderboard_username(guild: discord.Guild | None, user_id: int) -> str:
+    """Best-effort display name for the card — checks the cached member first, then
+    falls back to a fetch, then to the raw ID if the user can't be resolved at all."""
+    member = guild.get_member(user_id) if guild else None
+    if member:
+        return member.display_name
+    user = bot.get_user(user_id)
+    if user:
+        return user.display_name
+    try:
+        user = await bot.fetch_user(user_id)
+        return user.display_name
+    except discord.HTTPException:
+        return f"User {user_id}"
+
+
+def _render_leaderboard_image(ranked: list[tuple[int, int, str]], current_user_id: int) -> bytes:
+    """Draws the two-column leaderboard card. `ranked` is a list of
+    (user_id, message_count, username) tuples, already sorted/sliced to the top 10.
+    Runs synchronously — call via asyncio.to_thread, this is not async-safe on its own."""
+    W, H = LEADERBOARD_CANVAS_WIDTH, LEADERBOARD_CANVAS_HEIGHT
+
+    try:
+        bg = Image.open(LEADERBOARD_BG_PATH).convert("RGBA")
+    except (FileNotFoundError, OSError):
+        try:
+            bg = Image.open(LEADERBOARD_BG_FALLBACK_PATH).convert("RGBA")
+        except (FileNotFoundError, OSError):
+            bg = Image.new("RGBA", (W, H), (24, 24, 28, 255))
+    bg = bg.resize((W, H))
+
+    canvas = bg.copy()
+
+    # Dark overlay card
+    _leaderboard_blend_shape(
+        canvas,
+        lambda d: _leaderboard_rounded_rect(d, (35, 30, 35 + 830, 30 + 460), 14, fill=(0, 0, 0, 179)),
+    )
+
+    draw = ImageDraw.Draw(canvas)
+
+    font_title = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 36)
+    font_rank = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 16)
+    font_msgs = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 16)
+
+    # Title
+    draw.text((60, 85), "Weekly Leaders", font=font_title, fill=(255, 255, 255, 255), anchor="ls")
+
+    # Separator line under the title
+    _leaderboard_blend_shape(
+        canvas,
+        lambda d: d.rectangle((60, 100, 60 + 780, 100 + 2), fill=(255, 255, 255, 38)),
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    left_column = ranked[0:5]
+    right_column = ranked[5:10]
+
+    start_y = 120
+    row_height = 56
+    row_gap = 18
+
+    def draw_row(user_id: int, count: int, username: str, col_x: int, row_index: int, real_rank: int) -> None:
+        row_y = start_y + row_index * (row_height + row_gap)
+        is_current_user = user_id == current_user_id
+
+        # Row background
+        if is_current_user:
+            _leaderboard_blend_shape(
+                canvas,
+                lambda d: _leaderboard_rounded_rect(
+                    d, (col_x, row_y, col_x + 360, row_y + row_height), 10, fill=(88, 101, 242, 64)
+                ),
+            )
+            _leaderboard_blend_shape(
+                canvas,
+                lambda d: _leaderboard_rounded_rect(
+                    d, (col_x, row_y, col_x + 360, row_y + row_height), 10, outline=(88, 101, 242, 127), width=2
+                ),
+            )
         else:
-            body = "No messages tracked yet this week — check back soon!"
+            _leaderboard_blend_shape(
+                canvas,
+                lambda d: _leaderboard_rounded_rect(
+                    d, (col_x, row_y, col_x + 360, row_y + row_height), 10, fill=(255, 255, 255, 18)
+                ),
+            )
 
-        children = [
-            discord.ui.TextDisplay("# 🏆 Weekly Message Leaderboard"),
-            discord.ui.TextDisplay("The top 10 most active members this week:"),
-            discord.ui.Separator(),
-            discord.ui.TextDisplay(body),
-            discord.ui.Separator(),
-            discord.ui.TextDisplay(f"-# Resets <t:{int(next_reset.timestamp())}:R> (every Sunday at 23:00 UTC)"),
-        ]
+        row_draw = ImageDraw.Draw(canvas)
 
-        container = discord.ui.Container(*children, accent_colour=discord.Colour.gold())
-        self.add_item(container)
+        # Rank circle (fully opaque — safe to draw straight onto the canvas)
+        rank_circle_x = col_x + 14
+        rank_circle_y = row_y + 10
+        radius = 18
+        row_draw.ellipse(
+            (rank_circle_x, rank_circle_y, rank_circle_x + radius * 2, rank_circle_y + radius * 2),
+            fill=(30, 30, 30, 255),
+            outline=(47, 47, 47, 255),
+            width=2,
+        )
+
+        if real_rank == 1:
+            rank_color = (255, 217, 102, 255)
+        elif real_rank == 2:
+            rank_color = (207, 207, 207, 255)
+        elif real_rank == 3:
+            rank_color = (200, 155, 60, 255)
+        else:
+            rank_color = (255, 255, 255, 255)
+
+        row_draw.text(
+            (rank_circle_x + radius, rank_circle_y + radius),
+            str(real_rank),
+            font=font_rank,
+            fill=rank_color,
+            anchor="mm",
+        )
+
+        # Message count, right-aligned
+        msg_text = f"{count} msgs"
+        row_draw.text(
+            (col_x + 345, row_y + row_height / 2),
+            msg_text,
+            font=font_msgs,
+            fill=(204, 204, 204, 255),
+            anchor="rm",
+        )
+        msg_width = font_msgs.getlength(msg_text)
+        max_name_width = (345 - msg_width - 15) - 64
+
+        # Shrink-to-fit username
+        font_size = 24
+        name_font = _leaderboard_load_font(LEADERBOARD_FONT_PATH, font_size)
+        while name_font.getlength(username) > max_name_width and font_size > 12:
+            font_size -= 1
+            name_font = _leaderboard_load_font(LEADERBOARD_FONT_PATH, font_size)
+
+        row_draw.text(
+            (col_x + 64, row_y + row_height / 2),
+            username,
+            font=name_font,
+            fill=(255, 255, 255, 255),
+            anchor="lm",
+        )
+
+    for i, (user_id, count, username) in enumerate(left_column):
+        draw_row(user_id, count, username, 60, i, i + 1)
+    for i, (user_id, count, username) in enumerate(right_column):
+        draw_row(user_id, count, username, 460, i, i + 6)
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @bot.tree.command(name="messageleaderboard", description="Show this week's most active members by message count")
 async def messageleaderboard(interaction: discord.Interaction):
+    # 1. Check cooldown (mirrors leaderboard.js)
+    user_id = interaction.user.id
+    last_used = _leaderboard_cooldowns.get(user_id)
+    if last_used is not None:
+        expiration_time = last_used + LEADERBOARD_COOLDOWN_SECONDS
+        now_ts = time.time()
+        if now_ts < expiration_time:
+            time_left = round(expiration_time - now_ts)
+            await interaction.response.send_message(
+                f"⏳ Please wait **{time_left} seconds** before checking the leaderboard again!",
+                ephemeral=True,
+            )
+            return
+
+    # 2. Set cooldown
+    _leaderboard_cooldowns[user_id] = time.time()
+
+    # 3. Start command
     await interaction.response.defer()
-    await interaction.followup.send(view=MessageLeaderboardView())
+
+    ranked_counts = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    if not ranked_counts:
+        await interaction.followup.send("No messages logged this week yet!")
+        return
+
+    ranked = [
+        (uid, count, await _resolve_leaderboard_username(interaction.guild, uid))
+        for uid, count in ranked_counts
+    ]
+
+    try:
+        image_bytes = await asyncio.to_thread(_render_leaderboard_image, ranked, user_id)
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render leaderboard image: {e!r}")
+        await interaction.followup.send("Something went wrong generating the leaderboard image.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="leaderboard.png")
+    await interaction.followup.send(
+        content="🏆 **Here are the current top 10 chatters!** 🏆",
+        file=file,
+    )
 
 
 # ---------- Slash commands ----------
