@@ -61,8 +61,6 @@ TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer grante
 TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID = 1539098236772425830  # gets basic (view/send/read history/react + ping-any-role) access in every team channel, except TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID
 TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID = 1534638919465963570  # this one team channel is skipped when granting TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID access
 
-ROLES_PANEL_CHANNEL_ID = 1528008012625743944  # channel the roles panel is posted in
-
 QOTD_CHANNEL_ID = 1535123663844548639       # where /qotd posts the question and opens its thread
 QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of the Day
 
@@ -579,7 +577,7 @@ SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
 class SupportPanelView(discord.ui.LayoutView):
-    """A Components V2 container styled like RolesPanelView/MetaUpdateView elsewhere in
+    """A Components V2 container styled like MetaUpdateView elsewhere in
     the bot — accent-bordered card with a title, rules, category dropdown, and the hub
     banner, instead of the old plain embed + separate View."""
 
@@ -641,7 +639,7 @@ class SupportPanelView(discord.ui.LayoutView):
 
 # ---------- Persistent "Close" button attached to every ticket thread's first message ----------
 class TicketThreadView(discord.ui.LayoutView):
-    """A Components V2 container styled like RolesPanelView/MetaUpdateView elsewhere in
+    """A Components V2 container styled like MetaUpdateView elsewhere in
     the bot — replaces the old Embed + separate TicketCloseView with one native container
     holding the ticket details and the Close button together.
 
@@ -842,7 +840,7 @@ async def refresh_support_ticket_panel():
     Unlike before, this does NOT delete and repost the panel on every startup — that would
     spam the channel. It only posts a fresh panel the first time (or if the old one was
     deleted). Components V2 messages don't carry a top-level embed, so "already posted" is
-    detected via the attached banner file instead (same approach refresh_roles_panel uses)
+    detected via the attached banner file instead (same approach used elsewhere in the bot)
     — or, if no banner is available locally, via the presence of any component-based
     message from the bot."""
     channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
@@ -861,136 +859,6 @@ async def refresh_support_ticket_panel():
 
     if not include_banner:
         print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — panel sent without image.")
-        await channel.send(view=view)
-        return
-
-    file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-    await channel.send(view=view, file=file)
-
-
-# ---------- Roles panel (self-role dropdown) ----------
-ROLES_PANEL_TITLE = "Animal Company: Arena Hub Roles"
-
-# value -> (label, PartialEmoji, role_id)
-ROLES_PANEL_OPTIONS = {
-    "announcements": ("Announcements", discord.PartialEmoji(name="Trophy", id=1528217005390565429), 1528140386197831800),
-    "social_media": ("Social Media", discord.PartialEmoji(name="Ogre", id=1538745742192021605), 1528141360182333491),
-    "tournaments": ("Tournaments", discord.PartialEmoji(name="CompanyCoins", id=1528218837030535394), 1528140502665531543),
-    "qotd": ("Question Of The Day", discord.PartialEmoji(name="Pineapple", id=1528219371263234222), 1535432839548506163),
-    "ac_leaks": ("AC Leaks", discord.PartialEmoji(name="Ruby", id=1528216929259753575), 1528140437573996724),
-}
-
-
-class RolesPanelView(discord.ui.LayoutView):
-    """A Components V2 container styled like MetaUpdateView/TeamMembersView elsewhere in
-    the bot — accent-bordered card with a title, description, self-role dropdown, and the
-    hub banner, instead of a plain embed. The dropdown is a toggle-style multi-select: ping
-    roles the user already has come up selected implicitly by them re-picking them, and
-    submitting adds every checked role + removes every unchecked one from ROLES_PANEL_OPTIONS."""
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-        description = (
-            "Here you can pick up roles for pings, notifications, and more. Use the "
-            "dropdown below to add or remove roles for yourself — pick everything you "
-            "want pings for and submit; anything you leave unchecked gets removed.\n\n"
-            "Not sure what a role does? Ask staff before grabbing one."
-        )
-
-        select = discord.ui.Select(
-            placeholder="Choose an option",
-            min_values=0,
-            max_values=len(ROLES_PANEL_OPTIONS),
-            options=[
-                discord.SelectOption(label=label, value=value, emoji=emoji)
-                for value, (label, emoji, _role_id) in ROLES_PANEL_OPTIONS.items()
-            ],
-            custom_id="roles_panel_select",
-        )
-        select.callback = self._make_select_callback(select)
-
-        children = [
-            discord.ui.TextDisplay(f"# {ROLES_PANEL_TITLE}"),
-            discord.ui.TextDisplay(description),
-            discord.ui.ActionRow(select),
-            discord.ui.Separator(),
-        ]
-        if os.path.exists(SUPPORT_BANNER_PATH):
-            children.append(
-                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
-            )
-
-        container = discord.ui.Container(*children)
-        self.add_item(container)
-
-    def _make_select_callback(self, select: discord.ui.Select):
-        async def callback(interaction: discord.Interaction):
-            member = interaction.user
-            selected = set(select.values)
-
-            to_add = []
-            to_remove = []
-            missing_roles = []
-            for value, (label, _emoji, role_id) in ROLES_PANEL_OPTIONS.items():
-                role = interaction.guild.get_role(role_id)
-                if not role:
-                    missing_roles.append(label)
-                    continue
-                has_role = role in member.roles
-                wants_role = value in selected
-                if wants_role and not has_role:
-                    to_add.append(role)
-                elif not wants_role and has_role:
-                    to_remove.append(role)
-
-            if to_add:
-                await member.add_roles(*to_add, reason="Self-role panel selection")
-            if to_remove:
-                await member.remove_roles(*to_remove, reason="Self-role panel selection")
-
-            parts = []
-            if to_add:
-                parts.append("✅ Added: " + ", ".join(r.mention for r in to_add))
-            if to_remove:
-                parts.append("➖ Removed: " + ", ".join(r.mention for r in to_remove))
-            if missing_roles:
-                parts.append("⚠️ Couldn't find these roles on the server (ask staff): " + ", ".join(missing_roles))
-            if not parts:
-                parts.append("No changes made.")
-
-            await interaction.response.send_message("\n".join(parts), ephemeral=True)
-
-        return callback
-
-
-async def refresh_roles_panel():
-    """Posts the roles panel if one isn't already up in the target channel. Like the support
-    ticket panel, this does NOT delete and repost on every startup — it only posts a fresh
-    panel the first time (or if the old one was deleted). Components V2 messages don't carry
-    a top-level embed, so "already posted" is detected via the attached banner file instead
-    (same filename-matching approach the JSON db backups use) — or, if no banner is
-    available locally, via the presence of any component-based message from the bot."""
-    if not ROLES_PANEL_CHANNEL_ID:
-        print("ROLES_PANEL_CHANNEL_ID isn't set — skipping roles panel.")
-        return
-
-    channel = bot.get_channel(ROLES_PANEL_CHANNEL_ID) or await bot.fetch_channel(ROLES_PANEL_CHANNEL_ID)
-    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
-
-    async for msg in channel.history(limit=50):
-        if msg.author.id != bot.user.id:
-            continue
-        if include_banner:
-            if msg.attachments and msg.attachments[0].filename == SUPPORT_BANNER_FILENAME:
-                return  # panel already posted — leave it alone
-        elif msg.components:
-            return  # panel already posted (best-effort check, no banner to match on)
-
-    view = RolesPanelView()
-
-    if not include_banner:
-        print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — roles panel sent without image.")
         await channel.send(view=view)
         return
 
@@ -5414,7 +5282,6 @@ async def on_ready():
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
     bot.add_view(SupportPanelView())
-    bot.add_view(RolesPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
     # builds a placeholder container; only the button's custom_id is used to route
@@ -5436,10 +5303,6 @@ async def on_ready():
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
-    try:
-        await refresh_roles_panel()
-    except discord.HTTPException as e:
-        print(f"Failed to refresh roles panel: {e}")
     try:
         await post_tournament_panel_if_missing()
     except discord.HTTPException as e:
