@@ -33,6 +33,7 @@ TEAM_CATEGORY_ID = 1528146975554404552     # category new team channels are crea
 TEAM_CATEGORY_OVERFLOW_ID = 1534991567486714026  # used once TEAM_CATEGORY_ID hits Discord's 50-channel cap
 TEAM_LOG_CHANNEL_ID = 1530008905663512626  # teams JSON "database" message lives here
 TEAM_ACTIVITY_LOG_CHANNEL_ID = 1536846101657690242  # human-readable embed log of every team event (create/delete/join/leave/invite/etc)
+BOT_LOG_CHANNEL_ID = 1538791773772455949   # global bot activity log — every slash command run, every JSON db sync (backup/restore), and every startup/restart
 GIVEAWAY_LOG_CHANNEL_ID = 1530009058294370476  # giveaways JSON "database" message lives here
 LOG_CHANNEL_ID = 1528147225799037008       # legacy combined database channel — kept only so
                                             # old data can be migrated into the two channels above
@@ -154,6 +155,10 @@ pending_invites: dict = {}
 # outstanding. Used to stop a leader from having more than one scrim request pending at once.
 pending_scrim_requests: dict = {}
 
+# Set once the first on_ready pass has fully finished, so if Discord fires on_ready again
+# on a later reconnect (same process, no actual restart), we don't log a spurious "restarted".
+_startup_logged: bool = False
+
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
     if channel_id in _db_message_cache:
@@ -180,12 +185,22 @@ async def _backup_file_to_channel(channel_id: int, file_path: str, filename: str
         try:
             edited = await msg.edit(content="📦 Database (auto-updated):", attachments=[new_file])
             _db_message_cache[channel_id] = edited
+            await log_bot_event(
+                title="📦 JSON synced",
+                description=f"`{filename}` backed up to <#{channel_id}>.",
+                colour=discord.Colour.dark_teal(),
+            )
             return
         except discord.HTTPException:
             pass  # message may have been deleted; fall through and send a fresh one
 
     sent = await channel.send(content="📦 Database (auto-updated):", file=new_file)
     _db_message_cache[channel_id] = sent
+    await log_bot_event(
+        title="📦 JSON synced",
+        description=f"`{filename}` backed up to <#{channel_id}> (new message).",
+        colour=discord.Colour.dark_teal(),
+    )
 
 
 async def backup_db_to_log_channel():
@@ -224,6 +239,36 @@ async def log_team_event(
         print(f"[ERROR] Failed to send team activity log: {e}")
 
 
+async def log_bot_event(
+    title: str,
+    description: str = "",
+    colour: discord.Colour = discord.Colour.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> None:
+    """Sends one standardized embed to BOT_LOG_CHANNEL_ID — the global bot activity log.
+    Covers every slash command run (via on_app_command_completion), every JSON db sync
+    (backup/restore, hooked in _backup_file_to_channel / _restore_file_from_channel below,
+    so it automatically covers teams, giveaways, tickets, invites, scrims, and the meta
+    version file), and startup/restart (on_ready). Fire-and-forget: any failure here is
+    printed and swallowed so a logging hiccup never breaks the actual action that triggered
+    it."""
+    try:
+        channel = bot.get_channel(BOT_LOG_CHANNEL_ID) or await bot.fetch_channel(BOT_LOG_CHANNEL_ID)
+        if channel is None:
+            return
+        embed = discord.Embed(
+            title=title,
+            description=description or None,
+            colour=colour,
+            timestamp=discord.utils.utcnow(),
+        )
+        for name, value, inline in (fields or []):
+            embed.add_field(name=name, value=value or "—", inline=inline)
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[ERROR] Failed to send bot log: {e}")
+
+
 async def _restore_file_from_channel(channel_id: int, file_path: str, filename: str) -> bool:
     """Looks for filename attached to one of the bot's own messages in channel_id and, if
     found, writes it to file_path. Returns whether a backup was found."""
@@ -235,6 +280,11 @@ async def _restore_file_from_channel(channel_id: int, file_path: str, filename: 
                 with open(file_path, "wb") as f:
                     f.write(data)
                 _db_message_cache[channel_id] = msg
+                await log_bot_event(
+                    title="📥 JSON restored",
+                    description=f"`{filename}` restored from <#{channel_id}>.",
+                    colour=discord.Colour.dark_teal(),
+                )
                 return True
     except discord.HTTPException as e:
         print(f"Failed to restore {filename} from channel {channel_id}: {e}")
@@ -5225,6 +5275,41 @@ async def qotd(interaction: discord.Interaction, question: app_commands.Range[st
     await interaction.followup.send(f"✅ Posted in {channel.mention} and opened a thread.", ephemeral=True)
 
 
+# ---------- Global slash-command activity logging ----------
+# Fires after every slash command finishes successfully. Logged separately from the
+# per-feature activity logs (e.g. log_team_event) so BOT_LOG_CHANNEL_ID has a complete,
+# chronological record of every command anyone runs, on top of the JSON sync and
+# startup/restart logging.
+@bot.event
+async def on_app_command_completion(
+    interaction: discord.Interaction,
+    command: app_commands.Command | app_commands.ContextMenu,
+):
+    options_text = ""
+    try:
+        data = interaction.data or {}
+        raw_options = data.get("options") or []
+        # Slash commands nest subcommand/subcommand-group options one or two levels deep;
+        # walk down to the actual argument list instead of assuming it's flat.
+        while raw_options and raw_options[0].get("type") in (1, 2):  # SUB_COMMAND, SUB_COMMAND_GROUP
+            raw_options = raw_options[0].get("options") or []
+        parts = [f"{opt['name']}: {opt['value']}" for opt in raw_options if "value" in opt]
+        options_text = ", ".join(parts)
+    except Exception:
+        options_text = ""
+
+    where = interaction.channel.mention if interaction.channel else "DMs"
+    description = f"Run by {interaction.user.mention} (`{interaction.user.id}`) in {where}"
+    if options_text:
+        description += f"\n**Options:** {options_text}"
+
+    await log_bot_event(
+        title=f"⚙️ /{command.qualified_name}",
+        description=description,
+        colour=discord.Colour.blurple(),
+    )
+
+
 # ---------- Global slash-command error handler ----------
 # Without this, discord.py just logs a full traceback for every unhandled command error
 # (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
@@ -5258,6 +5343,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         return
 
     print(f"Unhandled error in '{command_name}': {error!r}")
+    await log_bot_event(
+        title=f"❌ /{command_name} failed",
+        description=f"Run by {interaction.user.mention} (`{interaction.user.id}`)\n```{error!r}```"[:4000],
+        colour=discord.Colour.red(),
+    )
     try:
         message = "Something went wrong running that command. Please try again."
         if interaction.response.is_done():
@@ -5314,6 +5404,23 @@ async def on_ready():
         check_scrim_expiry.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
+
+    global _startup_logged
+    if not _startup_logged:
+        _startup_logged = True
+        await log_bot_event(
+            title="🟢 Bot started",
+            description=f"Logged in as {bot.user} and finished startup (db restore, panel refresh, background loops).",
+            colour=discord.Colour.green(),
+        )
+    else:
+        # Discord re-fired on_ready without the process actually restarting (e.g. a
+        # gateway reconnect) — worth a quieter note rather than another "started" log.
+        await log_bot_event(
+            title="🔄 Gateway reconnected",
+            description="on_ready fired again (session reconnect) — startup tasks re-ran.",
+            colour=discord.Colour.gold(),
+        )
 
 
 if __name__ == "__main__":
