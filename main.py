@@ -839,14 +839,17 @@ async def refresh_support_ticket_panel():
     """Posts the support ticket panel if one isn't already up in the target channel.
     Unlike before, this does NOT delete and repost the panel on every startup — that would
     spam the channel. It only posts a fresh panel the first time (or if the old one was
-    deleted). Components V2 messages don't carry a top-level embed, so "already posted" is
-    detected via the attached banner file instead (same approach used elsewhere in the bot)
-    — or, if no banner is available locally, via the presence of any component-based
-    message from the bot."""
+    deleted).
+
+    "Already posted" is detected by pinning the panel message and checking the channel's
+    pins on startup, rather than scanning recent history — this channel is also where new
+    ticket threads get opened, and each one posts a "started a thread" system message here,
+    so on a busy server the panel can easily scroll past a limited history scan and get
+    mistaken for missing. Pins aren't affected by that at all."""
     channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
     include_banner = os.path.exists(SUPPORT_BANNER_PATH)
 
-    async for msg in channel.history(limit=50):
+    for msg in await channel.pins():
         if msg.author.id != bot.user.id:
             continue
         if include_banner:
@@ -859,11 +862,17 @@ async def refresh_support_ticket_panel():
 
     if not include_banner:
         print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — panel sent without image.")
-        await channel.send(view=view)
-        return
+        sent = await channel.send(view=view)
+    else:
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+        sent = await channel.send(view=view, file=file)
 
-    file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-    await channel.send(view=view, file=file)
+    try:
+        await sent.pin(reason="Support ticket panel — keeps it detectable on restart regardless of channel activity")
+    except discord.HTTPException as e:
+        print(f"Failed to pin support ticket panel (will likely repost on next restart): {e}")
+
+
 
 
 # ---------- Tournament sticky sign-up message ----------
