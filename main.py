@@ -3170,17 +3170,18 @@ def _leaderboard_log_asset_status() -> None:
 
 
 async def _resolve_leaderboard_username(guild: discord.Guild | None, user_id: int) -> str:
-    """Best-effort display name for the card — checks the cached member first, then
-    falls back to a fetch, then to the raw ID if the user can't be resolved at all."""
+    """Best-effort account username (not server nickname) for the card — checks the
+    cached member first, then falls back to a fetch, then to the raw ID if the user
+    can't be resolved at all."""
     member = guild.get_member(user_id) if guild else None
     if member:
-        return member.display_name
+        return member.name
     user = bot.get_user(user_id)
     if user:
-        return user.display_name
+        return user.name
     try:
         user = await bot.fetch_user(user_id)
-        return user.display_name
+        return user.name
     except discord.HTTPException:
         return f"User {user_id}"
 
