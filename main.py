@@ -94,6 +94,13 @@ META_GAME_DISPLAY_NAME = "Wooster Games, Animal Company"  # bold subtitle line s
 META_EMBED_AUTHOR = "AC: Arena Hub"  # small eyebrow text shown above the embed title
 META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update is detected
 
+# ---------- Weekly message leaderboard config ----------
+MESSAGE_LEADERBOARD_LOG_CHANNEL_ID = 123456789012345678  # <-- SET ME: channel the leaderboard's JSON backup lives in
+MESSAGE_LEADERBOARD_DB_FILE = "message_leaderboard_data.json"
+MESSAGE_LEADERBOARD_SAVE_INTERVAL_MINUTES = 5   # how often in-memory counts are flushed to disk + backed up
+MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ... Sunday=6
+MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
+
 
 # ---------- Bot setup ----------
 intents = discord.Intents.default()
@@ -156,6 +163,14 @@ pending_scrim_requests: dict = {}
 # Set once the first on_ready pass has fully finished, so if Discord fires on_ready again
 # on a later reconnect (same process, no actual restart), we don't log a spurious "restarted".
 _startup_logged: bool = False
+
+# In-memory weekly message-leaderboard counters: {user_id: message_count}. Loaded on startup
+# from its backup channel (restore_message_leaderboard_from_log_channel) and periodically
+# flushed to disk + Discord by message_leaderboard_save_loop, rather than hitting the
+# filesystem on every single message sent in the server.
+_message_leaderboard_counts: dict = {}
+_message_leaderboard_period_start: datetime | None = None
+_message_leaderboard_dirty: bool = False
 
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
@@ -2959,6 +2974,182 @@ async def updateembed(interaction: discord.Interaction):
         await interaction.followup.send(view=view)
 
 
+# ============================================================
+# WEEKLY MESSAGE LEADERBOARD — tracks how many messages each
+# member sends and posts a top-10 card via /messageleaderboard.
+# Counts reset automatically every Sunday at 23:00 UTC.
+# ============================================================
+
+def _message_leaderboard_reset_boundary(now: datetime) -> datetime:
+    """Returns the most recent Sunday-23:00-UTC boundary at or before `now`. Counts
+    belong to the "week" starting at whichever boundary is currently in effect, so a
+    reset just means: if a newer boundary has been crossed, wipe the counts."""
+    days_since = (now.weekday() - MESSAGE_LEADERBOARD_RESET_WEEKDAY) % 7
+    candidate = (now - timedelta(days=days_since)).replace(
+        hour=MESSAGE_LEADERBOARD_RESET_HOUR_UTC, minute=0, second=0, microsecond=0
+    )
+    if candidate > now:
+        candidate -= timedelta(days=7)
+    return candidate
+
+
+def _message_leaderboard_next_reset(now: datetime) -> datetime:
+    return _message_leaderboard_reset_boundary(now) + timedelta(days=7)
+
+
+def record_message_for_leaderboard(user_id: int) -> None:
+    """Called from on_message for every non-bot message sent in the server. Lazily
+    resets the counters the moment a message arrives after the weekly boundary has
+    passed, rather than needing a separate scheduled reset job."""
+    global _message_leaderboard_period_start, _message_leaderboard_dirty
+
+    now = discord.utils.utcnow()
+    boundary = _message_leaderboard_reset_boundary(now)
+    if _message_leaderboard_period_start is None or boundary > _message_leaderboard_period_start:
+        _message_leaderboard_counts.clear()
+        _message_leaderboard_period_start = boundary
+
+    _message_leaderboard_counts[user_id] = _message_leaderboard_counts.get(user_id, 0) + 1
+    _message_leaderboard_dirty = True
+
+
+def save_message_leaderboard_db() -> None:
+    with open(MESSAGE_LEADERBOARD_DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "counts": {str(uid): count for uid, count in _message_leaderboard_counts.items()},
+                "period_start": (
+                    _message_leaderboard_period_start.isoformat()
+                    if _message_leaderboard_period_start
+                    else None
+                ),
+                "last_updated": discord.utils.utcnow().isoformat(),
+            },
+            f,
+            indent=2,
+        )
+
+
+def load_message_leaderboard_db() -> None:
+    global _message_leaderboard_period_start
+    if not os.path.exists(MESSAGE_LEADERBOARD_DB_FILE):
+        return
+    with open(MESSAGE_LEADERBOARD_DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    _message_leaderboard_counts.clear()
+    for uid, count in (data.get("counts") or {}).items():
+        _message_leaderboard_counts[int(uid)] = count
+
+    period_start = data.get("period_start")
+    _message_leaderboard_period_start = (
+        datetime.fromisoformat(period_start) if period_start else None
+    )
+
+    # If we've been offline across a weekly boundary, reset now rather than waiting for
+    # the next message to trigger it — keeps a stale prior week from lingering silently.
+    now = discord.utils.utcnow()
+    boundary = _message_leaderboard_reset_boundary(now)
+    if _message_leaderboard_period_start is None or boundary > _message_leaderboard_period_start:
+        _message_leaderboard_counts.clear()
+        _message_leaderboard_period_start = boundary
+
+
+async def backup_message_leaderboard_to_log_channel():
+    try:
+        await _backup_file_to_channel(
+            MESSAGE_LEADERBOARD_LOG_CHANNEL_ID, MESSAGE_LEADERBOARD_DB_FILE, MESSAGE_LEADERBOARD_DB_FILE
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to back up message leaderboard db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the save loop
+        print(f"Unexpected error backing up message leaderboard db: {e}")
+
+
+async def restore_message_leaderboard_from_log_channel():
+    """Pulls the last-known counts from MESSAGE_LEADERBOARD_LOG_CHANNEL_ID into local
+    storage on startup — critical because Railway wipes the container's disk on every
+    redeploy, the same reason teams/giveaways/tickets/meta-version are backed up this way."""
+    if os.path.exists(MESSAGE_LEADERBOARD_DB_FILE):
+        load_message_leaderboard_db()
+        await backup_message_leaderboard_to_log_channel()
+        return
+
+    try:
+        found = await _restore_file_from_channel(
+            MESSAGE_LEADERBOARD_LOG_CHANNEL_ID, MESSAGE_LEADERBOARD_DB_FILE, MESSAGE_LEADERBOARD_DB_FILE
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to restore message leaderboard db from log channel: {e}")
+        found = False
+
+    if found:
+        load_message_leaderboard_db()
+        print("Restored weekly message leaderboard counts from log channel backup.")
+    else:
+        global _message_leaderboard_period_start
+        _message_leaderboard_period_start = _message_leaderboard_reset_boundary(discord.utils.utcnow())
+        print("No message leaderboard backup found — starting a fresh week.")
+
+
+@tasks.loop(minutes=MESSAGE_LEADERBOARD_SAVE_INTERVAL_MINUTES)
+async def message_leaderboard_save_loop():
+    global _message_leaderboard_dirty
+    if not _message_leaderboard_dirty:
+        return
+    _message_leaderboard_dirty = False
+    save_message_leaderboard_db()
+    await backup_message_leaderboard_to_log_channel()
+
+
+@message_leaderboard_save_loop.before_loop
+async def before_message_leaderboard_save_loop():
+    await bot.wait_until_ready()
+
+
+_LEADERBOARD_RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+class MessageLeaderboardView(discord.ui.LayoutView):
+    """A Components V2 container styled like the other cards elsewhere in the bot
+    (SupportPanelView / MetaUpdateView / MemberCountView) — an accent-bordered card
+    listing this week's top 10 most active members by message count."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        now = discord.utils.utcnow()
+        ranked = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        next_reset = _message_leaderboard_next_reset(now)
+
+        if ranked:
+            lines = [
+                f"{_LEADERBOARD_RANK_EMOJI.get(i, f'`{i}.`')} <@{uid}> — `{count:,}` msgs"
+                for i, (uid, count) in enumerate(ranked, start=1)
+            ]
+            body = "\n".join(lines)
+        else:
+            body = "No messages tracked yet this week — check back soon!"
+
+        children = [
+            discord.ui.TextDisplay("# 🏆 Weekly Message Leaderboard"),
+            discord.ui.TextDisplay("The top 10 most active members this week:"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(body),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f"-# Resets <t:{int(next_reset.timestamp())}:R> (every Sunday at 23:00 UTC)"),
+        ]
+
+        container = discord.ui.Container(*children, accent_colour=discord.Colour.gold())
+        self.add_item(container)
+
+
+@bot.tree.command(name="messageleaderboard", description="Show this week's most active members by message count")
+async def messageleaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send(view=MessageLeaderboardView())
+
+
 # ---------- Slash commands ----------
 @bot.tree.command(name="createteam", description="Create a new team")
 @app_commands.describe(
@@ -4215,6 +4406,7 @@ async def on_message(message: discord.Message):
 
     if message.guild is not None and not message.author.bot:
         await maybe_restick_tournament_message(message)
+        record_message_for_leaderboard(message.author.id)
 
     await bot.process_commands(message)
 
@@ -5290,6 +5482,7 @@ async def on_ready():
     await restore_meta_version_from_log_channel()
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
+    await restore_message_leaderboard_from_log_channel()
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
@@ -5326,6 +5519,8 @@ async def on_ready():
         meta_poll_loop.start()
     if not check_scrim_expiry.is_running():
         check_scrim_expiry.start()
+    if not message_leaderboard_save_loop.is_running():
+        message_leaderboard_save_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
