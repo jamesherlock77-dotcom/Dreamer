@@ -96,11 +96,12 @@ META_EMBED_AUTHOR = "AC: Arena Hub"  # small eyebrow text shown above the embed 
 META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update is detected
 
 # ---------- Weekly message leaderboard config ----------
-MESSAGE_LEADERBOARD_LOG_CHANNEL_ID = 123456789012345678  # <-- SET ME: channel the leaderboard's JSON backup lives in
+MESSAGE_LEADERBOARD_LOG_CHANNEL_ID = 1539159955922362369  # channel the leaderboard's JSON backup lives in
 MESSAGE_LEADERBOARD_DB_FILE = "message_leaderboard_data.json"
 MESSAGE_LEADERBOARD_SAVE_INTERVAL_MINUTES = 5   # how often in-memory counts are flushed to disk + backed up
 MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ... Sunday=6
 MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
+MESSAGE_LEADERBOARD_RESET_MINUTE_UTC = 59       # ...and this minute — i.e. Sunday 23:59 UTC
 
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
@@ -2989,16 +2990,19 @@ async def updateembed(interaction: discord.Interaction):
 # ============================================================
 # WEEKLY MESSAGE LEADERBOARD — tracks how many messages each
 # member sends and posts a top-10 card via /messageleaderboard.
-# Counts reset automatically every Sunday at 23:00 UTC.
+# Counts reset automatically every Sunday at 23:59 UTC.
 # ============================================================
 
 def _message_leaderboard_reset_boundary(now: datetime) -> datetime:
-    """Returns the most recent Sunday-23:00-UTC boundary at or before `now`. Counts
+    """Returns the most recent Sunday-23:59-UTC boundary at or before `now`. Counts
     belong to the "week" starting at whichever boundary is currently in effect, so a
     reset just means: if a newer boundary has been crossed, wipe the counts."""
     days_since = (now.weekday() - MESSAGE_LEADERBOARD_RESET_WEEKDAY) % 7
     candidate = (now - timedelta(days=days_since)).replace(
-        hour=MESSAGE_LEADERBOARD_RESET_HOUR_UTC, minute=0, second=0, microsecond=0
+        hour=MESSAGE_LEADERBOARD_RESET_HOUR_UTC,
+        minute=MESSAGE_LEADERBOARD_RESET_MINUTE_UTC,
+        second=0,
+        microsecond=0,
     )
     if candidate > now:
         candidate -= timedelta(days=7)
@@ -3363,6 +3367,80 @@ async def messageleaderboard(interaction: discord.Interaction):
     await interaction.followup.send(
         content="🏆 **Here are the current top 10 chatters!** 🏆",
         file=file,
+    )
+
+
+@bot.tree.command(
+    name="syncmessages",
+    description="(Staff) Rebuild this week's message counts by rescanning channel history since the last reset",
+)
+async def syncmessages(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    # The boundary is this week's currently-in-effect Sunday-23:59-UTC reset — i.e. "last
+    # Sunday 23:59" relative to right now, same boundary record_message_for_leaderboard uses.
+    boundary = _message_leaderboard_reset_boundary(discord.utils.utcnow())
+
+    # Collect every channel that can hold messages: text channels, and both active + archived
+    # threads (including forum posts) off of them — mirrors what on_message already counts
+    # live for every non-bot message sent anywhere in the guild, so a resync matches it.
+    channels_to_scan: list = list(guild.text_channels)
+
+    for text_channel in guild.text_channels:
+        channels_to_scan.extend(text_channel.threads)
+        try:
+            async for thread in text_channel.archived_threads(limit=None):
+                channels_to_scan.append(thread)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    for forum in getattr(guild, "forums", []):
+        channels_to_scan.extend(forum.threads)
+        try:
+            async for thread in forum.archived_threads(limit=None):
+                channels_to_scan.append(thread)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    counts: dict[int, int] = {}
+    scanned_channels = 0
+    skipped_channels = 0
+    total_messages = 0
+
+    for channel in channels_to_scan:
+        try:
+            async for message in channel.history(after=boundary, limit=None, oldest_first=True):
+                if message.author.bot:
+                    continue
+                counts[message.author.id] = counts.get(message.author.id, 0) + 1
+                total_messages += 1
+            scanned_channels += 1
+        except (discord.Forbidden, discord.HTTPException):
+            skipped_channels += 1
+            continue
+
+    global _message_leaderboard_period_start, _message_leaderboard_dirty
+    _message_leaderboard_counts.clear()
+    _message_leaderboard_counts.update(counts)
+    _message_leaderboard_period_start = boundary
+    _message_leaderboard_dirty = True
+    save_message_leaderboard_db()
+    await backup_message_leaderboard_to_log_channel()
+
+    await interaction.followup.send(
+        f"✅ Resynced weekly message counts from <t:{int(boundary.timestamp())}:f> — "
+        f"scanned {scanned_channels} channel(s)/thread(s) ({skipped_channels} skipped due to missing access), "
+        f"counted {total_messages:,} messages across {len(counts)} member(s).",
+        ephemeral=True,
     )
 
 
