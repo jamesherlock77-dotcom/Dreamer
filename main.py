@@ -3137,11 +3137,32 @@ def _leaderboard_blend_shape(base: "Image.Image", draw_fn) -> None:
     base.alpha_composite(overlay)
 
 
+_leaderboard_font_warned_paths: set = set()
+
+
 def _leaderboard_load_font(path: str, size: int) -> "ImageFont.FreeTypeFont":
     try:
         return ImageFont.truetype(path, size)
-    except OSError:
+    except OSError as e:
+        if path not in _leaderboard_font_warned_paths:
+            _leaderboard_font_warned_paths.add(path)
+            print(f"[leaderboard] Failed to load font at '{path}': {e!r} — falling back to Pillow's default font.")
         return ImageFont.load_default()
+
+
+def _leaderboard_log_asset_status() -> None:
+    """Prints whether each leaderboard asset was actually found on disk at startup,
+    so a wrong path or a missing/un-committed file shows up immediately in the Railway
+    logs instead of silently rendering with the wrong font."""
+    for label, path in (
+        ("Orbitron regular/bold font", LEADERBOARD_FONT_PATH),
+        ("Orbitron extra-bold font", LEADERBOARD_FONT_EXTRABOLD_PATH),
+        ("Background image", LEADERBOARD_BG_PATH),
+    ):
+        if os.path.exists(path):
+            print(f"[leaderboard] Found {label} at '{path}'.")
+        else:
+            print(f"[leaderboard] MISSING {label} — expected at '{path}'.")
 
 
 async def _resolve_leaderboard_username(guild: discord.Guild | None, user_id: int) -> str:
@@ -5672,6 +5693,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.event
 async def on_ready():
+    _leaderboard_log_asset_status()
     await restore_db_from_log_channel()
     await restore_ticket_db_from_log_channel()
     await restore_meta_version_from_log_channel()
