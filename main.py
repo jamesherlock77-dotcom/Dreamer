@@ -55,8 +55,10 @@ TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the
 TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the sticky tournament message
 TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
-TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # gets every permission in every team channel
-TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # gets every permission except channel/permission management in every team channel
+TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
+TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
+TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID = 1539098236772425830  # gets basic (view/send/read history/react + ping-any-role) access in every team channel, except TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID
+TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID = 1534638919465963570  # this one team channel is skipped when granting TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID access
 
 ROLES_PANEL_CHANNEL_ID = 1528008012625743944  # channel the roles panel is posted in
 
@@ -476,26 +478,21 @@ def team_leader_channel_overwrite() -> discord.PermissionOverwrite:
     )
 
 
-def team_channel_full_access_overwrite() -> discord.PermissionOverwrite:
-    """Every permission, allowed — granted to TEAM_CHANNEL_FULL_ACCESS_ROLE_ID in every
-    team channel."""
-    return discord.PermissionOverwrite.from_pair(discord.Permissions.all(), discord.Permissions.none())
-
-
-def team_channel_viewer_overwrite() -> discord.PermissionOverwrite:
-    """Every permission except channel/permission management, allowed — granted to
-    TEAM_CHANNEL_VIEWER_ROLE_ID in every team channel. Lets holders see and fully interact
-    with every team channel without being able to manage the channel, its permissions, or
-    webhooks."""
-    allow = discord.Permissions.all()
-    allow.update(
-        administrator=False,
-        manage_channels=False,
-        manage_permissions=False,
-        manage_roles=False,
-        manage_webhooks=False,
+def team_channel_basic_access_overwrite() -> discord.PermissionOverwrite:
+    """Basic-use permissions, allowed — granted to TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID in
+    every team channel except TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID. Lets holders
+    view the channel, send messages, read history, and react (i.e. use basic commands)
+    without any channel/message/permission management rights. mention_everyone is included
+    so holders can still ping any role in the channel, even one that isn't itself set to be
+    mentionable — same trick used for team leaders."""
+    return discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        add_reactions=True,
+        use_application_commands=True,
+        mention_everyone=True,
     )
-    return discord.PermissionOverwrite.from_pair(allow, discord.Permissions.none())
 
 
 # Preset palette offered in /premiumteamsettings' colour1/colour2 dropdowns (Discord caps choices at 25).
@@ -1433,10 +1430,12 @@ async def sync_existing_teams():
     """Backfill pass run on every startup: makes sure every current team leader holds
     TEAM_LEADER_ROLE_ID and has the manage-messages/mention-everyone overrides in their
     own team channel (so they can ping the team, delete messages, and pin messages), that
-    TEAM_CHANNEL_FULL_ACCESS_ROLE_ID has every permission in every team channel, and that
-    TEAM_CHANNEL_VIEWER_ROLE_ID has every permission except channel/permission management
-    in every team channel. Idempotent — cheap after the first run, and self-heals if a
-    permission or role is ever reverted manually."""
+    any leftover TEAM_CHANNEL_FULL_ACCESS_ROLE_ID / TEAM_CHANNEL_VIEWER_ROLE_ID overwrites
+    are stripped out of every team channel (those roles no longer get team-channel access),
+    and that TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID has basic access in every team channel except
+    TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID. Runs against every team every time, so any
+    newly created team gets picked up the next time this runs. Idempotent — cheap after the
+    first run, and self-heals if a permission or role is ever reverted manually."""
     db = load_db()
     if not db["teams"]:
         return
@@ -1444,8 +1443,8 @@ async def sync_existing_teams():
     guild = None
     leader_role_granted = 0
     perms_updated = 0
-    full_access_updated = 0
-    viewer_access_updated = 0
+    legacy_access_removed = 0
+    basic_access_updated = 0
 
     for team_name, info in db["teams"].items():
         leader_id = info.get("leader_id")
@@ -1464,35 +1463,47 @@ async def sync_existing_teams():
 
         channel = guild.get_channel(channel_id) if channel_id is not None else None
 
-        # Backfill the full-access role's channel permissions regardless of who leads the team.
+        # Strip any leftover overwrites for the two legacy roles, and backfill the new
+        # basic-access role's channel permissions, regardless of who leads the team.
         if channel is not None:
-            full_access_role = guild.get_role(TEAM_CHANNEL_FULL_ACCESS_ROLE_ID)
-            if full_access_role is not None:
-                allow, _deny = channel.overwrites_for(full_access_role).pair()
-                if allow != discord.Permissions.all():
+            for legacy_role_id in (TEAM_CHANNEL_FULL_ACCESS_ROLE_ID, TEAM_CHANNEL_VIEWER_ROLE_ID):
+                legacy_role = guild.get_role(legacy_role_id)
+                if legacy_role is not None and legacy_role in channel.overwrites:
                     try:
                         await channel.set_permissions(
-                            full_access_role,
-                            overwrite=team_channel_full_access_overwrite(),
-                            reason=f"Backfilled full-access role permissions for existing team {team_name}",
+                            legacy_role,
+                            overwrite=None,
+                            reason=f"Removed legacy team-channel access role from {team_name}",
                         )
-                        full_access_updated += 1
+                        legacy_access_removed += 1
                     except discord.HTTPException:
                         pass
 
-            viewer_role = guild.get_role(TEAM_CHANNEL_VIEWER_ROLE_ID)
-            if viewer_role is not None:
-                allow, _deny = channel.overwrites_for(viewer_role).pair()
-                if allow != team_channel_viewer_overwrite().pair()[0]:
+            if channel_id == TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID:
+                basic_role = guild.get_role(TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID)
+                if basic_role is not None and basic_role in channel.overwrites:
                     try:
                         await channel.set_permissions(
-                            viewer_role,
-                            overwrite=team_channel_viewer_overwrite(),
-                            reason=f"Backfilled viewer role permissions for existing team {team_name}",
+                            basic_role,
+                            overwrite=None,
+                            reason=f"Excluded team channel — basic-access role should not have access here ({team_name})",
                         )
-                        viewer_access_updated += 1
                     except discord.HTTPException:
                         pass
+            else:
+                basic_role = guild.get_role(TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID)
+                if basic_role is not None:
+                    allow, _deny = channel.overwrites_for(basic_role).pair()
+                    if allow != team_channel_basic_access_overwrite().pair()[0]:
+                        try:
+                            await channel.set_permissions(
+                                basic_role,
+                                overwrite=team_channel_basic_access_overwrite(),
+                                reason=f"Backfilled basic-access role permissions for existing team {team_name}",
+                            )
+                            basic_access_updated += 1
+                        except discord.HTTPException:
+                            pass
 
         if leader_id is None:
             continue
@@ -1527,12 +1538,12 @@ async def sync_existing_teams():
                 except discord.HTTPException:
                     pass
 
-    if leader_role_granted or perms_updated or full_access_updated or viewer_access_updated:
+    if leader_role_granted or perms_updated or legacy_access_removed or basic_access_updated:
         print(
             f"Backfilled team-leader role onto {leader_role_granted} leader(s), channel "
-            f"permissions onto {perms_updated} leader(s), full-access role permissions "
-            f"onto {full_access_updated} team channel(s), and viewer role permissions onto "
-            f"{viewer_access_updated} team channel(s)."
+            f"permissions onto {perms_updated} leader(s), removed {legacy_access_removed} "
+            f"legacy access-role overwrite(s), and backfilled basic-access role permissions "
+            f"onto {basic_access_updated} team channel(s)."
         )
 
 
@@ -1859,13 +1870,9 @@ class ConfirmTeamView(discord.ui.View):
             leader: team_leader_channel_overwrite(),
         }
 
-        full_access_role = guild.get_role(TEAM_CHANNEL_FULL_ACCESS_ROLE_ID)
-        if full_access_role is not None:
-            overwrites[full_access_role] = team_channel_full_access_overwrite()
-
-        viewer_role = guild.get_role(TEAM_CHANNEL_VIEWER_ROLE_ID)
-        if viewer_role is not None:
-            overwrites[viewer_role] = team_channel_viewer_overwrite()
+        basic_access_role = guild.get_role(TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID)
+        if basic_access_role is not None:
+            overwrites[basic_access_role] = team_channel_basic_access_overwrite()
 
         channel_name = f"{self.emoji}┃{self.team_name}-Team"
         try:
