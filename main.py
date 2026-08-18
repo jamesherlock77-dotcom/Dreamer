@@ -578,85 +578,156 @@ PREMIUM_COLOUR_CHOICES = [
 SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
-def build_support_ticket_embed() -> discord.Embed:
-    description = (
-        "Welcome! Before opening a ticket, please read the rules below "
-        "carefully. Our team is here to help with server issues.\n\n"
-        "## 📘 Ticket Rules\n"
-        "`1.` Please follow our server rules and stay respectful.\n"
-        "`2.` Do not open a ticket to report in-game issues.\n"
-        "`3.` Do not spam or open multiple tickets for the same issue.\n"
-        "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n\n"
-        "## ⏳ Response Time\n"
-        "If you don't respond within 48 hours, your ticket will be closed.\n\n"
-        "## 🤔 Need Help With Something Else?\n"
-        "<#1528007337699311740>\n"
-        "<#1528009356119900210>\n"
-        "<#1528230357072347146>"
-    )
-    embed = discord.Embed(
-        title=SUPPORT_PANEL_TITLE,
-        description=description,
-        colour=discord.Colour.orange(),
-    )
-    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
-    embed.set_footer(text="Animal Company: Arena Hub")
-    return embed
+class SupportPanelView(discord.ui.LayoutView):
+    """A Components V2 container styled like RolesPanelView/MetaUpdateView elsewhere in
+    the bot — accent-bordered card with a title, rules, category dropdown, and the hub
+    banner, instead of the old plain embed + separate View."""
+
+    def __init__(self, *, include_banner: bool = True):
+        super().__init__(timeout=None)
+
+        description = (
+            "Welcome! Before opening a ticket, please read the rules below "
+            "carefully. Our team is here to help with server issues.\n\n"
+            "## 📘 Ticket Rules\n"
+            "`1.` Please follow our server rules and stay respectful.\n"
+            "`2.` Do not open a ticket to report in-game issues.\n"
+            "`3.` Do not spam or open multiple tickets for the same issue.\n"
+            "`4.` Do not use tickets to report bugs, use the proper bug report channel.\n\n"
+            "## ⏳ Response Time\n"
+            "If you don't respond within 48 hours, your ticket will be closed.\n\n"
+            "## 🤔 Need Help With Something Else?\n"
+            "<#1528007337699311740>\n"
+            "<#1528009356119900210>\n"
+            "<#1528230357072347146>"
+        )
+
+        select = discord.ui.Select(
+            placeholder="Select a category...",
+            options=[
+                discord.SelectOption(
+                    label="Discord Issue",
+                    emoji=discord.PartialEmoji(name="SilverTrophy", id=1528216893297791098),
+                ),
+                discord.SelectOption(
+                    label="Report A Discord User",
+                    emoji=discord.PartialEmoji(name="boombox", id=1528218480657170452),
+                ),
+            ],
+            custom_id="support_panel_category_select",
+        )
+        select.callback = self._make_category_select_callback(select)
+
+        children = [
+            discord.ui.TextDisplay(f"# {SUPPORT_PANEL_TITLE}"),
+            discord.ui.TextDisplay(description),
+            discord.ui.ActionRow(select),
+            discord.ui.Separator(),
+        ]
+        if include_banner:
+            children.append(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
+            )
+        children.append(discord.ui.TextDisplay("-# Animal Company: Arena Hub"))
+
+        self.add_item(discord.ui.Container(*children))
+
+    def _make_category_select_callback(self, select: discord.ui.Select):
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.send_modal(TicketIntakeModal(select.values[0]))
+
+        return callback
 
 
 # ---------- Persistent "Close" button attached to every ticket thread's first message ----------
-class TicketCloseView(discord.ui.View):
-    def __init__(self):
+class TicketThreadView(discord.ui.LayoutView):
+    """A Components V2 container styled like RolesPanelView/MetaUpdateView elsewhere in
+    the bot — replaces the old Embed + separate TicketCloseView with one native container
+    holding the ticket details and the Close button together.
+
+    Pass number/category_label/answers/opener to build a real ticket's contents; call with
+    no arguments to get a placeholder container used only to re-register the persistent
+    Close button's custom_id after a restart (see on_ready)."""
+
+    def __init__(
+        self,
+        number: int | None = None,
+        category_label: str | None = None,
+        answers: list[tuple[str, str]] | None = None,
+        opener: discord.abc.User | None = None,
+    ):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Close", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close_button")
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        thread = interaction.channel
-        if not isinstance(thread, discord.Thread):
-            await interaction.response.send_message(
-                "This can only be used inside a ticket thread.", ephemeral=True
-            )
-            return
+        button = discord.ui.Button(
+            label="Close", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close_button"
+        )
+        button.callback = self._make_close_callback(button)
 
-        db = load_ticket_db()
-        ticket = db["tickets"].get(str(thread.id))
+        children = []
+        if number is not None:
+            body = f"**Category:** {category_label}\n\n"
+            body += "\n\n".join(f"**{question}**\n{response}" for question, response in answers)
+            # Components V2 messages can't carry a top-level `content` field, so the
+            # role/opener ping has to live inside the container as its own text
+            # component — Discord still parses and notifies on mentions found there.
+            children.append(discord.ui.TextDisplay(f"<@&{TICKET_PING_ROLE_ID}> {opener.mention}"))
+            children.append(discord.ui.TextDisplay(f"### Ticket #{number}\n{body}"))
+            children.append(discord.ui.Separator())
+        children.append(discord.ui.ActionRow(button))
+        if opener is not None:
+            children.append(discord.ui.TextDisplay(f"-# Opened by {opener}"))
 
-        is_opener = ticket is not None and interaction.user.id == ticket.get("opener_id")
-        has_close_role = any(role.id == TICKET_CLOSE_ROLE_ID for role in interaction.user.roles)
-        if not (has_staff_role(interaction.user) or has_close_role or is_opener):
-            await interaction.response.send_message(
-                "You don't have permission to close this ticket.", ephemeral=True
-            )
-            return
+        self.add_item(discord.ui.Container(*children))
 
-        await interaction.response.defer()
+    def _make_close_callback(self, button: discord.ui.Button):
+        async def callback(interaction: discord.Interaction):
+            thread = interaction.channel
+            if not isinstance(thread, discord.Thread):
+                await interaction.response.send_message(
+                    "This can only be used inside a ticket thread.", ephemeral=True
+                )
+                return
 
-        if ticket is not None:
-            ticket["closed"] = True
-            save_ticket_db(db)
-            await backup_ticket_db_to_log_channel()
+            db = load_ticket_db()
+            ticket = db["tickets"].get(str(thread.id))
 
-        for child in self.children:
-            child.disabled = True
-        try:
-            await interaction.message.edit(view=self)
-        except discord.HTTPException:
-            pass
+            is_opener = ticket is not None and interaction.user.id == ticket.get("opener_id")
+            has_close_role = any(role.id == TICKET_CLOSE_ROLE_ID for role in interaction.user.roles)
+            if not (has_staff_role(interaction.user) or has_close_role or is_opener):
+                await interaction.response.send_message(
+                    "You don't have permission to close this ticket.", ephemeral=True
+                )
+                return
 
-        try:
-            await thread.send(f"🔒 Ticket closed by {interaction.user.mention}.")
-        except discord.HTTPException:
-            pass
+            await interaction.response.defer()
 
-        try:
-            await thread.edit(
-                name="closed-ticket",
-                archived=True,
-                locked=True,
-                reason=f"Ticket closed by {interaction.user}",
-            )
-        except discord.HTTPException:
-            pass
+            if ticket is not None:
+                ticket["closed"] = True
+                save_ticket_db(db)
+                await backup_ticket_db_to_log_channel()
+
+            button.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+            try:
+                await thread.send(f"🔒 Ticket closed by {interaction.user.mention}.")
+            except discord.HTTPException:
+                pass
+
+            try:
+                await thread.edit(
+                    name="closed-ticket",
+                    archived=True,
+                    locked=True,
+                    reason=f"Ticket closed by {interaction.user}",
+                )
+            except discord.HTTPException:
+                pass
+
+        return callback
 
 
 # ---------- Dropdown shown under the support ticket panel banner — opens a ticket thread ----------
@@ -664,8 +735,8 @@ async def _create_ticket_thread(
     interaction: discord.Interaction, category_label: str, answers: list[tuple[str, str]]
 ):
     """Shared by the intake modal: opens the ticket thread, pings the role + opener, posts
-    an embed with the submitted answers, and logs the ticket to the database. `answers` is
-    a list of (question, response) pairs shown in the ticket embed."""
+    a container with the submitted answers, and logs the ticket to the database. `answers`
+    is a list of (question, response) pairs shown in the ticket container."""
     channel = interaction.guild.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(
         SUPPORT_TICKET_CHANNEL_ID
     )
@@ -705,16 +776,7 @@ async def _create_ticket_thread(
     save_ticket_db(db)
     await backup_ticket_db_to_log_channel()
 
-    description = f"**Category:** {category_label}\n\n"
-    description += "\n\n".join(f"**{question}**\n{response}" for question, response in answers)
-    embed = discord.Embed(title=f"Ticket #{number}", description=description, colour=discord.Colour.orange())
-    embed.set_footer(text=f"Opened by {interaction.user}")
-
-    await thread.send(
-        content=f"<@&{TICKET_PING_ROLE_ID}> {interaction.user.mention}",
-        embed=embed,
-        view=TicketCloseView(),
-    )
+    await thread.send(view=TicketThreadView(number, category_label, answers, interaction.user))
 
     await interaction.followup.send(f"Ticket created: {thread.mention}", ephemeral=True)
 
@@ -775,49 +837,35 @@ class TicketIntakeModal(discord.ui.Modal, title="Open a Ticket"):
         await _create_ticket_thread(interaction, self.category_label, answers)
 
 
-class SupportPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.select(
-        placeholder="Select a category...",
-        options=[
-            discord.SelectOption(
-                label="Discord Issue",
-                emoji=discord.PartialEmoji(name="SilverTrophy", id=1528216893297791098),
-            ),
-            discord.SelectOption(
-                label="Report A Discord User",
-                emoji=discord.PartialEmoji(name="boombox", id=1528218480657170452),
-            ),
-        ],
-        custom_id="support_panel_category_select",
-    )
-    async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        await interaction.response.send_modal(TicketIntakeModal(select.values[0]))
-
-
 async def refresh_support_ticket_panel():
     """Posts the support ticket panel if one isn't already up in the target channel.
     Unlike before, this does NOT delete and repost the panel on every startup — that would
     spam the channel. It only posts a fresh panel the first time (or if the old one was
-    deleted)."""
+    deleted). Components V2 messages don't carry a top-level embed, so "already posted" is
+    detected via the attached banner file instead (same approach refresh_roles_panel uses)
+    — or, if no banner is available locally, via the presence of any component-based
+    message from the bot."""
     channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
+    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
 
     async for msg in channel.history(limit=50):
-        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == SUPPORT_PANEL_TITLE:
-            return  # panel already posted — leave it alone
+        if msg.author.id != bot.user.id:
+            continue
+        if include_banner:
+            if msg.attachments and msg.attachments[0].filename == SUPPORT_BANNER_FILENAME:
+                return  # panel already posted — leave it alone
+        elif msg.components:
+            return  # panel already posted (best-effort check, no banner to match on)
 
-    view = SupportPanelView()
+    view = SupportPanelView(include_banner=include_banner)
 
-    if not os.path.exists(SUPPORT_BANNER_PATH):
+    if not include_banner:
         print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — panel sent without image.")
-        await channel.send(embed=build_support_ticket_embed(), view=view)
+        await channel.send(view=view)
         return
 
-    embed = build_support_ticket_embed()
     file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-    await channel.send(embed=embed, file=file, view=view)
+    await channel.send(view=view, file=file)
 
 
 # ---------- Roles panel (self-role dropdown) ----------
@@ -5367,7 +5415,11 @@ async def on_ready():
     await restore_scrim_db_from_log_channel()
     bot.add_view(SupportPanelView())
     bot.add_view(RolesPanelView())
-    bot.add_view(TicketCloseView())
+    # Registers the "Close" button's custom_id against a callback so it keeps working on
+    # existing ticket threads after a restart — called with no arguments, this just
+    # builds a placeholder container; only the button's custom_id is used to route
+    # the interaction on old messages, not this container's content.
+    bot.add_view(TicketThreadView())
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayJoinView())
