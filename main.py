@@ -105,9 +105,8 @@ MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at t
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
 # plain dark canvas if the assets aren't present, so the command still works out of the box.
-LEADERBOARD_ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-LEADERBOARD_BG_PATH = os.path.join(LEADERBOARD_ASSETS_DIR, "leaderboard-bg.png")
-LEADERBOARD_BG_FALLBACK_PATH = os.path.join(LEADERBOARD_ASSETS_DIR, "default-background.png")
+LEADERBOARD_BG_PATH = os.path.join(BASE_DIR, "leaderboard-bg.png")
+LEADERBOARD_BG_FALLBACK_PATH = os.path.join(BASE_DIR, "default-background.png")
 LEADERBOARD_FONT_PATH = os.path.join(BASE_DIR, "Orbitron-Bold.ttf")        # family "Orbitron" in the JS version
 LEADERBOARD_FONT_EXTRABOLD_PATH = os.path.join(BASE_DIR, "Orbitron-ExtraBold.ttf")  # family "OrbitronExtra"
 LEADERBOARD_CANVAS_WIDTH = 900
