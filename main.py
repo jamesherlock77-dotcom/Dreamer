@@ -128,20 +128,44 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # two separate Discord channels — see backup_db_to_log_channel / restore_db_from_log_channel
 # below), but the rest of the bot still works with a single merged {"teams": ..., "giveaways": ...}
 # dict in memory, exactly as before, so nothing else in the file needs to change.
+
+def _load_json_file(path: str):
+    """Reads a JSON file, returning None if it's missing OR present-but-invalid
+    (e.g. empty/truncated because the process was killed mid-write). Callers should
+    treat None the same as "no file" rather than letting the exception propagate —
+    an empty file on disk should never be able to crash startup."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] {path} exists but isn't valid JSON ({e}); treating as missing.")
+        return None
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    """Writes JSON to path atomically (write to a temp file, then os.replace) so a
+    crash/kill mid-write can never leave a truncated/empty file behind — os.replace
+    is atomic on POSIX and Windows, unlike open(path, 'w') which truncates in place."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+
 def load_db() -> dict:
     data = {"teams": {}, "giveaways": {}}
 
-    if os.path.exists(TEAMS_DB_FILE):
-        with open(TEAMS_DB_FILE, "r", encoding="utf-8") as f:
-            teams_file = json.load(f)
+    teams_file = _load_json_file(TEAMS_DB_FILE)
+    if teams_file is not None:
         if "teams" not in teams_file:
             # migrate old flat-format {team_name: {...}} files
             teams_file = {"teams": teams_file}
         data["teams"] = teams_file.get("teams", {})
 
-    if os.path.exists(GIVEAWAYS_DB_FILE):
-        with open(GIVEAWAYS_DB_FILE, "r", encoding="utf-8") as f:
-            giveaways_file = json.load(f)
+    giveaways_file = _load_json_file(GIVEAWAYS_DB_FILE)
+    if giveaways_file is not None:
         data["giveaways"] = giveaways_file.get("giveaways", {})
 
     return data
@@ -149,10 +173,8 @@ def load_db() -> dict:
 
 def save_db(data: dict) -> None:
     now = discord.utils.utcnow().isoformat()
-    with open(TEAMS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump({"teams": data.get("teams", {}), "last_updated": now}, f, indent=2)
-    with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump({"giveaways": data.get("giveaways", {}), "last_updated": now}, f, indent=2)
+    _atomic_write_json(TEAMS_DB_FILE, {"teams": data.get("teams", {}), "last_updated": now})
+    _atomic_write_json(GIVEAWAYS_DB_FILE, {"giveaways": data.get("giveaways", {}), "last_updated": now})
 
 
 # Cache of each database message (keyed by channel ID) so we edit it in place instead of
@@ -332,8 +354,11 @@ async def restore_db_from_log_channel():
     neither dedicated channel has a backup yet. In that case we fall back to the old
     combined log channel (LOG_CHANNEL_ID), split whatever's there into the two new files,
     and immediately push fresh backups to the two new channels so no previous data is lost."""
-    have_teams = os.path.exists(TEAMS_DB_FILE)
-    have_giveaways = os.path.exists(GIVEAWAYS_DB_FILE)
+    # Use validity, not mere existence — a truncated/empty file left behind by a
+    # process that died mid-write (see _atomic_write_json) must not be mistaken for
+    # a good local copy, or we'd skip restoring the real backup from Discord.
+    have_teams = _load_json_file(TEAMS_DB_FILE) is not None
+    have_giveaways = _load_json_file(GIVEAWAYS_DB_FILE) is not None
 
     if not have_teams:
         have_teams = await _restore_file_from_channel(TEAM_LOG_CHANNEL_ID, TEAMS_DB_FILE, TEAMS_DB_FILE)
@@ -345,11 +370,8 @@ async def restore_db_from_log_channel():
         return
 
     # Fall back to the old combined backup and split it into the two new files.
-    legacy = None
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            legacy = json.load(f)
-    else:
+    legacy = _load_json_file(DB_FILE)
+    if legacy is None:
         try:
             channel = bot.get_channel(LOG_CHANNEL_ID) or await bot.fetch_channel(LOG_CHANNEL_ID)
             async for msg in channel.history(limit=50):
@@ -371,12 +393,10 @@ async def restore_db_from_log_channel():
     migrated_at = discord.utils.utcnow().isoformat()
 
     if not have_teams:
-        with open(TEAMS_DB_FILE, "w", encoding="utf-8") as f:
-            json.dump({"teams": legacy.get("teams", {}), "last_updated": migrated_at}, f, indent=2)
+        _atomic_write_json(TEAMS_DB_FILE, {"teams": legacy.get("teams", {}), "last_updated": migrated_at})
         print("Migrated teams data from the legacy combined log channel.")
     if not have_giveaways:
-        with open(GIVEAWAYS_DB_FILE, "w", encoding="utf-8") as f:
-            json.dump({"giveaways": legacy.get("giveaways", {}), "last_updated": migrated_at}, f, indent=2)
+        _atomic_write_json(GIVEAWAYS_DB_FILE, {"giveaways": legacy.get("giveaways", {}), "last_updated": migrated_at})
         print("Migrated giveaways data from the legacy combined log channel.")
 
     # Push the split data into the two new dedicated channels right away, rather than
@@ -390,10 +410,9 @@ async def restore_db_from_log_channel():
 # and are backed up as an auto-updated message in TICKET_LOG_CHANNEL_ID, the same way
 # teams/giveaways are.
 def load_ticket_db() -> dict:
-    if not os.path.exists(TICKETS_DB_FILE):
+    data = _load_json_file(TICKETS_DB_FILE)
+    if data is None:
         return {"next_number": 1, "tickets": {}}
-    with open(TICKETS_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
     data.setdefault("next_number", 1)
     data.setdefault("tickets", {})
     return data
@@ -401,8 +420,7 @@ def load_ticket_db() -> dict:
 
 def save_ticket_db(data: dict) -> None:
     data["last_updated"] = discord.utils.utcnow().isoformat()
-    with open(TICKETS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(TICKETS_DB_FILE, data)
 
 
 async def backup_ticket_db_to_log_channel():
@@ -415,7 +433,9 @@ async def backup_ticket_db_to_log_channel():
 
 
 async def restore_ticket_db_from_log_channel():
-    if os.path.exists(TICKETS_DB_FILE):
+    # Validity, not mere existence — a broken local file must not (a) crash load_ticket_db
+    # later, or (b) get pushed to the log channel here and clobber a good backup.
+    if _load_json_file(TICKETS_DB_FILE) is not None:
         # Local data already present (e.g. a crash-restart, not a fresh container) — push
         # it straight to the log channel so the backup there is confirmed up to date.
         await backup_ticket_db_to_log_channel()
@@ -2669,9 +2689,8 @@ async def before_check_scrim_expiry():
 # ============================================================
 
 def load_last_meta_version() -> str | None:
-    if os.path.exists(META_VERSION_DB_FILE):
-        with open(META_VERSION_DB_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    data = _load_json_file(META_VERSION_DB_FILE)
+    if data is not None:
         return data.get("last_version") or None
 
     # One-time migration: an older build of this bot stored the version as plain text
@@ -2688,12 +2707,10 @@ def load_last_meta_version() -> str | None:
 
 
 def save_last_meta_version(version: str) -> None:
-    with open(META_VERSION_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"last_version": version, "last_updated": discord.utils.utcnow().isoformat()},
-            f,
-            indent=2,
-        )
+    _atomic_write_json(
+        META_VERSION_DB_FILE,
+        {"last_version": version, "last_updated": discord.utils.utcnow().isoformat()},
+    )
 
 
 async def backup_meta_version_to_log_channel():
@@ -2711,7 +2728,7 @@ async def restore_meta_version_from_log_channel():
     the same reason teams/giveaways/tickets are backed up this way. Falls back to
     migrating the legacy local .txt file (if present) and immediately pushing a fresh
     backup, so no previously-known version is lost."""
-    if os.path.exists(META_VERSION_DB_FILE):
+    if _load_json_file(META_VERSION_DB_FILE) is not None:
         # Local data already present (e.g. a crash-restart, not a fresh container) —
         # push it straight to the log channel so the backup there is confirmed up to date.
         await backup_meta_version_to_log_channel()
@@ -3045,28 +3062,25 @@ def record_message_for_leaderboard(user_id: int) -> None:
 
 
 def save_message_leaderboard_db() -> None:
-    with open(MESSAGE_LEADERBOARD_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "counts": {str(uid): count for uid, count in _message_leaderboard_counts.items()},
-                "period_start": (
-                    _message_leaderboard_period_start.isoformat()
-                    if _message_leaderboard_period_start
-                    else None
-                ),
-                "last_updated": discord.utils.utcnow().isoformat(),
-            },
-            f,
-            indent=2,
-        )
+    _atomic_write_json(
+        MESSAGE_LEADERBOARD_DB_FILE,
+        {
+            "counts": {str(uid): count for uid, count in _message_leaderboard_counts.items()},
+            "period_start": (
+                _message_leaderboard_period_start.isoformat()
+                if _message_leaderboard_period_start
+                else None
+            ),
+            "last_updated": discord.utils.utcnow().isoformat(),
+        },
+    )
 
 
 def load_message_leaderboard_db() -> None:
     global _message_leaderboard_period_start
-    if not os.path.exists(MESSAGE_LEADERBOARD_DB_FILE):
+    data = _load_json_file(MESSAGE_LEADERBOARD_DB_FILE)
+    if data is None:
         return
-    with open(MESSAGE_LEADERBOARD_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
 
     _message_leaderboard_counts.clear()
     for uid, count in (data.get("counts") or {}).items():
@@ -3101,7 +3115,7 @@ async def restore_message_leaderboard_from_log_channel():
     """Pulls the last-known counts from MESSAGE_LEADERBOARD_LOG_CHANNEL_ID into local
     storage on startup — critical because Railway wipes the container's disk on every
     redeploy, the same reason teams/giveaways/tickets/meta-version are backed up this way."""
-    if os.path.exists(MESSAGE_LEADERBOARD_DB_FILE):
+    if _load_json_file(MESSAGE_LEADERBOARD_DB_FILE) is not None:
         load_message_leaderboard_db()
         await backup_message_leaderboard_to_log_channel()
         return
@@ -4747,10 +4761,9 @@ def apply_invite_event(
 
 
 def load_invite_db() -> dict:
-    if not os.path.exists(INVITES_DB_FILE):
+    data = _load_json_file(INVITES_DB_FILE)
+    if data is None:
         return {"invited_users": {}, "last_processed_message_id": None}
-    with open(INVITES_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
     data.setdefault("invited_users", {})
     data.setdefault("last_processed_message_id", None)
     return data
@@ -4758,8 +4771,7 @@ def load_invite_db() -> dict:
 
 def save_invite_db(data: dict) -> None:
     data["last_updated"] = discord.utils.utcnow().isoformat()
-    with open(INVITES_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(INVITES_DB_FILE, data)
 
 
 async def backup_invite_db_to_log_channel():
@@ -4772,7 +4784,7 @@ async def backup_invite_db_to_log_channel():
 
 
 async def restore_invite_db_from_log_channel():
-    if os.path.exists(INVITES_DB_FILE):
+    if _load_json_file(INVITES_DB_FILE) is not None:
         # Local data already present (e.g. a crash-restart, not a fresh container) — push
         # it straight to the log channel so the backup there is confirmed up to date.
         await backup_invite_db_to_log_channel()
@@ -4796,18 +4808,16 @@ async def restore_invite_db_from_log_channel():
 # ============================================================
 
 def load_scrim_db() -> dict:
-    if not os.path.exists(SCRIMS_DB_FILE):
+    data = _load_json_file(SCRIMS_DB_FILE)
+    if data is None:
         return {"scrims": {}}
-    with open(SCRIMS_DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
     data.setdefault("scrims", {})
     return data
 
 
 def save_scrim_db(data: dict) -> None:
     data["last_updated"] = discord.utils.utcnow().isoformat()
-    with open(SCRIMS_DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(SCRIMS_DB_FILE, data)
 
 
 async def backup_scrim_db_to_log_channel():
@@ -4820,7 +4830,7 @@ async def backup_scrim_db_to_log_channel():
 
 
 async def restore_scrim_db_from_log_channel():
-    if os.path.exists(SCRIMS_DB_FILE):
+    if _load_json_file(SCRIMS_DB_FILE) is not None:
         # Local data already present (e.g. a crash-restart, not a fresh container) — push
         # it straight to the log channel so the backup there is confirmed up to date.
         await backup_scrim_db_to_log_channel()
