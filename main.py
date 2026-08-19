@@ -2481,6 +2481,19 @@ def parse_duration(text: str):
     return timedelta(seconds=total_seconds)
 
 
+_MESSAGE_LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
+
+
+def parse_message_link(link: str):
+    """Parses a Discord message link (…/channels/<guild>/<channel>/<message>) into
+    (channel_id, message_id) ints. Returns None if the link doesn't match."""
+    match = _MESSAGE_LINK_RE.search(link.strip())
+    if not match:
+        return None
+    _, channel_id, message_id = match.groups()
+    return int(channel_id), int(message_id)
+
+
 def build_giveaway_embed(
     prize: str,
     winners_count: int,
@@ -5657,6 +5670,78 @@ async def startgiveaway(
     await backup_db_to_log_channel()
 
     await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} Giveaway started in {sent.channel.mention}!", ephemeral=True)
+
+
+@bot.tree.command(name="changegiveawayprize", description="(Staff) Change the prize on an existing giveaway")
+@app_commands.describe(
+    messagelink="Link to the giveaway message (right-click it → Copy Message Link)",
+    prize="The new prize text",
+)
+async def changegiveawayprize(interaction: discord.Interaction, messagelink: str, prize: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if not has_staff_role(interaction.user):
+        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    parsed = parse_message_link(messagelink)
+    if parsed is None:
+        await interaction.followup.send(
+            "Couldn't read that as a message link — right-click the giveaway message and choose "
+            "**Copy Message Link**, then paste it here.", ephemeral=True,
+        )
+        return
+    channel_id, message_id = parsed
+
+    db = load_db()
+    giveaways = db.setdefault("giveaways", {})
+    key = str(message_id)
+    info = giveaways.get(key)
+    if info is None:
+        await interaction.followup.send("That message isn't a giveaway I have on record.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None and interaction.guild is not None:
+        channel = interaction.guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            channel = None
+    if channel is None:
+        await interaction.followup.send("I couldn't access the channel that giveaway is in.", ephemeral=True)
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except discord.HTTPException:
+        message = None
+
+    old_prize = info.get("prize")
+    info["prize"] = prize
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    if message is not None:
+        embed = build_giveaway_embed(
+            prize=prize,
+            winners_count=info.get("winners", 1),
+            host_id=info.get("host_id"),
+            end_ts=info.get("end_ts", 0),
+            entries_count=len(info.get("entries", [])),
+            winner_ids=info.get("winner_ids") if info.get("ended") else None,
+        )
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            await interaction.followup.send(
+                f"Updated the prize in the database (`{old_prize}` → `{prize}`), but couldn't edit the "
+                "giveaway message itself — you may need to update it manually.", ephemeral=True,
+            )
+            return
+
+    await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} Prize updated to **{prize}**.", ephemeral=True)
 
 
 # ---------- Message stats slash command ----------
