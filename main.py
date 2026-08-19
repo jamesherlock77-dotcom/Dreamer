@@ -159,6 +159,11 @@ def save_db(data: dict) -> None:
 # posting a new file every time. Populated lazily by scanning channel history.
 _db_message_cache: dict = {}
 
+# Set by the giveaway Join/Leave button when entries change; flushed by check_giveaways()
+# every 30s instead of backing up on every single click — see the comment in
+# GiveawayJoinView.join() for why.
+_giveaway_backup_dirty: bool = False
+
 # User IDs with a /createteam request currently awaiting admin confirmation,
 # so the same user can't queue up multiple pending requests.
 pending_team_requests: set = set()
@@ -2494,10 +2499,6 @@ class GiveawayJoinView(discord.ui.View):
             joined = True
 
         save_db(db)
-        # Persist every entry/leave to the log-channel backup immediately, not just when a
-        # giveaway ends — otherwise entries collected since the last backup would be lost
-        # if the bot restarts (Railway wipes the container disk on every redeploy).
-        await backup_db_to_log_channel()
 
         embed = build_giveaway_embed(
             prize=info["prize"],
@@ -2506,6 +2507,10 @@ class GiveawayJoinView(discord.ui.View):
             end_ts=info["end_ts"],
             entries_count=len(entries),
         )
+        # Acknowledge the click FIRST. Discord invalidates the whole interaction (and every
+        # followup after it) if it doesn't get an initial response within 3 seconds — and a
+        # popular giveaway can get enough simultaneous clicks to rate-limit the log-channel
+        # backup below, which used to run *before* this and could blow past that window.
         try:
             await interaction.response.edit_message(embed=embed)
         except discord.HTTPException:
@@ -2515,6 +2520,13 @@ class GiveawayJoinView(discord.ui.View):
             await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} You're in — good luck!", ephemeral=True)
         else:
             await interaction.followup.send("You left the giveaway.", ephemeral=True)
+
+        # Persist entries so they survive a Railway redeploy — but batched, not on every
+        # single click. A popular giveaway can get dozens of clicks a second, and running
+        # the full multi-file, multi-channel backup on each one is exactly what caused the
+        # rate-limit storm. Mark it dirty here; check_giveaways() flushes it every 30s.
+        global _giveaway_backup_dirty
+        _giveaway_backup_dirty = True
 
 
 async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
@@ -2593,8 +2605,11 @@ async def check_giveaways():
         await _end_giveaway(guild, message_id, info)
         changed = True
 
-    if changed:
-        save_db(db)
+    global _giveaway_backup_dirty
+    if changed or _giveaway_backup_dirty:
+        if changed:
+            save_db(db)
+        _giveaway_backup_dirty = False
         await backup_db_to_log_channel()
 
 
