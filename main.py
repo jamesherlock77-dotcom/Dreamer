@@ -181,6 +181,20 @@ def save_db(data: dict) -> None:
 # posting a new file every time. Populated lazily by scanning channel history.
 _db_message_cache: dict = {}
 
+# Per-channel lock so two backups firing at nearly the same time (e.g. two team actions
+# completing back-to-back) can't both miss _db_message_cache at once and each post a brand
+# new "database" message — without this, concurrent saves race and duplicates pile up in
+# the channel instead of one message being edited in place.
+_db_message_locks: dict = {}
+
+
+def _get_db_message_lock(channel_id: int) -> asyncio.Lock:
+    lock = _db_message_locks.get(channel_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _db_message_locks[channel_id] = lock
+    return lock
+
 # Set by the giveaway Join/Leave button when entries change; flushed by check_giveaways()
 # every 30s instead of backing up on every single click — see the comment in
 # GiveawayJoinView.join() for why.
@@ -218,42 +232,63 @@ async def _get_or_create_db_message(channel_id: int, filename: str):
         return _db_message_cache[channel_id]
 
     channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-    async for msg in channel.history(limit=50):
+
+    # Collect every one of the bot's own messages carrying this filename, not just the
+    # first one found. If duplicates already exist in the channel (from before this fix,
+    # or a past race/hiccup), keep only the newest and delete the rest so the channel
+    # settles back down to a single database message instead of accumulating more.
+    matches = []
+    async for msg in channel.history(limit=200):
         if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == filename:
-            _db_message_cache[channel_id] = msg
-            return msg
-    return None
+            matches.append(msg)
+
+    if not matches:
+        return None
+
+    # channel.history() yields newest-first by default, so the first match is the one to keep.
+    keep, duplicates = matches[0], matches[1:]
+    for dup in duplicates:
+        try:
+            await dup.delete()
+        except discord.HTTPException:
+            pass
+    if duplicates:
+        print(f"[INFO] Cleaned up {len(duplicates)} duplicate `{filename}` message(s) in channel {channel_id}.")
+
+    _db_message_cache[channel_id] = keep
+    return keep
 
 
 async def _backup_file_to_channel(channel_id: int, file_path: str, filename: str):
     """Keeps a single message in the given channel updated with the given local file,
     editing it in place rather than posting a new file every time."""
-    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
-    new_file = discord.File(io.BytesIO(file_bytes), filename=filename)
+    async with _get_db_message_lock(channel_id):
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+        new_file = discord.File(io.BytesIO(file_bytes), filename=filename)
 
-    msg = await _get_or_create_db_message(channel_id, filename)
-    if msg is not None:
-        try:
-            edited = await msg.edit(content="📦 Database (auto-updated):", attachments=[new_file])
-            _db_message_cache[channel_id] = edited
-            await log_bot_event(
-                title="📦 JSON synced",
-                description=f"`{filename}` backed up to <#{channel_id}>.",
-                colour=discord.Colour.dark_teal(),
-            )
-            return
-        except discord.HTTPException:
-            pass  # message may have been deleted; fall through and send a fresh one
+        msg = await _get_or_create_db_message(channel_id, filename)
+        if msg is not None:
+            try:
+                edited = await msg.edit(content="📦 Database (auto-updated):", attachments=[new_file])
+                _db_message_cache[channel_id] = edited
+                await log_bot_event(
+                    title="📦 JSON synced",
+                    description=f"`{filename}` backed up to <#{channel_id}>.",
+                    colour=discord.Colour.dark_teal(),
+                )
+                return
+            except discord.HTTPException:
+                pass  # message may have been deleted; fall through and send a fresh one
 
-    sent = await channel.send(content="📦 Database (auto-updated):", file=new_file)
-    _db_message_cache[channel_id] = sent
-    await log_bot_event(
-        title="📦 JSON synced",
-        description=f"`{filename}` backed up to <#{channel_id}> (new message).",
-        colour=discord.Colour.dark_teal(),
-    )
+        sent = await channel.send(content="📦 Database (auto-updated):", file=new_file)
+        _db_message_cache[channel_id] = sent
+        await log_bot_event(
+            title="📦 JSON synced",
+            description=f"`{filename}` backed up to <#{channel_id}> (new message).",
+            colour=discord.Colour.dark_teal(),
+        )
 
 
 async def backup_db_to_log_channel():
@@ -325,22 +360,23 @@ async def log_bot_event(
 async def _restore_file_from_channel(channel_id: int, file_path: str, filename: str) -> bool:
     """Looks for filename attached to one of the bot's own messages in channel_id and, if
     found, writes it to file_path. Returns whether a backup was found."""
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        async for msg in channel.history(limit=50):
-            if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == filename:
-                data = await msg.attachments[0].read()
-                with open(file_path, "wb") as f:
-                    f.write(data)
-                _db_message_cache[channel_id] = msg
-                await log_bot_event(
-                    title="📥 JSON restored",
-                    description=f"`{filename}` restored from <#{channel_id}>.",
-                    colour=discord.Colour.dark_teal(),
-                )
-                return True
-    except discord.HTTPException as e:
-        print(f"Failed to restore {filename} from channel {channel_id}: {e}")
+    async with _get_db_message_lock(channel_id):
+        try:
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            async for msg in channel.history(limit=200):
+                if msg.author.id == bot.user.id and msg.attachments and msg.attachments[0].filename == filename:
+                    data = await msg.attachments[0].read()
+                    with open(file_path, "wb") as f:
+                        f.write(data)
+                    _db_message_cache[channel_id] = msg
+                    await log_bot_event(
+                        title="📥 JSON restored",
+                        description=f"`{filename}` restored from <#{channel_id}>.",
+                        colour=discord.Colour.dark_teal(),
+                    )
+                    return True
+        except discord.HTTPException as e:
+            print(f"Failed to restore {filename} from channel {channel_id}: {e}")
     return False
 
 
