@@ -62,10 +62,7 @@ TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team'
 # boxes, 2 semifinal boxes, 1 final box = 15 boxes total. /bracketconfig numbers them
 # 1-15 in reading order (top-to-bottom within each round, then round 1 -> final).
 BRACKET_PLACE_COUNT = 15
-# Optional: a font file dropped next to this script for the pixel/mono look from the
-# mockup. Falls back to Pillow's default font (via the leaderboard's font loader) if
-# this file isn't present, so the command still works out of the box.
-BRACKET_FONT_PATH = os.path.join(BASE_DIR, "RobotoMono-Bold.ttf")
+# BRACKET_FONT_PATH is set further down, right after BASE_DIR is defined.
 
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
@@ -92,6 +89,10 @@ BRACKET_DB_FILE = "bracket_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Optional: a font file dropped next to this script for the pixel/mono look from the
+# bracket mockup. Falls back to Pillow's default font (via the leaderboard's font
+# loader) if this file isn't present, so /bracketconfig still works out of the box.
+BRACKET_FONT_PATH = os.path.join(BASE_DIR, "RobotoMono-Bold.ttf")
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
 
