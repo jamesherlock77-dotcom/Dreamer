@@ -57,6 +57,16 @@ TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the
 TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the sticky tournament message
 TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
+# ---------- Tournament bracket config ----------
+# 16-team single-elimination bracket rendered as an image: 8 round-1 boxes, 4 round-2
+# boxes, 2 semifinal boxes, 1 final box = 15 boxes total. /bracketconfig numbers them
+# 1-15 in reading order (top-to-bottom within each round, then round 1 -> final).
+BRACKET_PLACE_COUNT = 15
+# Optional: a font file dropped next to this script for the pixel/mono look from the
+# mockup. Falls back to Pillow's default font (via the leaderboard's font loader) if
+# this file isn't present, so the command still works out of the box.
+BRACKET_FONT_PATH = os.path.join(BASE_DIR, "RobotoMono-Bold.ttf")
+
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID = 1539098236772425830  # gets basic (view/send/read history/react + ping-any-role) access in every team channel, except TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID
@@ -78,6 +88,7 @@ GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
 SCRIMS_DB_FILE = "scrims_data.json"
+BRACKET_DB_FILE = "bracket_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4895,6 +4906,143 @@ async def restore_scrim_db_from_log_channel():
         print("No existing scrim db backup found — starting fresh.")
 
 
+# ---------- Tournament bracket ----------
+def default_bracket_boxes() -> dict:
+    return {str(i): ["", ""] for i in range(1, BRACKET_PLACE_COUNT + 1)}
+
+
+def load_bracket_db() -> dict:
+    data = _load_json_file(BRACKET_DB_FILE)
+    if data is None:
+        return {"boxes": default_bracket_boxes()}
+    boxes = data.get("boxes", {})
+    # Fill in any slots missing from an older/shorter file rather than erroring on them.
+    for i in range(1, BRACKET_PLACE_COUNT + 1):
+        boxes.setdefault(str(i), ["", ""])
+    data["boxes"] = boxes
+    return data
+
+
+def save_bracket_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    _atomic_write_json(BRACKET_DB_FILE, data)
+
+
+def _bracket_layout():
+    """Computes pixel positions for all 15 boxes plus the canvas size, so the render
+    function and the connector-line drawing share one source of truth for coordinates."""
+    box_w, box_h = 230, 64
+    pair_gap, group_gap = 14, 46
+    margin_top, margin_left, margin_right, margin_bottom = 150, 60, 80, 60
+    col_gap = 90
+
+    round1_ys = []
+    y = margin_top
+    for _pair in range(4):
+        round1_ys.append(y)
+        y2 = y + box_h + pair_gap
+        round1_ys.append(y2)
+        y = y2 + box_h + group_gap
+
+    col_x = [margin_left]
+    for _c in range(3):
+        col_x.append(col_x[-1] + box_w + col_gap)
+
+    round1_centers = [ry + box_h / 2 for ry in round1_ys]
+    round2_centers = [(round1_centers[2 * i] + round1_centers[2 * i + 1]) / 2 for i in range(4)]
+    round2_ys = [c - box_h / 2 for c in round2_centers]
+    semi_centers = [(round2_centers[2 * i] + round2_centers[2 * i + 1]) / 2 for i in range(2)]
+    semi_ys = [c - box_h / 2 for c in semi_centers]
+    final_center = (semi_centers[0] + semi_centers[1]) / 2
+    final_y = final_center - box_h / 2
+
+    # Places 1-15 in reading order: round 1 (top-to-bottom), round 2, semis, final.
+    slots = []
+    for i in range(8):
+        slots.append((col_x[0], round1_ys[i]))
+    for i in range(4):
+        slots.append((col_x[1], round2_ys[i]))
+    for i in range(2):
+        slots.append((col_x[2], semi_ys[i]))
+    slots.append((col_x[3], final_y))
+
+    width = int(col_x[3] + box_w + margin_right)
+    height = int(round1_ys[-1] + box_h + margin_bottom)
+
+    return {
+        "box_w": box_w, "box_h": box_h, "col_x": col_x, "col_gap": col_gap,
+        "slots": slots, "width": width, "height": height,
+        "round1_centers": round1_centers, "round2_centers": round2_centers,
+        "semi_centers": semi_centers,
+    }
+
+
+def _bracket_connector(draw: "ImageDraw.ImageDraw", y1: float, y2: float, x_from: float, x_mid: float, x_to: float, color) -> None:
+    """Draws the elbow-shaped connector between two source boxes and the box they feed
+    into: a stub out of each source box, a vertical bar joining them, then a stub into
+    the target box — matching the bracket-line style from the mockup."""
+    draw.line([(x_from, y1), (x_mid, y1)], fill=color, width=2)
+    draw.line([(x_from, y2), (x_mid, y2)], fill=color, width=2)
+    draw.line([(x_mid, y1), (x_mid, y2)], fill=color, width=2)
+    mid_y = (y1 + y2) / 2
+    draw.line([(x_mid, mid_y), (x_to, mid_y)], fill=color, width=2)
+
+
+def _render_bracket_image(boxes: dict) -> bytes:
+    """Draws the 15-box tournament bracket card. Runs synchronously — call via
+    asyncio.to_thread, this is not async-safe on its own."""
+    layout = _bracket_layout()
+    box_w, box_h = layout["box_w"], layout["box_h"]
+    col_x, col_gap = layout["col_x"], layout["col_gap"]
+
+    img = Image.new("RGBA", (layout["width"], layout["height"]), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    card_box = [0, 0, layout["width"] - 1, layout["height"] - 1]
+    draw.rounded_rectangle(card_box, radius=28, fill=(18, 18, 22, 255))
+    draw.rounded_rectangle(card_box, radius=28, outline=(70, 70, 78, 255), width=2)
+
+    title_font = _leaderboard_load_font(BRACKET_FONT_PATH, 50)
+    box_font = _leaderboard_load_font(BRACKET_FONT_PATH, 22)
+
+    draw.text((60, 40), "Tournament Bracket", font=title_font, fill=(240, 240, 240, 255))
+    draw.line([(60, 112), (layout["width"] - 60, 112)], fill=(120, 120, 128, 180), width=2)
+
+    for place, (x, y) in enumerate(layout["slots"], start=1):
+        box_data = boxes.get(str(place)) or ["", ""]
+        team1 = box_data[0] if len(box_data) > 0 else ""
+        team2 = box_data[1] if len(box_data) > 1 else ""
+
+        box = [x, y, x + box_w, y + box_h]
+
+        def _fill(d, box=box):
+            d.rounded_rectangle(box, radius=10, fill=(255, 255, 255, 26))
+
+        _leaderboard_blend_shape(img, _fill)
+
+        if team1:
+            draw.text((x + 16, y + 10), team1, font=box_font, fill=(235, 235, 240, 255))
+        if team2:
+            draw.text((x + 16, y + 38), team2, font=box_font, fill=(235, 235, 240, 255))
+
+    line_color = (225, 225, 230, 220)
+    for i in range(4):
+        x_from = col_x[0] + box_w
+        x_mid = x_from + col_gap / 2
+        _bracket_connector(draw, layout["round1_centers"][2 * i], layout["round1_centers"][2 * i + 1], x_from, x_mid, col_x[1], line_color)
+    for i in range(2):
+        x_from = col_x[1] + box_w
+        x_mid = x_from + col_gap / 2
+        _bracket_connector(draw, layout["round2_centers"][2 * i], layout["round2_centers"][2 * i + 1], x_from, x_mid, col_x[2], line_color)
+    x_from = col_x[2] + box_w
+    x_mid = x_from + col_gap / 2
+    _bracket_connector(draw, layout["semi_centers"][0], layout["semi_centers"][1], x_from, x_mid, col_x[3], line_color)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def scrim_leader_channel_overwrite() -> discord.PermissionOverwrite:
     """Permissions granted to each team's leader in their scrim channel: on top of
     viewing/sending, mention_everyone lets them ping their own team's role even though
@@ -5991,6 +6139,58 @@ async def deletetournamentsignups(interaction: discord.Interaction):
         result += f"\n⚠️ Couldn't delete for: {', '.join(failed)} — check the bot's permissions there."
     result += "\nThey won't be re-stuck until posted again from the tournament panel dropdown."
     await interaction.followup.send(result, ephemeral=True)
+
+
+@bot.tree.command(
+    name="bracketconfig",
+    description="(Staff) Fill in a tournament bracket box, reset the whole bracket, or just view it",
+)
+@app_commands.describe(
+    place=f"Which box to fill in (1-{BRACKET_PLACE_COUNT}, reading order: round 1 top-to-bottom, then round 2, semis, final)",
+    team1="First team/name for that box",
+    team2="Second team/name for that box",
+    reset="Set to true to clear every box back to empty (ignores place/team1/team2)",
+)
+async def bracketconfig(
+    interaction: discord.Interaction,
+    place: app_commands.Range[int, 1, BRACKET_PLACE_COUNT] | None = None,
+    team1: str | None = None,
+    team2: str | None = None,
+    reset: bool = False,
+):
+    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    db = load_bracket_db()
+    boxes = db["boxes"]
+
+    if reset:
+        boxes = default_bracket_boxes()
+        db["boxes"] = boxes
+        save_bracket_db(db)
+    elif place is not None:
+        if not team1 or not team2:
+            await interaction.followup.send(
+                "Please provide both `team1` and `team2` when setting a box.", ephemeral=True
+            )
+            return
+        # Only this one box is touched — every other box's saved value is left exactly as-is.
+        boxes[str(place)] = [team1, team2]
+        save_bracket_db(db)
+    # else: neither `place` nor `reset` was given — just render the bracket as it stands.
+
+    try:
+        image_bytes = await asyncio.to_thread(_render_bracket_image, boxes)
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render bracket image: {e!r}")
+        await interaction.followup.send("Something went wrong generating the bracket image.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="bracket.png")
+    await interaction.followup.send(file=file)
 
 
 # ---------- Question of the Day ----------
