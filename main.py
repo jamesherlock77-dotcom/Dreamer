@@ -240,7 +240,7 @@ def _get_db_message_lock(channel_id: int) -> asyncio.Lock:
 
 # Set by the giveaway Join/Leave button when entries change; flushed by check_giveaways()
 # every 30s instead of backing up on every single click — see the comment in
-# GiveawayJoinView.join() for why.
+# GiveawayView._make_join_callback() for why.
 _giveaway_backup_dirty: bool = False
 
 # User IDs with a /createteam request currently awaiting admin confirmation,
@@ -2537,108 +2537,147 @@ def parse_message_link(link: str):
     return int(channel_id), int(message_id)
 
 
-def build_giveaway_embed(
+def build_giveaway_view(
     prize: str,
     winners_count: int,
     host_id: int,
     end_ts: int,
     entries_count: int,
     winner_ids: list = None,
-) -> discord.Embed:
-    """Mirrors the AC: Arena Hub giveaway style: orange embed, a timestamp for when it
-    ends (or ended), the host, a live entry count, and — once it's over — the winners."""
-    ended = winner_ids is not None
-
-    embed = discord.Embed(
-        title=f"{GIVEAWAY_JOIN_EMOJI} {prize}",
-        colour=discord.Colour.orange(),
+) -> "GiveawayView":
+    """Mirrors the AC: Arena Hub giveaway style — a title, a timestamp for when it
+    ends (or ended), the host, a live entry count, and — once it's over — the
+    winners — built as a Components V2 container (no accent colour) instead of the
+    old embed."""
+    return GiveawayView(
+        prize=prize,
+        winners_count=winners_count,
+        host_id=host_id,
+        end_ts=end_ts,
+        entries_count=entries_count,
+        winner_ids=winner_ids,
     )
 
-    if ended:
-        embed.add_field(name="Ended", value=f"<t:{end_ts}:F>", inline=False)
-    else:
-        embed.add_field(name="Ends", value=f"<t:{end_ts}:R> (<t:{end_ts}:F>)", inline=False)
 
-    embed.add_field(name="Hosted by", value=f"<@{host_id}>", inline=False)
-    embed.add_field(name="Entries", value=f"**{entries_count}**", inline=False)
+class GiveawayView(discord.ui.LayoutView):
+    """A Components V2 container replacing the old giveaway embed + separate
+    GiveawayJoinView — same title, ends/ended timestamp, host, live entry count, and
+    (once it's over) the winners, all in one native container with no accent colour.
+    The Join button lives inside the container and is only added while the giveaway
+    is still running; call with no arguments to get a placeholder used only to
+    re-register the persistent Join button's custom_id after a restart (see on_ready)."""
 
-    if ended:
-        winners_value = (
-            ", ".join(f"<@{uid}>" for uid in winner_ids) if winner_ids else "No valid entries"
-        )
-        embed.add_field(name="Winners" if len(winner_ids) != 1 else "Winner", value=winners_value, inline=False)
-    else:
-        embed.set_footer(
-            text=f"{winners_count} winner(s) • Click {GIVEAWAY_JOIN_EMOJI} Join below to enter!"
-        )
-
-    embed.set_image(url=f"attachment://{SUPPORT_BANNER_FILENAME}")
-    return embed
-
-
-class GiveawayJoinView(discord.ui.View):
-    """Persistent green 'Join' button attached to every giveaway message. Entries are kept
-    in the database keyed by message ID (not on the view instance, since one registered
-    view instance backs every giveaway message and must survive restarts)."""
-
-    def __init__(self):
+    def __init__(
+        self,
+        prize: str | None = None,
+        winners_count: int = 1,
+        host_id: int | None = None,
+        end_ts: int = 0,
+        entries_count: int = 0,
+        winner_ids: list = None,
+    ):
         super().__init__(timeout=None)
+        ended = winner_ids is not None
 
-    @discord.ui.button(
-        label="Join", emoji=GIVEAWAY_JOIN_EMOJI, style=discord.ButtonStyle.success,
-        custom_id="giveaway_join_button",
-    )
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db = load_db()
-        giveaways = db.setdefault("giveaways", {})
-        key = str(interaction.message.id)
-        info = giveaways.get(key)
-
-        if info is None:
-            await interaction.response.send_message("This giveaway no longer exists.", ephemeral=True)
-            return
-        if info.get("ended"):
-            await interaction.response.send_message("This giveaway has already ended.", ephemeral=True)
+        if prize is None:
+            # Placeholder registration path — just needs the Join button's custom_id present.
+            button = discord.ui.Button(
+                label="Join", emoji=GIVEAWAY_JOIN_EMOJI, style=discord.ButtonStyle.success,
+                custom_id="giveaway_join_button",
+            )
+            button.callback = self._make_join_callback(button)
+            self.add_item(discord.ui.Container(discord.ui.ActionRow(button)))
             return
 
-        entries = info.setdefault("entries", [])
-        user_id = interaction.user.id
-        if user_id in entries:
-            entries.remove(user_id)
-            joined = False
+        children = [
+            discord.ui.TextDisplay(f"# {GIVEAWAY_JOIN_EMOJI} {prize}"),
+            discord.ui.Separator(),
+        ]
+        if ended:
+            children.append(discord.ui.TextDisplay(f"**Ended:** <t:{end_ts}:F>"))
         else:
-            entries.append(user_id)
-            joined = True
+            children.append(discord.ui.TextDisplay(f"**Ends:** <t:{end_ts}:R> (<t:{end_ts}:F>)"))
+        children.append(discord.ui.TextDisplay(f"**Hosted by:** <@{host_id}>"))
+        children.append(discord.ui.TextDisplay(f"**Entries:** **{entries_count}**"))
 
-        save_db(db)
-
-        embed = build_giveaway_embed(
-            prize=info["prize"],
-            winners_count=info["winners"],
-            host_id=info["host_id"],
-            end_ts=info["end_ts"],
-            entries_count=len(entries),
-        )
-        # Acknowledge the click FIRST. Discord invalidates the whole interaction (and every
-        # followup after it) if it doesn't get an initial response within 3 seconds — and a
-        # popular giveaway can get enough simultaneous clicks to rate-limit the log-channel
-        # backup below, which used to run *before* this and could blow past that window.
-        try:
-            await interaction.response.edit_message(embed=embed)
-        except discord.HTTPException:
-            pass
-
-        if joined:
-            await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} You're in — good luck!", ephemeral=True)
+        if ended:
+            winners_value = (
+                ", ".join(f"<@{uid}>" for uid in winner_ids) if winner_ids else "No valid entries"
+            )
+            label = "Winner" if len(winner_ids) == 1 else "Winners"
+            children.append(discord.ui.TextDisplay(f"**{label}:** {winners_value}"))
         else:
-            await interaction.followup.send("You left the giveaway.", ephemeral=True)
+            button = discord.ui.Button(
+                label="Join", emoji=GIVEAWAY_JOIN_EMOJI, style=discord.ButtonStyle.success,
+                custom_id="giveaway_join_button",
+            )
+            button.callback = self._make_join_callback(button)
+            children.append(discord.ui.ActionRow(button))
+            children.append(
+                discord.ui.TextDisplay(f"-# {winners_count} winner(s) • Click {GIVEAWAY_JOIN_EMOJI} Join above to enter!")
+            )
 
-        # Persist entries so they survive a Railway redeploy — but batched, not on every
-        # single click. A popular giveaway can get dozens of clicks a second, and running
-        # the full multi-file, multi-channel backup on each one is exactly what caused the
-        # rate-limit storm. Mark it dirty here; check_giveaways() flushes it every 30s.
-        global _giveaway_backup_dirty
-        _giveaway_backup_dirty = True
+        if os.path.exists(SUPPORT_BANNER_PATH):
+            children.append(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
+            )
+
+        self.add_item(discord.ui.Container(*children))
+
+    def _make_join_callback(self, button: discord.ui.Button):
+        async def callback(interaction: discord.Interaction):
+            db = load_db()
+            giveaways = db.setdefault("giveaways", {})
+            key = str(interaction.message.id)
+            info = giveaways.get(key)
+
+            if info is None:
+                await interaction.response.send_message("This giveaway no longer exists.", ephemeral=True)
+                return
+            if info.get("ended"):
+                await interaction.response.send_message("This giveaway has already ended.", ephemeral=True)
+                return
+
+            entries = info.setdefault("entries", [])
+            user_id = interaction.user.id
+            if user_id in entries:
+                entries.remove(user_id)
+                joined = False
+            else:
+                entries.append(user_id)
+                joined = True
+
+            save_db(db)
+
+            view = build_giveaway_view(
+                prize=info["prize"],
+                winners_count=info["winners"],
+                host_id=info["host_id"],
+                end_ts=info["end_ts"],
+                entries_count=len(entries),
+            )
+            # Acknowledge the click FIRST. Discord invalidates the whole interaction (and every
+            # followup after it) if it doesn't get an initial response within 3 seconds — and a
+            # popular giveaway can get enough simultaneous clicks to rate-limit the log-channel
+            # backup below, which used to run *before* this and could blow past that window.
+            try:
+                await interaction.response.edit_message(view=view)
+            except discord.HTTPException:
+                pass
+
+            if joined:
+                await interaction.followup.send(f"{GIVEAWAY_JOIN_EMOJI} You're in — good luck!", ephemeral=True)
+            else:
+                await interaction.followup.send("You left the giveaway.", ephemeral=True)
+
+            # Persist entries so they survive a Railway redeploy — but batched, not on every
+            # single click. A popular giveaway can get dozens of clicks a second, and running
+            # the full multi-file, multi-channel backup on each one is exactly what caused the
+            # rate-limit storm. Mark it dirty here; check_giveaways() flushes it every 30s.
+            global _giveaway_backup_dirty
+            _giveaway_backup_dirty = True
+
+        return callback
 
 
 async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
@@ -2660,7 +2699,7 @@ async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
         except discord.HTTPException:
             return
 
-    embed = build_giveaway_embed(
+    view = build_giveaway_view(
         prize=info["prize"],
         winners_count=info["winners"],
         host_id=info["host_id"],
@@ -2669,13 +2708,9 @@ async def _end_giveaway(guild: discord.Guild, message_id: str, info: dict):
         winner_ids=winner_ids,
     )
 
-    ended_view = GiveawayJoinView()
-    for child in ended_view.children:
-        child.disabled = True
-
     try:
         message = await channel.fetch_message(int(message_id))
-        await message.edit(embed=embed, view=ended_view)
+        await message.edit(view=view)
     except discord.HTTPException:
         pass
 
@@ -5822,17 +5857,15 @@ async def startgiveaway(
     end_dt = discord.utils.utcnow() + duration
     end_ts = int(end_dt.timestamp())
 
-    embed = build_giveaway_embed(
+    view = build_giveaway_view(
         prize=prize, winners_count=winners, host_id=host.id, end_ts=end_ts, entries_count=0,
     )
-    view = GiveawayJoinView()
 
     if os.path.exists(SUPPORT_BANNER_PATH):
         file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-        sent = await interaction.channel.send(embed=embed, view=view, file=file)
+        sent = await interaction.channel.send(view=view, file=file)
     else:
-        embed.set_image(url=None)
-        sent = await interaction.channel.send(embed=embed, view=view)
+        sent = await interaction.channel.send(view=view)
 
     db = load_db()
     db.setdefault("giveaways", {})
@@ -5904,7 +5937,7 @@ async def changegiveawayprize(interaction: discord.Interaction, messagelink: str
     await backup_db_to_log_channel()
 
     if message is not None:
-        embed = build_giveaway_embed(
+        view = build_giveaway_view(
             prize=prize,
             winners_count=info.get("winners", 1),
             host_id=info.get("host_id"),
@@ -5913,7 +5946,7 @@ async def changegiveawayprize(interaction: discord.Interaction, messagelink: str
             winner_ids=info.get("winner_ids") if info.get("ended") else None,
         )
         try:
-            await message.edit(embed=embed)
+            await message.edit(view=view)
         except discord.HTTPException:
             await interaction.followup.send(
                 f"Updated the prize in the database (`{old_prize}` → `{prize}`), but couldn't edit the "
@@ -6481,7 +6514,7 @@ async def on_ready():
     bot.add_view(TicketThreadView())
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
-    bot.add_view(GiveawayJoinView())
+    bot.add_view(GiveawayView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
