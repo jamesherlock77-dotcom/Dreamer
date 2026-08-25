@@ -64,6 +64,38 @@ TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team'
 BRACKET_PLACE_COUNT = 15
 # BRACKET_FONT_PATH is set further down, right after BASE_DIR is defined.
 
+# ---------- Lurkr level role sync ----------
+# Thresholds checked highest-first: a member's target role is the first one whose
+# level requirement they meet or exceed. Update this list if the Lurkr level-role
+# rewards ever change.
+LEVEL_ROLE_THRESHOLDS = [
+    (100, 1541608490345435227),
+    (90, 1541608406199042108),
+    (80, 1541608296123998318),
+    (70, 1541608190473666670),
+    (60, 1541608081107066891),
+    (50, 1541599434419470416),
+    (40, 1541599352076632205),
+    (30, 1541599279095877632),
+    (20, 1528221409317486713),
+    (15, 1528490625777926228),
+    (10, 1528161334632644868),
+    (6, 1528161296183463966),
+    (5, 1528161220924932136),
+    (4, 1528161147541520416),
+    (3, 1528160499676614657),
+    (2, 1528160422857932868),
+    (1, 1528160287910264973),
+]
+LEVEL_ROLE_IDS = {role_id for _level, role_id in LEVEL_ROLE_THRESHOLDS}
+
+
+def target_level_role_id(level: int) -> int | None:
+    for threshold, role_id in LEVEL_ROLE_THRESHOLDS:
+        if level >= threshold:
+            return role_id
+    return None
+
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_BASIC_ACCESS_ROLE_ID = 1539098236772425830  # gets basic (view/send/read history/react + ping-any-role) access in every team channel, except TEAM_CHANNEL_BASIC_ACCESS_EXCLUDED_CHANNEL_ID
@@ -6192,6 +6224,102 @@ async def bracketconfig(
 
     file = discord.File(io.BytesIO(image_bytes), filename="bracket.png")
     await interaction.followup.send(file=file)
+
+
+@bot.tree.command(
+    name="synclevelroles",
+    description="(Staff) Bulk-apply level roles to every member from a Lurkr levels export",
+)
+@app_commands.describe(export="The Lurkr levels export JSON file (e.g. lurkr_levels_....json)")
+async def synclevelroles(interaction: discord.Interaction, export: discord.Attachment):
+    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if not export.filename.lower().endswith(".json"):
+        await interaction.response.send_message("Please attach the Lurkr levels export as a `.json` file.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command has to be run in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        raw = await export.read()
+        data = json.loads(raw)
+        levels = data["levels"]
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't read that export file: {e}")
+        return
+
+    level_by_user: dict[str, int] = {}
+    for entry in levels:
+        uid = entry.get("userId")
+        lvl = entry.get("level")
+        if uid is not None and lvl is not None:
+            level_by_user[str(uid)] = int(lvl)
+
+    total = len(level_by_user)
+    progress_msg = await interaction.followup.send(
+        f"Syncing level roles for {total} members from the export — this will take a few minutes...",
+        wait=True,
+    )
+
+    updated = 0
+    unchanged = 0
+    not_in_guild = 0
+    errors = 0
+    processed = 0
+
+    for user_id_str, level in level_by_user.items():
+        processed += 1
+        member = guild.get_member(int(user_id_str))
+        if member is None:
+            not_in_guild += 1
+            continue
+
+        target_role_id = target_level_role_id(level)
+        current_level_role_ids = {r.id for r in member.roles if r.id in LEVEL_ROLE_IDS}
+        desired = {target_role_id} if target_role_id else set()
+
+        if current_level_role_ids == desired:
+            unchanged += 1
+        else:
+            roles_to_remove = [guild.get_role(rid) for rid in current_level_role_ids if rid != target_role_id]
+            roles_to_remove = [r for r in roles_to_remove if r is not None]
+            try:
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove, reason="Level role sync from Lurkr export")
+                if target_role_id and target_role_id not in current_level_role_ids:
+                    target_role = guild.get_role(target_role_id)
+                    if target_role:
+                        await member.add_roles(target_role, reason="Level role sync from Lurkr export")
+                updated += 1
+            except discord.HTTPException:
+                errors += 1
+
+        if processed % 50 == 0 or processed == total:
+            try:
+                await progress_msg.edit(
+                    content=f"Syncing... {processed}/{total} processed ({updated} updated so far)."
+                )
+            except discord.HTTPException:
+                pass
+
+        await asyncio.sleep(0.4)  # stay well under rate limits across large member counts
+
+    await progress_msg.edit(
+        content=(
+            "Level role sync complete.\n"
+            f"Updated: {updated}\n"
+            f"Already correct: {unchanged}\n"
+            f"Not currently in this server: {not_in_guild}\n"
+            f"Errors: {errors}"
+        )
+    )
 
 
 # ---------- Question of the Day ----------
