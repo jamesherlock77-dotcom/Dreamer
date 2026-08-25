@@ -90,11 +90,10 @@ LEVEL_ROLE_THRESHOLDS = [
 LEVEL_ROLE_IDS = {role_id for _level, role_id in LEVEL_ROLE_THRESHOLDS}
 
 
-def target_level_role_id(level: int) -> int | None:
-    for threshold, role_id in LEVEL_ROLE_THRESHOLDS:
-        if level >= threshold:
-            return role_id
-    return None
+def target_level_role_ids(level: int) -> set[int]:
+    """Every level role a member at this level should hold — stacked, not just the
+    highest one (e.g. level 45 gets the Level 1/2/3/4/5/6/10/15/20/30/40 roles)."""
+    return {role_id for threshold, role_id in LEVEL_ROLE_THRESHOLDS if level >= threshold}
 
 TEAM_CHANNEL_FULL_ACCESS_ROLE_ID = 1528155138337013921  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
 TEAM_CHANNEL_VIEWER_ROLE_ID = 1535819394129854474  # legacy — no longer granted access; kept only so sync_existing_teams can strip its old overwrites
@@ -6263,10 +6262,13 @@ async def synclevelroles(interaction: discord.Interaction, export: discord.Attac
             level_by_user[str(uid)] = int(lvl)
 
     total = len(level_by_user)
-    progress_msg = await interaction.followup.send(
-        f"Syncing level roles for {total} members from the export — this will take a few minutes...",
-        wait=True,
-    )
+    channel = interaction.channel
+    # Post progress as a normal channel message rather than editing the interaction's
+    # followup — the interaction token only stays valid for 15 minutes, and a sync
+    # over ~1000 members can easily run longer than that. A plain message has no such
+    # limit, so progress won't silently stop updating partway through.
+    await interaction.followup.send(f"Starting level role sync for {total} members — progress below.")
+    progress_msg = await channel.send(f"Syncing level roles for {total} members from the export...")
 
     updated = 0
     unchanged = 0
@@ -6274,42 +6276,60 @@ async def synclevelroles(interaction: discord.Interaction, export: discord.Attac
     errors = 0
     processed = 0
 
-    for user_id_str, level in level_by_user.items():
-        processed += 1
-        member = guild.get_member(int(user_id_str))
-        if member is None:
-            not_in_guild += 1
-            continue
+    try:
+        for user_id_str, level in level_by_user.items():
+            processed += 1
+            member = guild.get_member(int(user_id_str))
+            if member is None:
+                not_in_guild += 1
+                continue
 
-        target_role_id = target_level_role_id(level)
-        current_level_role_ids = {r.id for r in member.roles if r.id in LEVEL_ROLE_IDS}
-        desired = {target_role_id} if target_role_id else set()
+            desired = target_level_role_ids(level)
+            current_level_role_ids = {r.id for r in member.roles if r.id in LEVEL_ROLE_IDS}
 
-        if current_level_role_ids == desired:
-            unchanged += 1
-        else:
-            roles_to_remove = [guild.get_role(rid) for rid in current_level_role_ids if rid != target_role_id]
-            roles_to_remove = [r for r in roles_to_remove if r is not None]
-            try:
-                if roles_to_remove:
-                    await member.remove_roles(*roles_to_remove, reason="Level role sync from Lurkr export")
-                if target_role_id and target_role_id not in current_level_role_ids:
-                    target_role = guild.get_role(target_role_id)
-                    if target_role:
-                        await member.add_roles(target_role, reason="Level role sync from Lurkr export")
-                updated += 1
-            except discord.HTTPException:
-                errors += 1
+            if current_level_role_ids == desired:
+                unchanged += 1
+            else:
+                ids_to_remove = current_level_role_ids - desired
+                ids_to_add = desired - current_level_role_ids
+                roles_to_remove = [r for r in (guild.get_role(rid) for rid in ids_to_remove) if r is not None]
+                roles_to_add = [r for r in (guild.get_role(rid) for rid in ids_to_add) if r is not None]
+                try:
+                    if roles_to_remove:
+                        await member.remove_roles(*roles_to_remove, reason="Level role sync from Lurkr export")
+                    if roles_to_add:
+                        await member.add_roles(*roles_to_add, reason="Level role sync from Lurkr export")
+                    updated += 1
+                except Exception as e:
+                    print(f"synclevelroles: failed to update {user_id_str}: {e!r}")
+                    errors += 1
 
-        if processed % 50 == 0 or processed == total:
-            try:
-                await progress_msg.edit(
-                    content=f"Syncing... {processed}/{total} processed ({updated} updated so far)."
+            if processed % 50 == 0 or processed == total:
+                try:
+                    await progress_msg.edit(
+                        content=f"Syncing... {processed}/{total} processed ({updated} updated so far)."
+                    )
+                except Exception as e:
+                    print(f"synclevelroles: progress edit failed: {e!r}")
+
+            await asyncio.sleep(0.4)  # stay well under rate limits across large member counts
+    except Exception as e:
+        print(f"synclevelroles: sync loop aborted early: {e!r}")
+        try:
+            await progress_msg.edit(
+                content=(
+                    "Level role sync hit an unexpected error and stopped early.\n"
+                    f"Processed: {processed}/{total}\n"
+                    f"Updated: {updated}\n"
+                    f"Already correct: {unchanged}\n"
+                    f"Not currently in this server: {not_in_guild}\n"
+                    f"Errors: {errors}\n"
+                    f"Error: {e}"
                 )
-            except discord.HTTPException:
-                pass
-
-        await asyncio.sleep(0.4)  # stay well under rate limits across large member counts
+            )
+        except Exception:
+            pass
+        return
 
     await progress_msg.edit(
         content=(
