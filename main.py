@@ -46,7 +46,7 @@ PREMIUM_ROLE_ID_2 = 1529805001088569384    # a second role that also grants prem
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
 MAX_TEAM_MEMBERS = 10                      # includes the leader
 TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a team before leaving it
-SUPPORT_TICKET_CHANNEL_ID = 1530456581903486996  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
+SUPPORT_TICKET_CHANNEL_ID = 1542648891147558993  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
 TICKET_PING_ROLE_ID = 1528224254896771132        # pinged (alongside the opener) whenever a new ticket thread is opened
 TICKET_LOG_CHANNEL_ID = 1533595017438826646       # ticket numbers/records JSON "database" message lives here
 TICKET_CLOSE_ROLE_ID = 1528142703727083691        # holders of this role can close any ticket, same as staff
@@ -502,9 +502,10 @@ async def restore_db_from_log_channel():
 def load_ticket_db() -> dict:
     data = _load_json_file(TICKETS_DB_FILE)
     if data is None:
-        return {"next_number": 1, "tickets": {}}
+        return {"next_number": 1, "tickets": {}, "panel_message_id": None}
     data.setdefault("next_number", 1)
     data.setdefault("tickets", {})
+    data.setdefault("panel_message_id", None)
     return data
 
 
@@ -984,22 +985,28 @@ async def refresh_support_ticket_panel():
     spam the channel. It only posts a fresh panel the first time (or if the old one was
     deleted).
 
-    "Already posted" is detected by pinning the panel message and checking the channel's
-    pins on startup, rather than scanning recent history — this channel is also where new
-    ticket threads get opened, and each one posts a "started a thread" system message here,
-    so on a busy server the panel can easily scroll past a limited history scan and get
-    mistaken for missing. Pins aren't affected by that at all."""
+    "Already posted" is detected by remembering the panel message's ID in TICKETS_DB_FILE
+    (persisted the same way ticket records are, backed up to TICKET_LOG_CHANNEL_ID) and
+    trying to fetch that exact message on startup. This used to rely on pinning the panel
+    and checking the channel's pins instead — but if pinning itself ever failed (permissions,
+    or the channel already at Discord's 50-pin cap), the message would never show up as
+    pinned, so every single restart would silently repost another copy. Remembering the ID
+    directly sidesteps that failure mode entirely; pinning below is now just a convenience
+    for admins, not the detection mechanism."""
     channel = bot.get_channel(SUPPORT_TICKET_CHANNEL_ID) or await bot.fetch_channel(SUPPORT_TICKET_CHANNEL_ID)
     include_banner = os.path.exists(SUPPORT_BANNER_PATH)
 
-    for msg in await channel.pins():
-        if msg.author.id != bot.user.id:
-            continue
-        if include_banner:
-            if msg.attachments and msg.attachments[0].filename == SUPPORT_BANNER_FILENAME:
-                return  # panel already posted — leave it alone
-        elif msg.components:
-            return  # panel already posted (best-effort check, no banner to match on)
+    db = load_ticket_db()
+    existing_id = db.get("panel_message_id")
+    if existing_id is not None:
+        try:
+            await channel.fetch_message(existing_id)
+            return  # panel already posted — leave it alone
+        except discord.NotFound:
+            pass  # was deleted — fall through and repost
+        except discord.HTTPException as e:
+            print(f"Couldn't verify the existing support panel message ({e}) — leaving it as-is rather than risk a duplicate.")
+            return
 
     view = SupportPanelView(include_banner=include_banner)
 
@@ -1010,10 +1017,14 @@ async def refresh_support_ticket_panel():
         file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
         sent = await channel.send(view=view, file=file)
 
+    db["panel_message_id"] = sent.id
+    save_ticket_db(db)
+    await backup_ticket_db_to_log_channel()
+
     try:
-        await sent.pin(reason="Support ticket panel — keeps it detectable on restart regardless of channel activity")
+        await sent.pin(reason="Support ticket panel")
     except discord.HTTPException as e:
-        print(f"Failed to pin support ticket panel (will likely repost on next restart): {e}")
+        print(f"Panel posted fine, but couldn't pin it (non-critical — detection no longer depends on this): {e}")
 
 
 
