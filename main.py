@@ -145,6 +145,7 @@ MESSAGE_LEADERBOARD_SAVE_INTERVAL_MINUTES = 5   # how often in-memory counts are
 MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ... Sunday=6
 MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
 MESSAGE_LEADERBOARD_RESET_MINUTE_UTC = 59       # ...and this minute — i.e. Sunday 23:59 UTC
+MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID = 1528008744422871211  # only messages sent here count
 
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
@@ -3173,8 +3174,8 @@ def _message_leaderboard_next_reset(now: datetime) -> datetime:
 
 
 def record_message_for_leaderboard(user_id: int) -> None:
-    """Called from on_message for every non-bot message sent in the server. Lazily
-    resets the counters the moment a message arrives after the weekly boundary has
+    """Called from on_message for every non-bot message sent in MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID.
+    Lazily resets the counters the moment a message arrives after the weekly boundary has
     passed, rather than needing a separate scheduled reset job."""
     global _message_leaderboard_period_start, _message_leaderboard_dirty
 
@@ -3538,35 +3539,32 @@ async def syncmessages(interaction: discord.Interaction):
         await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
         return
 
+    # Only the designated tracking channel counts now — mirrors what on_message does live,
+    # so a resync can't reintroduce counts from every other channel in the server.
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send("This command can only be used in a server.", ephemeral=True)
+        return
+
+    tracked_channel = guild.get_channel(MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID)
+    if tracked_channel is None:
+        await interaction.followup.send(
+            "Couldn't find the tracked channel — check MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID.",
+            ephemeral=True,
+        )
         return
 
     # The boundary is this week's currently-in-effect Sunday-23:59-UTC reset — i.e. "last
     # Sunday 23:59" relative to right now, same boundary record_message_for_leaderboard uses.
     boundary = _message_leaderboard_reset_boundary(discord.utils.utcnow())
 
-    # Collect every channel that can hold messages: text channels, and both active + archived
-    # threads (including forum posts) off of them — mirrors what on_message already counts
-    # live for every non-bot message sent anywhere in the guild, so a resync matches it.
-    channels_to_scan: list = list(guild.text_channels)
-
-    for text_channel in guild.text_channels:
-        channels_to_scan.extend(text_channel.threads)
-        try:
-            async for thread in text_channel.archived_threads(limit=None):
-                channels_to_scan.append(thread)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    for forum in getattr(guild, "forums", []):
-        channels_to_scan.extend(forum.threads)
-        try:
-            async for thread in forum.archived_threads(limit=None):
-                channels_to_scan.append(thread)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+    channels_to_scan: list = [tracked_channel]
+    channels_to_scan.extend(getattr(tracked_channel, "threads", []))
+    try:
+        async for thread in tracked_channel.archived_threads(limit=None):
+            channels_to_scan.append(thread)
+    except (discord.Forbidden, discord.HTTPException, AttributeError):
+        pass
 
     counts: dict[int, int] = {}
     scanned_channels = 0
@@ -3598,6 +3596,54 @@ async def syncmessages(interaction: discord.Interaction):
         f"scanned {scanned_channels} channel(s)/thread(s) ({skipped_channels} skipped due to missing access), "
         f"counted {total_messages:,} messages across {len(counts)} member(s).",
         ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="changemessagetracking",
+    description="(Staff) Manually add or remove weekly tracked messages for a user",
+)
+@app_commands.describe(
+    user="The member whose weekly message count to adjust",
+    add="Number of messages to add to their count",
+    remove="Number of messages to remove from their count",
+)
+async def changemessagetracking(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    add: app_commands.Range[int, 1, None] | None = None,
+    remove: app_commands.Range[int, 1, None] | None = None,
+):
+    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if user is None:
+        await interaction.response.send_message("Please specify a `user`.", ephemeral=True)
+        return
+
+    if (add is None) == (remove is None):  # neither given, or both given
+        await interaction.response.send_message(
+            "Please provide exactly one of `add` or `remove`.", ephemeral=True
+        )
+        return
+
+    global _message_leaderboard_dirty
+    current = _message_leaderboard_counts.get(user.id, 0)
+    if add is not None:
+        new_count = current + add
+        action_desc = f"Added **{add}**"
+    else:
+        new_count = max(0, current - remove)
+        action_desc = f"Removed **{remove}**"
+
+    _message_leaderboard_counts[user.id] = new_count
+    _message_leaderboard_dirty = True
+    save_message_leaderboard_db()
+    await backup_message_leaderboard_to_log_channel()
+
+    await interaction.response.send_message(
+        f"{action_desc} tracked message(s) for {user.mention}. New weekly count: **{new_count}**."
     )
 
 
@@ -5189,7 +5235,8 @@ async def on_message(message: discord.Message):
 
     if message.guild is not None and not message.author.bot:
         await maybe_restick_tournament_message(message)
-        record_message_for_leaderboard(message.author.id)
+        if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
+            record_message_for_leaderboard(message.author.id)
 
     await bot.process_commands(message)
 
