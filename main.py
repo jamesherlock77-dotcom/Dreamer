@@ -146,6 +146,8 @@ MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ...
 MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
 MESSAGE_LEADERBOARD_RESET_MINUTE_UTC = 59       # ...and this minute — i.e. Sunday 23:59 UTC
 MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID = 1528008744422871211  # only messages sent here count
+MESSAGE_LEADERBOARD_TOP3_ROLE_ID = 1538743573103648788   # given to #1-#3 at each weekly reset
+MESSAGE_LEADERBOARD_TOP10_ROLE_ID = 1542340814418743406  # given to #1-#10 at each weekly reset (top 3 get both)
 
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
@@ -3175,15 +3177,14 @@ def _message_leaderboard_next_reset(now: datetime) -> datetime:
 
 def record_message_for_leaderboard(user_id: int) -> None:
     """Called from on_message for every non-bot message sent in MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID.
-    Lazily resets the counters the moment a message arrives after the weekly boundary has
-    passed, rather than needing a separate scheduled reset job."""
+    Does NOT reset on its own — message_leaderboard_rollover_loop owns the weekly reset
+    (and the role hand-out that goes with it) so there's exactly one place that can trigger
+    it. If this fired with no period set yet (very first run before the loop's first tick),
+    just start one rather than losing the message."""
     global _message_leaderboard_period_start, _message_leaderboard_dirty
 
-    now = discord.utils.utcnow()
-    boundary = _message_leaderboard_reset_boundary(now)
-    if _message_leaderboard_period_start is None or boundary > _message_leaderboard_period_start:
-        _message_leaderboard_counts.clear()
-        _message_leaderboard_period_start = boundary
+    if _message_leaderboard_period_start is None:
+        _message_leaderboard_period_start = _message_leaderboard_reset_boundary(discord.utils.utcnow())
 
     _message_leaderboard_counts[user_id] = _message_leaderboard_counts.get(user_id, 0) + 1
     _message_leaderboard_dirty = True
@@ -3219,13 +3220,64 @@ def load_message_leaderboard_db() -> None:
         datetime.fromisoformat(period_start) if period_start else None
     )
 
-    # If we've been offline across a weekly boundary, reset now rather than waiting for
-    # the next message to trigger it — keeps a stale prior week from lingering silently.
+    # If we've been offline across a weekly boundary, reset now rather than waiting for the
+    # rollover loop's first tick — keeps a stale prior week from lingering silently. Note:
+    # since this runs before the loop (and before we can reliably touch guild roles) it just
+    # wipes the counts — the top-3/top-10 role hand-out for that missed week doesn't happen,
+    # the same trade-off other offline-spanning resets in this bot already make.
     now = discord.utils.utcnow()
     boundary = _message_leaderboard_reset_boundary(now)
     if _message_leaderboard_period_start is None or boundary > _message_leaderboard_period_start:
         _message_leaderboard_counts.clear()
         _message_leaderboard_period_start = boundary
+
+
+def _message_leaderboard_guild() -> discord.Guild | None:
+    """Resolves the single guild this bot operates in via the tracked channel, since the
+    weekly rollover runs from a background task with no interaction to pull a guild from."""
+    channel = bot.get_channel(MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID)
+    return channel.guild if channel else None
+
+
+async def _apply_weekly_leaderboard_roles(top3_ids: list[int], top10_ids: list[int]) -> None:
+    """Strips both weekly leaderboard roles from everyone holding them, then hands the
+    top-10 role to #1-#10 and the top-3 role to #1-#3 (so the top 3 end up with both).
+    Called right after counts are snapshotted and reset for the new week."""
+    guild = _message_leaderboard_guild()
+    if guild is None:
+        print("[leaderboard] Couldn't resolve the guild for the weekly role rollover — skipping role changes.")
+        return
+
+    top3_role = guild.get_role(MESSAGE_LEADERBOARD_TOP3_ROLE_ID)
+    top10_role = guild.get_role(MESSAGE_LEADERBOARD_TOP10_ROLE_ID)
+    if top3_role is None or top10_role is None:
+        print("[leaderboard] Weekly leaderboard role(s) not found — check the role ID constants.")
+        return
+
+    for role in (top3_role, top10_role):
+        for member in list(role.members):
+            try:
+                await member.remove_roles(role, reason="Weekly message leaderboard reset")
+            except discord.HTTPException as e:
+                print(f"[leaderboard] Failed to remove {role.name} from {member.id}: {e}")
+
+    for user_id in top10_ids:
+        member = guild.get_member(user_id)
+        if member is None:
+            continue
+        try:
+            await member.add_roles(top10_role, reason="Weekly message leaderboard — top 10")
+        except discord.HTTPException as e:
+            print(f"[leaderboard] Failed to add the top-10 role to {user_id}: {e}")
+
+    for user_id in top3_ids:
+        member = guild.get_member(user_id)
+        if member is None:
+            continue
+        try:
+            await member.add_roles(top3_role, reason="Weekly message leaderboard — top 3")
+        except discord.HTTPException as e:
+            print(f"[leaderboard] Failed to add the top-3 role to {user_id}: {e}")
 
 
 async def backup_message_leaderboard_to_log_channel():
@@ -3277,6 +3329,37 @@ async def message_leaderboard_save_loop():
 
 @message_leaderboard_save_loop.before_loop
 async def before_message_leaderboard_save_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def message_leaderboard_rollover_loop():
+    """Checks once a minute for the weekly Sunday-23:59-UTC boundary. When it's crossed,
+    snapshots the top 3/top 10 BEFORE wiping counts, resets immediately (no awaits in
+    between, so nothing can race in and either see stale counts or miss the reset), then
+    hands out the two leaderboard roles based on that snapshot."""
+    global _message_leaderboard_period_start, _message_leaderboard_dirty
+
+    now = discord.utils.utcnow()
+    boundary = _message_leaderboard_reset_boundary(now)
+    if _message_leaderboard_period_start is None or boundary <= _message_leaderboard_period_start:
+        return
+
+    ranked = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)
+    top3_ids = [uid for uid, _count in ranked[:3]]
+    top10_ids = [uid for uid, _count in ranked[:10]]
+
+    _message_leaderboard_counts.clear()
+    _message_leaderboard_period_start = boundary
+    _message_leaderboard_dirty = True
+    save_message_leaderboard_db()
+
+    await backup_message_leaderboard_to_log_channel()
+    await _apply_weekly_leaderboard_roles(top3_ids, top10_ids)
+
+
+@message_leaderboard_rollover_loop.before_loop
+async def before_message_leaderboard_rollover_loop():
     await bot.wait_until_ready()
 
 
@@ -6591,6 +6674,8 @@ async def on_ready():
         check_scrim_expiry.start()
     if not message_leaderboard_save_loop.is_running():
         message_leaderboard_save_loop.start()
+    if not message_leaderboard_rollover_loop.is_running():
+        message_leaderboard_rollover_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
