@@ -8,6 +8,7 @@ import logging
 import asyncio
 import time
 from datetime import timedelta, datetime, timezone
+from typing import Literal
 
 import aiohttp
 import emoji as emoji_lib
@@ -134,6 +135,7 @@ MESSAGE_LEADERBOARD_RESET_WEEKDAY = 6           # Python weekday(): Monday=0 ...
 MESSAGE_LEADERBOARD_RESET_HOUR_UTC = 23         # counts reset every Sunday at this hour, UTC
 MESSAGE_LEADERBOARD_RESET_MINUTE_UTC = 59       # ...and this minute — i.e. Sunday 23:59 UTC
 MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID = 1528008744422871211  # only messages sent here count
+MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS = 5  # a user's message only counts toward either leaderboard if this long has passed since their last counted one
 MESSAGE_LEADERBOARD_TOP3_ROLE_ID = 1538743573103648788   # given to #1-#3 at each weekly reset
 MESSAGE_LEADERBOARD_TOP10_ROLE_ID = 1542340814418743406  # given to #1-#10 at each weekly reset (top 3 get both)
 
@@ -270,6 +272,13 @@ _message_leaderboard_dirty: bool = False
 # never resets — see OVERALL_MESSAGE_LOG_CHANNEL_ID.
 _overall_message_counts: dict = {}
 _overall_message_dirty: bool = False
+
+# Per-user cooldown gate shared by BOTH leaderboards: {user_id: last counted message's time.time()}.
+# A message only counts toward either leaderboard if MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS has
+# passed since that user's last counted message — stops someone inflating their count (on
+# either leaderboard) by spamming short messages back-to-back. This does NOT block the
+# messages themselves, only whether they're counted.
+_message_count_cooldowns: dict = {}
 
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
@@ -3365,8 +3374,8 @@ async def before_message_leaderboard_rollover_loop():
 # ============================================================
 # ALL-TIME MESSAGE LEADERBOARD — same idea as the weekly one above,
 # but counts every non-bot message sent anywhere in the guild and
-# never resets. /overallmessageleaderboard, /overallmessages,
-# /syncglobalmessages.
+# never resets. Selectable via the `select` option on /messageleaderboard and
+# /messages, plus /syncglobalmessages to rescan the whole server's history.
 # ============================================================
 
 def record_overall_message(user_id: int) -> None:
@@ -3449,6 +3458,7 @@ async def before_overall_message_save_loop():
 # ---------- Leaderboard image card (ported from leaderboard.js) ----------
 # Per-user cooldown, mirroring the JS version's cooldowns Map.
 _leaderboard_cooldowns: dict[int, float] = {}
+_overall_leaderboard_cooldowns: dict[int, float] = {}
 
 
 def _leaderboard_rounded_rect(draw: "ImageDraw.ImageDraw", box, radius, **kwargs) -> None:
@@ -3650,11 +3660,15 @@ def _render_leaderboard_image(
     return buf.getvalue()
 
 
-@bot.tree.command(name="messageleaderboard", description="Show this week's most active members by message count")
-async def messageleaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="messageleaderboard", description="Show the most active members by message count")
+@app_commands.describe(select="Weekly (resets Sundays) or all-time — defaults to Weekly")
+async def messageleaderboard(interaction: discord.Interaction, select: Literal["Weekly", "Overall"] = "Weekly"):
+    is_overall = select == "Overall"
+    cooldowns = _overall_leaderboard_cooldowns if is_overall else _leaderboard_cooldowns
+
     # 1. Check cooldown (mirrors leaderboard.js)
     user_id = interaction.user.id
-    last_used = _leaderboard_cooldowns.get(user_id)
+    last_used = cooldowns.get(user_id)
     if last_used is not None:
         expiration_time = last_used + LEADERBOARD_COOLDOWN_SECONDS
         now_ts = time.time()
@@ -3667,14 +3681,15 @@ async def messageleaderboard(interaction: discord.Interaction):
             return
 
     # 2. Set cooldown
-    _leaderboard_cooldowns[user_id] = time.time()
+    cooldowns[user_id] = time.time()
 
     # 3. Start command
     await interaction.response.defer()
 
-    ranked_counts = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    counts_source = _overall_message_counts if is_overall else _message_leaderboard_counts
+    ranked_counts = sorted(counts_source.items(), key=lambda kv: kv[1], reverse=True)[:10]
     if not ranked_counts:
-        await interaction.followup.send("No messages logged this week yet!")
+        await interaction.followup.send("No messages logged yet!" if is_overall else "No messages logged this week yet!")
         return
 
     ranked = [
@@ -3682,8 +3697,9 @@ async def messageleaderboard(interaction: discord.Interaction):
         for uid, count in ranked_counts
     ]
 
+    title = "All-Time Leaders" if is_overall else "Weekly Leaders"
     try:
-        image_bytes = await asyncio.to_thread(_render_leaderboard_image, ranked, user_id)
+        image_bytes = await asyncio.to_thread(_render_leaderboard_image, ranked, user_id, title)
     except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
         print(f"Failed to render leaderboard image: {e!r}")
         await interaction.followup.send("Something went wrong generating the leaderboard image.")
@@ -3691,7 +3707,7 @@ async def messageleaderboard(interaction: discord.Interaction):
 
     file = discord.File(io.BytesIO(image_bytes), filename="leaderboard.png")
     await interaction.followup.send(
-        content="🏆 **Here are the current top 10 chatters!** 🏆",
+        content=("🏆 **Here are the all-time top 10 chatters!** 🏆" if is_overall else "🏆 **Here are the current top 10 chatters!** 🏆"),
         file=file,
     )
 
@@ -3735,6 +3751,7 @@ async def syncmessages(interaction: discord.Interaction):
         pass
 
     counts: dict[int, int] = {}
+    last_counted_at: dict[int, datetime] = {}  # mirrors the live 5s-per-user spam gate
     scanned_channels = 0
     skipped_channels = 0
     total_messages = 0
@@ -3744,6 +3761,10 @@ async def syncmessages(interaction: discord.Interaction):
             async for message in channel.history(after=boundary, limit=None, oldest_first=True):
                 if message.author.bot:
                     continue
+                last = last_counted_at.get(message.author.id)
+                if last is not None and (message.created_at - last).total_seconds() < MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS:
+                    continue
+                last_counted_at[message.author.id] = message.created_at
                 counts[message.author.id] = counts.get(message.author.id, 0) + 1
                 total_messages += 1
             scanned_channels += 1
@@ -3975,24 +3996,33 @@ def _render_message_rank_card(
     return buf.getvalue()
 
 
-@bot.tree.command(name="messages", description="Show your (or someone else's) weekly message stats")
-@app_commands.describe(user="Whose stats to show — defaults to you")
-async def messages_command(interaction: discord.Interaction, user: discord.Member | None = None):
+@bot.tree.command(name="messages", description="Show your (or someone else's) message stats")
+@app_commands.describe(
+    select="Weekly (resets Sundays) or all-time — defaults to Weekly",
+    user="Whose stats to show — defaults to you",
+)
+async def messages_command(
+    interaction: discord.Interaction,
+    select: Literal["Weekly", "Overall"] = "Weekly",
+    user: discord.Member | None = None,
+):
     await interaction.response.defer()
+
+    is_overall = select == "Overall"
+    counts_source = _overall_message_counts if is_overall else _message_leaderboard_counts
 
     target_member = user or interaction.user
     target_id = target_member.id
 
-    ranked = sorted(_message_leaderboard_counts.items(), key=lambda kv: kv[1], reverse=True)
+    ranked = sorted(counts_source.items(), key=lambda kv: kv[1], reverse=True)
     positions = {uid: i for i, (uid, _count) in enumerate(ranked)}
 
     if target_id not in positions:
         who = "You haven't" if target_member.id == interaction.user.id else f"**{target_member.display_name}** hasn't"
-        await interaction.followup.send(f"{who} sent any tracked messages this week yet!")
+        await interaction.followup.send(f"{who} sent any tracked messages yet!" if is_overall else f"{who} sent any tracked messages this week yet!")
         return
 
     idx = positions[target_id]
-    target_uid, target_count = ranked[idx]
 
     async def build_entry(i: int) -> dict:
         uid, count = ranked[i]
@@ -4005,104 +4035,22 @@ async def messages_command(interaction: discord.Interaction, user: discord.Membe
     avatar_bytes = await _fetch_leaderboard_avatar_bytes(target_member)
 
     try:
-        image_bytes = await asyncio.to_thread(
-            _render_message_rank_card, target_entry, neighbor_above, neighbor_below, avatar_bytes
-        )
+        if is_overall:
+            image_bytes = await asyncio.to_thread(
+                _render_message_rank_card,
+                target_entry, neighbor_above, neighbor_below, avatar_bytes,
+                stat_label="Total Messages", rank_label="All-Time Rank", top_rank_text="You're #1 all-time! 🏆",
+            )
+        else:
+            image_bytes = await asyncio.to_thread(
+                _render_message_rank_card, target_entry, neighbor_above, neighbor_below, avatar_bytes
+            )
     except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
         print(f"Failed to render message rank card: {e!r}")
         await interaction.followup.send("Something went wrong generating that card.")
         return
 
     file = discord.File(io.BytesIO(image_bytes), filename="messages.png")
-    await interaction.followup.send(file=file)
-
-
-# ---------- All-time message leaderboard/rank/sync commands ----------
-_overall_leaderboard_cooldowns: dict[int, float] = {}
-
-
-@bot.tree.command(name="overallmessageleaderboard", description="Show the all-time most active members by message count")
-async def overallmessageleaderboard(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    last_used = _overall_leaderboard_cooldowns.get(user_id)
-    if last_used is not None:
-        expiration_time = last_used + LEADERBOARD_COOLDOWN_SECONDS
-        now_ts = time.time()
-        if now_ts < expiration_time:
-            time_left = round(expiration_time - now_ts)
-            await interaction.response.send_message(
-                f"⏳ Please wait **{time_left} seconds** before checking the leaderboard again!",
-                ephemeral=True,
-            )
-            return
-
-    _overall_leaderboard_cooldowns[user_id] = time.time()
-    await interaction.response.defer()
-
-    ranked_counts = sorted(_overall_message_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    if not ranked_counts:
-        await interaction.followup.send("No messages logged yet!")
-        return
-
-    ranked = [
-        (uid, count, await _resolve_leaderboard_username(interaction.guild, uid))
-        for uid, count in ranked_counts
-    ]
-
-    try:
-        image_bytes = await asyncio.to_thread(_render_leaderboard_image, ranked, user_id, "All-Time Leaders")
-    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
-        print(f"Failed to render overall leaderboard image: {e!r}")
-        await interaction.followup.send("Something went wrong generating the leaderboard image.")
-        return
-
-    file = discord.File(io.BytesIO(image_bytes), filename="overall_leaderboard.png")
-    await interaction.followup.send(
-        content="🏆 **Here are the all-time top 10 chatters!** 🏆",
-        file=file,
-    )
-
-
-@bot.tree.command(name="overallmessages", description="Show your (or someone else's) all-time message stats")
-@app_commands.describe(user="Whose stats to show — defaults to you")
-async def overallmessages_command(interaction: discord.Interaction, user: discord.Member | None = None):
-    await interaction.response.defer()
-
-    target_member = user or interaction.user
-    target_id = target_member.id
-
-    ranked = sorted(_overall_message_counts.items(), key=lambda kv: kv[1], reverse=True)
-    positions = {uid: i for i, (uid, _count) in enumerate(ranked)}
-
-    if target_id not in positions:
-        who = "You haven't" if target_member.id == interaction.user.id else f"**{target_member.display_name}** hasn't"
-        await interaction.followup.send(f"{who} sent any tracked messages yet!")
-        return
-
-    idx = positions[target_id]
-
-    async def build_entry(i: int) -> dict:
-        uid, count = ranked[i]
-        return {"rank": i + 1, "username": await _resolve_leaderboard_username(interaction.guild, uid), "count": count}
-
-    target_entry = await build_entry(idx)
-    neighbor_above = await build_entry(idx - 1) if idx > 0 else None
-    neighbor_below = await build_entry(idx + 1) if idx < len(ranked) - 1 else None
-
-    avatar_bytes = await _fetch_leaderboard_avatar_bytes(target_member)
-
-    try:
-        image_bytes = await asyncio.to_thread(
-            _render_message_rank_card,
-            target_entry, neighbor_above, neighbor_below, avatar_bytes,
-            stat_label="Total Messages", rank_label="All-Time Rank", top_rank_text="You're #1 all-time! 🏆",
-        )
-    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
-        print(f"Failed to render overall message rank card: {e!r}")
-        await interaction.followup.send("Something went wrong generating that card.")
-        return
-
-    file = discord.File(io.BytesIO(image_bytes), filename="overall_messages.png")
     await interaction.followup.send(file=file)
 
 
@@ -4150,6 +4098,7 @@ async def syncglobalmessages(interaction: discord.Interaction):
     progress_msg = await interaction.channel.send(f"Scanning 0/{total_channels} channel(s)...")
 
     counts: dict[int, int] = {}
+    last_counted_at: dict[int, datetime] = {}  # mirrors the live 5s-per-user spam gate
     scanned_channels = 0
     skipped_channels = 0
     total_messages = 0
@@ -4159,6 +4108,10 @@ async def syncglobalmessages(interaction: discord.Interaction):
             async for message in channel.history(limit=None, oldest_first=True):
                 if message.author.bot:
                     continue
+                last = last_counted_at.get(message.author.id)
+                if last is not None and (message.created_at - last).total_seconds() < MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS:
+                    continue
+                last_counted_at[message.author.id] = message.created_at
                 counts[message.author.id] = counts.get(message.author.id, 0) + 1
                 total_messages += 1
             scanned_channels += 1
@@ -5448,9 +5401,16 @@ async def on_message(message: discord.Message):
 
     if message.guild is not None and not message.author.bot:
         await maybe_restick_tournament_message(message)
-        if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
-            record_message_for_leaderboard(message.author.id)
-        record_overall_message(message.author.id)
+
+        # Shared 5s-per-user anti-spam gate for BOTH leaderboards: a message only counts if
+        # this long has passed since that user's last counted message, anywhere in the guild.
+        now_ts = time.time()
+        last_counted = _message_count_cooldowns.get(message.author.id)
+        if last_counted is None or now_ts - last_counted >= MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS:
+            _message_count_cooldowns[message.author.id] = now_ts
+            if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
+                record_message_for_leaderboard(message.author.id)
+            record_overall_message(message.author.id)
 
     await bot.process_commands(message)
 
