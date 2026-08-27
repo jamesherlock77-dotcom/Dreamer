@@ -57,13 +57,6 @@ TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the
 TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the sticky tournament message
 TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
-# ---------- Tournament bracket config ----------
-# 16-team single-elimination bracket rendered as an image: 8 round-1 boxes, 4 round-2
-# boxes, 2 semifinal boxes, 1 final box = 15 boxes total. /bracketconfig numbers them
-# 1-15 in reading order (top-to-bottom within each round, then round 1 -> final).
-BRACKET_PLACE_COUNT = 15
-# BRACKET_FONT_PATH is set further down, right after BASE_DIR is defined.
-
 # ---------- Lurkr level role sync ----------
 # Thresholds checked highest-first: a member's target role is the first one whose
 # level requirement they meet or exceed. Update this list if the Lurkr level-role
@@ -116,14 +109,9 @@ GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
 SCRIMS_DB_FILE = "scrims_data.json"
-BRACKET_DB_FILE = "bracket_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Optional: a font file dropped next to this script for the pixel/mono look from the
-# bracket mockup. Falls back to Pillow's default font (via the leaderboard's font
-# loader) if this file isn't present, so /bracketconfig still works out of the box.
-BRACKET_FONT_PATH = os.path.join(BASE_DIR, "RobotoMono-Bold.ttf")
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
 
@@ -148,6 +136,11 @@ MESSAGE_LEADERBOARD_RESET_MINUTE_UTC = 59       # ...and this minute — i.e. Su
 MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID = 1528008744422871211  # only messages sent here count
 MESSAGE_LEADERBOARD_TOP3_ROLE_ID = 1538743573103648788   # given to #1-#3 at each weekly reset
 MESSAGE_LEADERBOARD_TOP10_ROLE_ID = 1542340814418743406  # given to #1-#10 at each weekly reset (top 3 get both)
+
+# ---------- All-time (never resets) message leaderboard config ----------
+OVERALL_MESSAGE_LOG_CHANNEL_ID = 1542639777809965167  # channel the all-time JSON backup lives in
+OVERALL_MESSAGE_DB_FILE = "overall_message_data.json"
+OVERALL_MESSAGE_SAVE_INTERVAL_MINUTES = 5  # how often in-memory counts are flushed to disk + backed up
 
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
@@ -271,6 +264,12 @@ _startup_logged: bool = False
 _message_leaderboard_counts: dict = {}
 _message_leaderboard_period_start: datetime | None = None
 _message_leaderboard_dirty: bool = False
+
+# In-memory ALL-TIME message counters: {user_id: message_count}. Same load/flush pattern as
+# the weekly ones above, but counts every non-bot message sent anywhere in the guild and
+# never resets — see OVERALL_MESSAGE_LOG_CHANNEL_ID.
+_overall_message_counts: dict = {}
+_overall_message_dirty: bool = False
 
 
 async def _get_or_create_db_message(channel_id: int, filename: str):
@@ -3363,6 +3362,90 @@ async def before_message_leaderboard_rollover_loop():
     await bot.wait_until_ready()
 
 
+# ============================================================
+# ALL-TIME MESSAGE LEADERBOARD — same idea as the weekly one above,
+# but counts every non-bot message sent anywhere in the guild and
+# never resets. /overallmessageleaderboard, /overallmessages,
+# /syncglobalmessages.
+# ============================================================
+
+def record_overall_message(user_id: int) -> None:
+    """Called from on_message for every non-bot message sent anywhere in the guild
+    (unlike the weekly tracker, not limited to one channel)."""
+    global _overall_message_dirty
+    _overall_message_counts[user_id] = _overall_message_counts.get(user_id, 0) + 1
+    _overall_message_dirty = True
+
+
+def save_overall_message_db() -> None:
+    _atomic_write_json(
+        OVERALL_MESSAGE_DB_FILE,
+        {
+            "counts": {str(uid): count for uid, count in _overall_message_counts.items()},
+            "last_updated": discord.utils.utcnow().isoformat(),
+        },
+    )
+
+
+def load_overall_message_db() -> None:
+    data = _load_json_file(OVERALL_MESSAGE_DB_FILE)
+    if data is None:
+        return
+    _overall_message_counts.clear()
+    for uid, count in (data.get("counts") or {}).items():
+        _overall_message_counts[int(uid)] = count
+
+
+async def backup_overall_message_to_log_channel():
+    try:
+        await _backup_file_to_channel(
+            OVERALL_MESSAGE_LOG_CHANNEL_ID, OVERALL_MESSAGE_DB_FILE, OVERALL_MESSAGE_DB_FILE
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to back up overall message db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the save loop
+        print(f"Unexpected error backing up overall message db: {e}")
+
+
+async def restore_overall_message_from_log_channel():
+    """Pulls the last-known all-time counts from OVERALL_MESSAGE_LOG_CHANNEL_ID into local
+    storage on startup — same reasoning as restore_message_leaderboard_from_log_channel:
+    Railway wipes the container's disk on every redeploy."""
+    if _load_json_file(OVERALL_MESSAGE_DB_FILE) is not None:
+        load_overall_message_db()
+        await backup_overall_message_to_log_channel()
+        return
+
+    try:
+        found = await _restore_file_from_channel(
+            OVERALL_MESSAGE_LOG_CHANNEL_ID, OVERALL_MESSAGE_DB_FILE, OVERALL_MESSAGE_DB_FILE
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to restore overall message db from log channel: {e}")
+        found = False
+
+    if found:
+        load_overall_message_db()
+        print("Restored all-time message counts from log channel backup.")
+    else:
+        print("No all-time message backup found — starting fresh.")
+
+
+@tasks.loop(minutes=OVERALL_MESSAGE_SAVE_INTERVAL_MINUTES)
+async def overall_message_save_loop():
+    global _overall_message_dirty
+    if not _overall_message_dirty:
+        return
+    _overall_message_dirty = False
+    save_overall_message_db()
+    await backup_overall_message_to_log_channel()
+
+
+@overall_message_save_loop.before_loop
+async def before_overall_message_save_loop():
+    await bot.wait_until_ready()
+
+
 # ---------- Leaderboard image card (ported from leaderboard.js) ----------
 # Per-user cooldown, mirroring the JS version's cooldowns Map.
 _leaderboard_cooldowns: dict[int, float] = {}
@@ -3426,7 +3509,9 @@ async def _resolve_leaderboard_username(guild: discord.Guild | None, user_id: in
         return f"User {user_id}"
 
 
-def _render_leaderboard_image(ranked: list[tuple[int, int, str]], current_user_id: int) -> bytes:
+def _render_leaderboard_image(
+    ranked: list[tuple[int, int, str]], current_user_id: int, title: str = "Weekly Leaders"
+) -> bytes:
     """Draws the two-column leaderboard card. `ranked` is a list of
     (user_id, message_count, username) tuples, already sorted/sliced to the top 10.
     Runs synchronously — call via asyncio.to_thread, this is not async-safe on its own."""
@@ -3456,7 +3541,7 @@ def _render_leaderboard_image(ranked: list[tuple[int, int, str]], current_user_i
     font_msgs = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 16)
 
     # Title
-    draw.text((60, 85), "Weekly Leaders", font=font_title, fill=(255, 255, 255, 255), anchor="ls")
+    draw.text((60, 85), title, font=font_title, fill=(255, 255, 255, 255), anchor="ls")
 
     # Separator line under the title
     _leaderboard_blend_shape(
@@ -3779,6 +3864,9 @@ def _render_message_rank_card(
     neighbor_above: dict | None,
     neighbor_below: dict | None,
     avatar_bytes: bytes | None,
+    stat_label: str = "Messages This Week",
+    rank_label: str = "Weekly Rank",
+    top_rank_text: str = "You're #1 this week! 🏆",
 ) -> bytes:
     """target/neighbor_above/neighbor_below are dicts: {"rank", "username", "count"}."""
     W, H = RANK_CARD_CANVAS_WIDTH, RANK_CARD_CANVAS_HEIGHT
@@ -3840,7 +3928,7 @@ def _render_message_rank_card(
             anchor="rm",
         )
 
-    draw_neighbor_row(neighbor_above, top_y0, top_y1, "You're #1 this week! 🏆")
+    draw_neighbor_row(neighbor_above, top_y0, top_y1, top_rank_text)
     draw_neighbor_row(neighbor_below, bot_y0, bot_y1, "Nobody's ranked below you yet.")
 
     # Avatar
@@ -3876,10 +3964,10 @@ def _render_message_rank_card(
     col1_x = text_x
     col2_x = text_x + 350
 
-    draw.text((col1_x, label_y), "Messages This Week", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text((col1_x, label_y), stat_label, font=font_label, fill=(200, 200, 200, 255), anchor="lm")
     draw.text((col1_x, stat_y), str(target["count"]), font=font_stat, fill=(255, 217, 102, 255), anchor="lm")
 
-    draw.text((col2_x, label_y), "Weekly Rank", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text((col2_x, label_y), rank_label, font=font_label, fill=(200, 200, 200, 255), anchor="lm")
     draw.text((col2_x, stat_y), f"#{target['rank']}", font=font_stat, fill=ring_color, anchor="lm")
 
     buf = io.BytesIO()
@@ -3927,6 +4015,185 @@ async def messages_command(interaction: discord.Interaction, user: discord.Membe
 
     file = discord.File(io.BytesIO(image_bytes), filename="messages.png")
     await interaction.followup.send(file=file)
+
+
+# ---------- All-time message leaderboard/rank/sync commands ----------
+_overall_leaderboard_cooldowns: dict[int, float] = {}
+
+
+@bot.tree.command(name="overallmessageleaderboard", description="Show the all-time most active members by message count")
+async def overallmessageleaderboard(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    last_used = _overall_leaderboard_cooldowns.get(user_id)
+    if last_used is not None:
+        expiration_time = last_used + LEADERBOARD_COOLDOWN_SECONDS
+        now_ts = time.time()
+        if now_ts < expiration_time:
+            time_left = round(expiration_time - now_ts)
+            await interaction.response.send_message(
+                f"⏳ Please wait **{time_left} seconds** before checking the leaderboard again!",
+                ephemeral=True,
+            )
+            return
+
+    _overall_leaderboard_cooldowns[user_id] = time.time()
+    await interaction.response.defer()
+
+    ranked_counts = sorted(_overall_message_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    if not ranked_counts:
+        await interaction.followup.send("No messages logged yet!")
+        return
+
+    ranked = [
+        (uid, count, await _resolve_leaderboard_username(interaction.guild, uid))
+        for uid, count in ranked_counts
+    ]
+
+    try:
+        image_bytes = await asyncio.to_thread(_render_leaderboard_image, ranked, user_id, "All-Time Leaders")
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render overall leaderboard image: {e!r}")
+        await interaction.followup.send("Something went wrong generating the leaderboard image.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="overall_leaderboard.png")
+    await interaction.followup.send(
+        content="🏆 **Here are the all-time top 10 chatters!** 🏆",
+        file=file,
+    )
+
+
+@bot.tree.command(name="overallmessages", description="Show your (or someone else's) all-time message stats")
+@app_commands.describe(user="Whose stats to show — defaults to you")
+async def overallmessages_command(interaction: discord.Interaction, user: discord.Member | None = None):
+    await interaction.response.defer()
+
+    target_member = user or interaction.user
+    target_id = target_member.id
+
+    ranked = sorted(_overall_message_counts.items(), key=lambda kv: kv[1], reverse=True)
+    positions = {uid: i for i, (uid, _count) in enumerate(ranked)}
+
+    if target_id not in positions:
+        who = "You haven't" if target_member.id == interaction.user.id else f"**{target_member.display_name}** hasn't"
+        await interaction.followup.send(f"{who} sent any tracked messages yet!")
+        return
+
+    idx = positions[target_id]
+
+    async def build_entry(i: int) -> dict:
+        uid, count = ranked[i]
+        return {"rank": i + 1, "username": await _resolve_leaderboard_username(interaction.guild, uid), "count": count}
+
+    target_entry = await build_entry(idx)
+    neighbor_above = await build_entry(idx - 1) if idx > 0 else None
+    neighbor_below = await build_entry(idx + 1) if idx < len(ranked) - 1 else None
+
+    avatar_bytes = await _fetch_leaderboard_avatar_bytes(target_member)
+
+    try:
+        image_bytes = await asyncio.to_thread(
+            _render_message_rank_card,
+            target_entry, neighbor_above, neighbor_below, avatar_bytes,
+            stat_label="Total Messages", rank_label="All-Time Rank", top_rank_text="You're #1 all-time! 🏆",
+        )
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render overall message rank card: {e!r}")
+        await interaction.followup.send("Something went wrong generating that card.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="overall_messages.png")
+    await interaction.followup.send(file=file)
+
+
+@bot.tree.command(
+    name="syncglobalmessages",
+    description="(Staff) Rebuild all-time message counts by rescanning as much of the server's history as possible",
+)
+async def syncglobalmessages(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # Every channel that can hold messages: text channels, forum posts, and both active +
+    # archived threads off of them — as much of the server's history as the API exposes.
+    channels_to_scan: list = list(guild.text_channels)
+    for text_channel in guild.text_channels:
+        channels_to_scan.extend(text_channel.threads)
+        try:
+            async for thread in text_channel.archived_threads(limit=None):
+                channels_to_scan.append(thread)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    for forum in getattr(guild, "forums", []):
+        channels_to_scan.extend(forum.threads)
+        try:
+            async for thread in forum.archived_threads(limit=None):
+                channels_to_scan.append(thread)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    total_channels = len(channels_to_scan)
+    # Progress is posted as a normal channel message rather than an interaction followup edit
+    # — the interaction token only stays valid 15 minutes, and scanning full history across
+    # every channel in an active server can easily take far longer than that.
+    await interaction.followup.send(
+        f"Starting a full-history resync across {total_channels} channel(s)/thread(s) — progress below."
+    )
+    progress_msg = await interaction.channel.send(f"Scanning 0/{total_channels} channel(s)...")
+
+    counts: dict[int, int] = {}
+    scanned_channels = 0
+    skipped_channels = 0
+    total_messages = 0
+
+    for channel in channels_to_scan:
+        try:
+            async for message in channel.history(limit=None, oldest_first=True):
+                if message.author.bot:
+                    continue
+                counts[message.author.id] = counts.get(message.author.id, 0) + 1
+                total_messages += 1
+            scanned_channels += 1
+        except (discord.Forbidden, discord.HTTPException):
+            skipped_channels += 1
+            continue
+        except Exception as e:
+            print(f"syncglobalmessages: error scanning channel {getattr(channel, 'id', '?')}: {e!r}")
+            skipped_channels += 1
+            continue
+
+        try:
+            await progress_msg.edit(
+                content=(
+                    f"Scanning {scanned_channels + skipped_channels}/{total_channels} channel(s)... "
+                    f"{total_messages:,} messages counted so far."
+                )
+            )
+        except Exception as e:
+            print(f"syncglobalmessages: progress edit failed: {e!r}")
+
+    global _overall_message_dirty
+    _overall_message_counts.clear()
+    _overall_message_counts.update(counts)
+    _overall_message_dirty = True
+    save_overall_message_db()
+    await backup_overall_message_to_log_channel()
+
+    await progress_msg.edit(
+        content=(
+            "✅ All-time message resync complete.\n"
+            f"Scanned {scanned_channels} channel(s)/thread(s) ({skipped_channels} skipped due to missing access).\n"
+            f"Counted {total_messages:,} messages across {len(counts)} member(s)."
+        )
+    )
 
 
 # ---------- Slash commands ----------
@@ -5102,143 +5369,6 @@ async def restore_scrim_db_from_log_channel():
         print("No existing scrim db backup found — starting fresh.")
 
 
-# ---------- Tournament bracket ----------
-def default_bracket_boxes() -> dict:
-    return {str(i): ["", ""] for i in range(1, BRACKET_PLACE_COUNT + 1)}
-
-
-def load_bracket_db() -> dict:
-    data = _load_json_file(BRACKET_DB_FILE)
-    if data is None:
-        return {"boxes": default_bracket_boxes()}
-    boxes = data.get("boxes", {})
-    # Fill in any slots missing from an older/shorter file rather than erroring on them.
-    for i in range(1, BRACKET_PLACE_COUNT + 1):
-        boxes.setdefault(str(i), ["", ""])
-    data["boxes"] = boxes
-    return data
-
-
-def save_bracket_db(data: dict) -> None:
-    data["last_updated"] = discord.utils.utcnow().isoformat()
-    _atomic_write_json(BRACKET_DB_FILE, data)
-
-
-def _bracket_layout():
-    """Computes pixel positions for all 15 boxes plus the canvas size, so the render
-    function and the connector-line drawing share one source of truth for coordinates."""
-    box_w, box_h = 230, 64
-    pair_gap, group_gap = 14, 46
-    margin_top, margin_left, margin_right, margin_bottom = 150, 60, 80, 60
-    col_gap = 90
-
-    round1_ys = []
-    y = margin_top
-    for _pair in range(4):
-        round1_ys.append(y)
-        y2 = y + box_h + pair_gap
-        round1_ys.append(y2)
-        y = y2 + box_h + group_gap
-
-    col_x = [margin_left]
-    for _c in range(3):
-        col_x.append(col_x[-1] + box_w + col_gap)
-
-    round1_centers = [ry + box_h / 2 for ry in round1_ys]
-    round2_centers = [(round1_centers[2 * i] + round1_centers[2 * i + 1]) / 2 for i in range(4)]
-    round2_ys = [c - box_h / 2 for c in round2_centers]
-    semi_centers = [(round2_centers[2 * i] + round2_centers[2 * i + 1]) / 2 for i in range(2)]
-    semi_ys = [c - box_h / 2 for c in semi_centers]
-    final_center = (semi_centers[0] + semi_centers[1]) / 2
-    final_y = final_center - box_h / 2
-
-    # Places 1-15 in reading order: round 1 (top-to-bottom), round 2, semis, final.
-    slots = []
-    for i in range(8):
-        slots.append((col_x[0], round1_ys[i]))
-    for i in range(4):
-        slots.append((col_x[1], round2_ys[i]))
-    for i in range(2):
-        slots.append((col_x[2], semi_ys[i]))
-    slots.append((col_x[3], final_y))
-
-    width = int(col_x[3] + box_w + margin_right)
-    height = int(round1_ys[-1] + box_h + margin_bottom)
-
-    return {
-        "box_w": box_w, "box_h": box_h, "col_x": col_x, "col_gap": col_gap,
-        "slots": slots, "width": width, "height": height,
-        "round1_centers": round1_centers, "round2_centers": round2_centers,
-        "semi_centers": semi_centers,
-    }
-
-
-def _bracket_connector(draw: "ImageDraw.ImageDraw", y1: float, y2: float, x_from: float, x_mid: float, x_to: float, color) -> None:
-    """Draws the elbow-shaped connector between two source boxes and the box they feed
-    into: a stub out of each source box, a vertical bar joining them, then a stub into
-    the target box — matching the bracket-line style from the mockup."""
-    draw.line([(x_from, y1), (x_mid, y1)], fill=color, width=2)
-    draw.line([(x_from, y2), (x_mid, y2)], fill=color, width=2)
-    draw.line([(x_mid, y1), (x_mid, y2)], fill=color, width=2)
-    mid_y = (y1 + y2) / 2
-    draw.line([(x_mid, mid_y), (x_to, mid_y)], fill=color, width=2)
-
-
-def _render_bracket_image(boxes: dict) -> bytes:
-    """Draws the 15-box tournament bracket card. Runs synchronously — call via
-    asyncio.to_thread, this is not async-safe on its own."""
-    layout = _bracket_layout()
-    box_w, box_h = layout["box_w"], layout["box_h"]
-    col_x, col_gap = layout["col_x"], layout["col_gap"]
-
-    img = Image.new("RGBA", (layout["width"], layout["height"]), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    card_box = [0, 0, layout["width"] - 1, layout["height"] - 1]
-    draw.rounded_rectangle(card_box, radius=28, fill=(18, 18, 22, 255))
-    draw.rounded_rectangle(card_box, radius=28, outline=(70, 70, 78, 255), width=2)
-
-    title_font = _leaderboard_load_font(BRACKET_FONT_PATH, 50)
-    box_font = _leaderboard_load_font(BRACKET_FONT_PATH, 22)
-
-    draw.text((60, 40), "Tournament Bracket", font=title_font, fill=(240, 240, 240, 255))
-    draw.line([(60, 112), (layout["width"] - 60, 112)], fill=(120, 120, 128, 180), width=2)
-
-    for place, (x, y) in enumerate(layout["slots"], start=1):
-        box_data = boxes.get(str(place)) or ["", ""]
-        team1 = box_data[0] if len(box_data) > 0 else ""
-        team2 = box_data[1] if len(box_data) > 1 else ""
-
-        box = [x, y, x + box_w, y + box_h]
-
-        def _fill(d, box=box):
-            d.rounded_rectangle(box, radius=10, fill=(255, 255, 255, 26))
-
-        _leaderboard_blend_shape(img, _fill)
-
-        if team1:
-            draw.text((x + 16, y + 10), team1, font=box_font, fill=(235, 235, 240, 255))
-        if team2:
-            draw.text((x + 16, y + 38), team2, font=box_font, fill=(235, 235, 240, 255))
-
-    line_color = (225, 225, 230, 220)
-    for i in range(4):
-        x_from = col_x[0] + box_w
-        x_mid = x_from + col_gap / 2
-        _bracket_connector(draw, layout["round1_centers"][2 * i], layout["round1_centers"][2 * i + 1], x_from, x_mid, col_x[1], line_color)
-    for i in range(2):
-        x_from = col_x[1] + box_w
-        x_mid = x_from + col_gap / 2
-        _bracket_connector(draw, layout["round2_centers"][2 * i], layout["round2_centers"][2 * i + 1], x_from, x_mid, col_x[2], line_color)
-    x_from = col_x[2] + box_w
-    x_mid = x_from + col_gap / 2
-    _bracket_connector(draw, layout["semi_centers"][0], layout["semi_centers"][1], x_from, x_mid, col_x[3], line_color)
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 def scrim_leader_channel_overwrite() -> discord.PermissionOverwrite:
     """Permissions granted to each team's leader in their scrim channel: on top of
     viewing/sending, mention_everyone lets them ping their own team's role even though
@@ -5320,6 +5450,7 @@ async def on_message(message: discord.Message):
         await maybe_restick_tournament_message(message)
         if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
             record_message_for_leaderboard(message.author.id)
+        record_overall_message(message.author.id)
 
     await bot.process_commands(message)
 
@@ -6336,175 +6467,6 @@ async def deletetournamentsignups(interaction: discord.Interaction):
     await interaction.followup.send(result, ephemeral=True)
 
 
-@bot.tree.command(
-    name="bracketconfig",
-    description="(Staff) Fill in a tournament bracket box, reset the whole bracket, or just view it",
-)
-@app_commands.describe(
-    place=f"Which box to fill in (1-{BRACKET_PLACE_COUNT}, reading order: round 1 top-to-bottom, then round 2, semis, final)",
-    team1="First team/name for that box",
-    team2="Second team/name for that box",
-    reset="Set to true to clear every box back to empty (ignores place/team1/team2)",
-)
-async def bracketconfig(
-    interaction: discord.Interaction,
-    place: app_commands.Range[int, 1, BRACKET_PLACE_COUNT] | None = None,
-    team1: str | None = None,
-    team2: str | None = None,
-    reset: bool = False,
-):
-    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    db = load_bracket_db()
-    boxes = db["boxes"]
-
-    if reset:
-        boxes = default_bracket_boxes()
-        db["boxes"] = boxes
-        save_bracket_db(db)
-    elif place is not None:
-        if not team1 or not team2:
-            await interaction.followup.send(
-                "Please provide both `team1` and `team2` when setting a box.", ephemeral=True
-            )
-            return
-        # Only this one box is touched — every other box's saved value is left exactly as-is.
-        boxes[str(place)] = [team1, team2]
-        save_bracket_db(db)
-    # else: neither `place` nor `reset` was given — just render the bracket as it stands.
-
-    try:
-        image_bytes = await asyncio.to_thread(_render_bracket_image, boxes)
-    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
-        print(f"Failed to render bracket image: {e!r}")
-        await interaction.followup.send("Something went wrong generating the bracket image.")
-        return
-
-    file = discord.File(io.BytesIO(image_bytes), filename="bracket.png")
-    await interaction.followup.send(file=file)
-
-
-@bot.tree.command(
-    name="synclevelroles",
-    description="(Staff) Bulk-apply level roles to every member from a Lurkr levels export",
-)
-@app_commands.describe(export="The Lurkr levels export JSON file (e.g. lurkr_levels_....json)")
-async def synclevelroles(interaction: discord.Interaction, export: discord.Attachment):
-    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    if not export.filename.lower().endswith(".json"):
-        await interaction.response.send_message("Please attach the Lurkr levels export as a `.json` file.", ephemeral=True)
-        return
-
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("This command has to be run in a server.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    try:
-        raw = await export.read()
-        data = json.loads(raw)
-        levels = data["levels"]
-    except Exception as e:
-        await interaction.followup.send(f"Couldn't read that export file: {e}")
-        return
-
-    level_by_user: dict[str, int] = {}
-    for entry in levels:
-        uid = entry.get("userId")
-        lvl = entry.get("level")
-        if uid is not None and lvl is not None:
-            level_by_user[str(uid)] = int(lvl)
-
-    total = len(level_by_user)
-    channel = interaction.channel
-    # Post progress as a normal channel message rather than editing the interaction's
-    # followup — the interaction token only stays valid for 15 minutes, and a sync
-    # over ~1000 members can easily run longer than that. A plain message has no such
-    # limit, so progress won't silently stop updating partway through.
-    await interaction.followup.send(f"Starting level role sync for {total} members — progress below.")
-    progress_msg = await channel.send(f"Syncing level roles for {total} members from the export...")
-
-    updated = 0
-    unchanged = 0
-    not_in_guild = 0
-    errors = 0
-    processed = 0
-
-    try:
-        for user_id_str, level in level_by_user.items():
-            processed += 1
-            member = guild.get_member(int(user_id_str))
-            if member is None:
-                not_in_guild += 1
-                continue
-
-            desired = target_level_role_ids(level)
-            current_level_role_ids = {r.id for r in member.roles if r.id in LEVEL_ROLE_IDS}
-
-            if current_level_role_ids == desired:
-                unchanged += 1
-            else:
-                ids_to_remove = current_level_role_ids - desired
-                ids_to_add = desired - current_level_role_ids
-                roles_to_remove = [r for r in (guild.get_role(rid) for rid in ids_to_remove) if r is not None]
-                roles_to_add = [r for r in (guild.get_role(rid) for rid in ids_to_add) if r is not None]
-                try:
-                    if roles_to_remove:
-                        await member.remove_roles(*roles_to_remove, reason="Level role sync from Lurkr export")
-                    if roles_to_add:
-                        await member.add_roles(*roles_to_add, reason="Level role sync from Lurkr export")
-                    updated += 1
-                except Exception as e:
-                    print(f"synclevelroles: failed to update {user_id_str}: {e!r}")
-                    errors += 1
-
-            if processed % 50 == 0 or processed == total:
-                try:
-                    await progress_msg.edit(
-                        content=f"Syncing... {processed}/{total} processed ({updated} updated so far)."
-                    )
-                except Exception as e:
-                    print(f"synclevelroles: progress edit failed: {e!r}")
-
-            await asyncio.sleep(0.4)  # stay well under rate limits across large member counts
-    except Exception as e:
-        print(f"synclevelroles: sync loop aborted early: {e!r}")
-        try:
-            await progress_msg.edit(
-                content=(
-                    "Level role sync hit an unexpected error and stopped early.\n"
-                    f"Processed: {processed}/{total}\n"
-                    f"Updated: {updated}\n"
-                    f"Already correct: {unchanged}\n"
-                    f"Not currently in this server: {not_in_guild}\n"
-                    f"Errors: {errors}\n"
-                    f"Error: {e}"
-                )
-            )
-        except Exception:
-            pass
-        return
-
-    await progress_msg.edit(
-        content=(
-            "Level role sync complete.\n"
-            f"Updated: {updated}\n"
-            f"Already correct: {unchanged}\n"
-            f"Not currently in this server: {not_in_guild}\n"
-            f"Errors: {errors}"
-        )
-    )
-
-
 # ---------- Question of the Day ----------
 @bot.tree.command(
     name="qotd",
@@ -6636,6 +6598,7 @@ async def on_ready():
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
     await restore_message_leaderboard_from_log_channel()
+    await restore_overall_message_from_log_channel()
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
@@ -6676,6 +6639,8 @@ async def on_ready():
         message_leaderboard_save_loop.start()
     if not message_leaderboard_rollover_loop.is_running():
         message_leaderboard_rollover_loop.start()
+    if not overall_message_save_loop.is_running():
+        overall_message_save_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
