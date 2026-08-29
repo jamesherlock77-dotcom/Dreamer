@@ -44,6 +44,7 @@ STAFF_ROLE_ID = 1528009567219224616        # only holders of this role can use s
 PREMIUM_ROLE_ID = 1528139462159106059      # gates /premiumteamsettings; premium team roles are kept above this role
 PREMIUM_ROLE_ID_2 = 1529805001088569384    # a second role that also grants premium access
 TEAM_LEADER_ROLE_ID = 1528445357317423135  # granted to every team leader, current and future
+TEAM_CO_LEADER_ROLE_ID = 1543045614319968266  # granted to a team's co-leader (see /setcoleader), removed once they no longer hold that slot
 MAX_TEAM_MEMBERS = 10                      # includes the leader
 TEAM_JOIN_COOLDOWN_DAYS = 7                 # how long a member must stay on a team before leaving it
 SUPPORT_TICKET_CHANNEL_ID = 1542648891147558993  # the support ticket panel is posted/refreshed here, and new ticket threads are opened here
@@ -549,6 +550,15 @@ def find_team_by_leader(db: dict, user_id: int):
     return None
 
 
+def find_team_by_leader_or_coleader(db: dict, user_id: int):
+    """Same as find_team_by_leader, but also matches a team's co-leader (set via
+    /setcoleader) — used to gate the commands co-leaders are allowed to use too."""
+    for name, info in db.items():
+        if info["leader_id"] == user_id or info.get("co_leader_id") == user_id:
+            return name
+    return None
+
+
 def find_team_by_member(db: dict, user_id: int):
     for name, info in db.items():
         if user_id in info.get("members", []):
@@ -661,13 +671,47 @@ def build_team_welcome_message(user_id: int, role_id: int) -> str:
 def team_leader_channel_overwrite() -> discord.PermissionOverwrite:
     """Permissions granted to a team leader in their own team channel: on top of viewing/
     sending, manage_messages lets them delete and pin messages, and mention_everyone lets
-    them ping their team's role even though the role itself isn't set to be mentionable."""
+    them ping their team's role even though the role itself isn't set to be mentionable.
+    Co-leaders (see /setcoleader) get this exact same overwrite."""
     return discord.PermissionOverwrite(
         view_channel=True,
         send_messages=True,
         manage_messages=True,
         mention_everyone=True,
     )
+
+
+async def _clear_team_coleader(db: dict, team_name: str, guild: discord.Guild, reason: str) -> None:
+    """Clears a team's co-leader slot (if any) and reverts their channel permission
+    overwrite back to whatever the base team role alone grants. Saves + backs up db.
+    Used both by /setcoleader itself and whenever a co-leader is kicked/leaves the team
+    outright, so a stale co-leader ID never lingers with elevated channel permissions."""
+    info = db["teams"].get(team_name)
+    if info is None:
+        return
+    old_co_leader_id = info.get("co_leader_id")
+    if old_co_leader_id is None:
+        return
+
+    info["co_leader_id"] = None
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    channel = guild.get_channel(info.get("channel_id"))
+    old_member = guild.get_member(old_co_leader_id)
+    if channel is not None and old_member is not None:
+        try:
+            await channel.set_permissions(old_member, overwrite=None, reason=reason)
+        except discord.HTTPException:
+            pass
+
+    if old_member is not None:
+        co_leader_role = guild.get_role(TEAM_CO_LEADER_ROLE_ID)
+        if co_leader_role is not None and co_leader_role in old_member.roles:
+            try:
+                await old_member.remove_roles(co_leader_role, reason=reason)
+            except discord.HTTPException:
+                pass
 
 
 def team_channel_basic_access_overwrite() -> discord.PermissionOverwrite:
@@ -1403,6 +1447,25 @@ async def perform_team_kick(db: dict, team_name: str, user_id: int, guild: disco
         except discord.HTTPException:
             pass
 
+    # If the person being kicked is the team's co-leader, clear that slot and revert their
+    # elevated channel permissions — they're leaving the team entirely, not just stepping
+    # down from co-leader, so this needs to happen regardless of who initiated the kick.
+    if info.get("co_leader_id") == user_id:
+        info["co_leader_id"] = None
+        channel_for_perms = guild.get_channel(info.get("channel_id"))
+        if channel_for_perms is not None and member is not None:
+            try:
+                await channel_for_perms.set_permissions(member, overwrite=None, reason=reason)
+            except discord.HTTPException:
+                pass
+        if member is not None:
+            co_leader_role = guild.get_role(TEAM_CO_LEADER_ROLE_ID)
+            if co_leader_role is not None and co_leader_role in member.roles:
+                try:
+                    await member.remove_roles(co_leader_role, reason=reason)
+                except discord.HTTPException:
+                    pass
+
     info["members"] = [uid for uid in info["members"] if uid != user_id]
     clear_team_join(info, user_id)
     save_db(db)
@@ -1459,6 +1522,17 @@ async def perform_team_deletion(db: dict, team_name: str, guild: discord.Guild, 
             except discord.HTTPException:
                 pass
 
+    co_leader_id = info.get("co_leader_id")
+    if co_leader_id is not None:
+        co_leader_role = guild.get_role(TEAM_CO_LEADER_ROLE_ID)
+        if co_leader_role is not None:
+            try:
+                co_leader_member = guild.get_member(co_leader_id) or await guild.fetch_member(co_leader_id)
+                if co_leader_role in co_leader_member.roles:
+                    await co_leader_member.remove_roles(co_leader_role, reason=reason)
+            except discord.HTTPException:
+                pass
+
     save_db(db)
     await backup_db_to_log_channel()
 
@@ -1489,6 +1563,12 @@ async def perform_leader_promotion(
 
     old_leader_id = info.get("leader_id")
     info["leader_id"] = new_leader_id
+
+    # If the new leader was the co-leader, that slot is meaningless now (can't be both) —
+    # clear it and its extra channel perms/role before the leader-promotion perms below
+    # apply (which grant the same/more anyway).
+    if info.get("co_leader_id") == new_leader_id:
+        await _clear_team_coleader(db, team_name, guild, reason=reason)
 
     channel = guild.get_channel(info.get("channel_id"))
     leader_marker_role = guild.get_role(TEAM_LEADER_ROLE_ID)
@@ -2051,6 +2131,7 @@ class ConfirmTeamView(discord.ui.View):
         db["teams"][self.team_name] = {
             "emoji": self.emoji,
             "leader_id": self.requester_id,
+            "co_leader_id": None,
             "role_id": role.id,
             "channel_id": team_channel.id,
             "members": [self.requester_id],
@@ -4294,15 +4375,15 @@ async def teammembers_team_autocomplete(interaction: discord.Interaction, curren
     ][:25]
 
 
-@bot.tree.command(name="invite", description="Invite a user to your team")
+@bot.tree.command(name="invite", description="Invite a user to your team (leader or co-leader)")
 @app_commands.describe(user="The user to invite")
 async def invite(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
     db = load_db()
-    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    team_key = find_team_by_leader_or_coleader(db["teams"], interaction.user.id)
     if not team_key:
-        await interaction.followup.send("You must be a team leader to invite people.", ephemeral=True)
+        await interaction.followup.send("You must be a team leader or co-leader to invite people.", ephemeral=True)
         return
 
     # Only one outstanding invite per leader at a time — if they already have one pending,
@@ -4500,6 +4581,22 @@ async def leaveteam(interaction: discord.Interaction):
     role = interaction.guild.get_role(info["role_id"])
     if role:
         await interaction.user.remove_roles(role, reason="Left the team")
+
+    # Same co-leader cleanup as perform_team_kick — see the comment there.
+    if info.get("co_leader_id") == interaction.user.id:
+        info["co_leader_id"] = None
+        channel_for_perms = interaction.guild.get_channel(info.get("channel_id"))
+        if channel_for_perms is not None:
+            try:
+                await channel_for_perms.set_permissions(interaction.user, overwrite=None, reason="Left the team")
+            except discord.HTTPException:
+                pass
+        co_leader_role = interaction.guild.get_role(TEAM_CO_LEADER_ROLE_ID)
+        if co_leader_role is not None and co_leader_role in interaction.user.roles:
+            try:
+                await interaction.user.remove_roles(co_leader_role, reason="Left the team")
+            except discord.HTTPException:
+                pass
 
     info["members"] = [uid for uid in info["members"] if uid != interaction.user.id]
     clear_team_join(info, interaction.user.id)
@@ -5633,9 +5730,9 @@ async def premiumteamsettings(
         return
 
     db = load_db()
-    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    team_key = find_team_by_leader_or_coleader(db["teams"], interaction.user.id)
     if not team_key:
-        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+        await interaction.followup.send("You must be a team leader or co-leader to use this command.", ephemeral=True)
         return
 
     if not any([colour1, colour1hex, colour2, colour2hex, roleicon]):
@@ -5789,14 +5886,14 @@ async def premiumteamsettings(
 
 @bot.tree.command(
     name="changeteamsettings",
-    description="Change your team's name, colour, or icon, kick a member, or delete it (leader only)",
+    description="Change your team's name, colour, or icon, kick a member, or delete it (leader/co-leader)",
 )
 @app_commands.describe(
-    delete="Delete your team — removes the role, channel, and database entry (can't be undone)",
+    delete="Delete your team — removes the role, channel, and database entry (leader only, can't be undone)",
     changename="New team name",
     changecolour="New hex colour for the team's role, e.g. #5865F2",
     changeicon="New single standard emoji for the team (no custom server emojis)",
-    kick="A member of your team to remove",
+    kick="A member of your team to remove (co-leaders can't kick the leader)",
 )
 async def changeteamsettings(
     interaction: discord.Interaction,
@@ -5809,12 +5906,18 @@ async def changeteamsettings(
     await interaction.response.defer(ephemeral=True)
 
     db = load_db()
-    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    team_key = find_team_by_leader_or_coleader(db["teams"], interaction.user.id)
     if not team_key:
-        await interaction.followup.send("You must be a team leader to use this command.", ephemeral=True)
+        await interaction.followup.send("You must be a team leader or co-leader to use this command.", ephemeral=True)
         return
 
+    info = db["teams"][team_key]
+    is_leader = info.get("leader_id") == interaction.user.id
+
     if delete:
+        if not is_leader:
+            await interaction.followup.send("Only the team leader can delete the team.", ephemeral=True)
+            return
         view = ConfirmDeleteTeamView(interaction.user.id, team_key, interaction.guild)
         await interaction.followup.send(
             f"Are you sure you want to delete **{team_key}**? This will remove the team's role, "
@@ -5832,7 +5935,9 @@ async def changeteamsettings(
         )
         return
 
-    info = db["teams"][team_key]
+    if kick is not None and kick.id == info.get("leader_id") and not is_leader:
+        await interaction.followup.send("Co-leaders can't kick the team leader.", ephemeral=True)
+        return
 
     if kick is not None:
         if kick.id == interaction.user.id:
@@ -5867,7 +5972,6 @@ async def changeteamsettings(
         )
         return
 
-    info = db["teams"][team_key]
     role = interaction.guild.get_role(info["role_id"])
     channel = interaction.guild.get_channel(info["channel_id"])
 
@@ -5968,6 +6072,96 @@ async def changeteamsettings(
     if icon_warning:
         message += f"\n⚠️ Everything else applied, but {icon_warning}."
     await interaction.followup.send(message, ephemeral=True)
+
+
+@bot.tree.command(
+    name="setcoleader",
+    description="Set (or clear) your team's co-leader — a co-leader can do everything you can except kick you or delete the team (leader only)",
+)
+@app_commands.describe(
+    user="The member to make co-leader (must already be on your team) — omit to remove the current co-leader"
+)
+async def setcoleader(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+    team_key = find_team_by_leader(db["teams"], interaction.user.id)
+    if not team_key:
+        await interaction.followup.send("You must be the team leader to use this command.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+
+    if user is None:
+        current_co_leader_id = info.get("co_leader_id")
+        if current_co_leader_id is None:
+            await interaction.followup.send("Your team doesn't currently have a co-leader.", ephemeral=True)
+            return
+        await _clear_team_coleader(db, team_key, interaction.guild, reason=f"Co-leader removed by {interaction.user}")
+        await log_team_event(
+            "🥈 Co-Leader Removed",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team", team_key, True),
+                ("Former Co-Leader", f"<@{current_co_leader_id}> (`{current_co_leader_id}`)", True),
+                ("Removed By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
+        await interaction.followup.send(f"<@{current_co_leader_id}> is no longer co-leader of **{team_key}**.", ephemeral=True)
+        return
+
+    if user.id == interaction.user.id:
+        await interaction.followup.send("You're already the leader.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.followup.send("You can't make a bot a co-leader.", ephemeral=True)
+        return
+    if user.id not in info.get("members", []):
+        await interaction.followup.send(f"{user.mention} isn't a member of **{team_key}**.", ephemeral=True)
+        return
+    if info.get("co_leader_id") == user.id:
+        await interaction.followup.send(f"{user.mention} is already the co-leader.", ephemeral=True)
+        return
+
+    # Only one co-leader slot per team — clear whoever currently holds it first.
+    if info.get("co_leader_id") is not None:
+        await _clear_team_coleader(db, team_key, interaction.guild, reason=f"Co-leader replaced by {interaction.user}")
+
+    info["co_leader_id"] = user.id
+    save_db(db)
+    await backup_db_to_log_channel()
+
+    channel = interaction.guild.get_channel(info.get("channel_id"))
+    if channel is not None:
+        try:
+            await channel.set_permissions(
+                user, overwrite=team_leader_channel_overwrite(), reason=f"Set as co-leader by {interaction.user}"
+            )
+        except discord.HTTPException:
+            pass
+        try:
+            await channel.send(f"🥈 {user.mention} is now co-leader of the team!")
+        except discord.HTTPException:
+            pass
+
+    co_leader_role = interaction.guild.get_role(TEAM_CO_LEADER_ROLE_ID)
+    if co_leader_role is not None:
+        try:
+            await user.add_roles(co_leader_role, reason=f"Set as co-leader by {interaction.user}")
+        except discord.HTTPException:
+            pass
+
+    await log_team_event(
+        "🥈 Co-Leader Set",
+        colour=discord.Colour.blue(),
+        fields=[
+            ("Team", team_key, True),
+            ("New Co-Leader", f"{user.mention} (`{user.id}`)", True),
+            ("Set By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+        ],
+    )
+
+    await interaction.followup.send(f"{user.mention} is now co-leader of **{team_key}**.", ephemeral=True)
 
 
 # ---------- Leader promotion commands ----------
