@@ -6076,7 +6076,7 @@ async def changeteamsettings(
 
 @bot.tree.command(
     name="setcoleader",
-    description="Set (or clear) your team's co-leader — a co-leader can do everything you can except kick you or delete the team (leader only)",
+    description="Set or clear your team's co-leader (leader only)",
 )
 @app_commands.describe(
     user="The member to make co-leader (must already be on your team) — omit to remove the current co-leader"
