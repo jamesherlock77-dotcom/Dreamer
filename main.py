@@ -165,6 +165,27 @@ STREAK_CHECK_INTERVAL_MINUTES = 5   # how often the loop checks for expired wind
 STREAK_LEAVE_EMOJI = "💔"
 STREAK_GAIN_EMOJI = "🔥"
 
+# Chat-streak milestone roles: stacked, not just the highest (a 14-day streak holds the
+# 1/3/7/14-day roles too) — same pattern as LEVEL_ROLE_THRESHOLDS above. Wiped entirely the
+# moment a streak is lost (see _advance_streak_phase), and re-granted automatically if the
+# streak is revived via /revivestreak since streak_days survives a revive.
+STREAK_ROLE_THRESHOLDS = [
+    (30, 1545191707044352081),
+    (14, 1545191647057412227),
+    (7, 1545191607500935248),
+    (3, 1545191558846881892),
+    (1, 1545191515217727589),
+]
+STREAK_ROLE_IDS = {role_id for _days, role_id in STREAK_ROLE_THRESHOLDS}
+
+
+def target_streak_role_ids(streak_days: int, phase: str) -> set[int]:
+    """Every streak role a member should currently hold — stacked, and none at all once the
+    streak is lost (phase == "lost") or the count is back at zero."""
+    if phase == "lost" or streak_days <= 0:
+        return set()
+    return {role_id for threshold, role_id in STREAK_ROLE_THRESHOLDS if streak_days >= threshold}
+
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
 # plain dark canvas if the assets aren't present, so the command still works out of the box.
@@ -4047,6 +4068,47 @@ async def _send_streak_channel_message(content: str) -> None:
         print(f"Failed to send streak announcement: {e}")
 
 
+def _streak_guild() -> discord.Guild | None:
+    """Resolves the single guild this bot operates in via the announce channel, since streak
+    role syncs can fire from a background task with no interaction to pull a guild from."""
+    channel = bot.get_channel(STREAK_ANNOUNCE_CHANNEL_ID)
+    return channel.guild if channel else None
+
+
+async def _sync_streak_roles(user_id: int, streak_days: int, phase: str) -> None:
+    """Brings a member's streak roles in line with target_streak_role_ids() for their current
+    streak_days/phase — adds any newly-earned milestone roles and strips every streak role at
+    once when the streak is lost. Recomputes from scratch each call (rather than tracking a
+    delta) so a missed sync earlier just gets corrected next time this runs."""
+    guild = _streak_guild()
+    if guild is None:
+        print("[streak] Couldn't resolve the guild for streak role sync — skipping role changes.")
+        return
+    member = guild.get_member(user_id)
+    if member is None:
+        return
+
+    target_ids = target_streak_role_ids(streak_days, phase)
+    current_ids = {role.id for role in member.roles if role.id in STREAK_ROLE_IDS}
+
+    to_add = [guild.get_role(rid) for rid in (target_ids - current_ids)]
+    to_add = [role for role in to_add if role is not None]
+    to_remove = [guild.get_role(rid) for rid in (current_ids - target_ids)]
+    to_remove = [role for role in to_remove if role is not None]
+
+    if to_add:
+        try:
+            await member.add_roles(*to_add, reason=f"Chat streak — {streak_days} day(s)")
+        except discord.HTTPException as e:
+            print(f"[streak] Failed to add streak role(s) to {user_id}: {e}")
+
+    if to_remove:
+        try:
+            await member.remove_roles(*to_remove, reason="Chat streak lost")
+        except discord.HTTPException as e:
+            print(f"[streak] Failed to remove streak role(s) from {user_id}: {e}")
+
+
 async def _advance_streak_phase(user_id: int, entry: dict, now: datetime) -> bool:
     """Moves entry to whichever phase it should be in given the current time — opening the
     next counting window once the wait is over, marking a missed window as lost, or
@@ -4071,6 +4133,7 @@ async def _advance_streak_phase(user_id: int, entry: dict, now: datetime) -> boo
                 f"*(Psst... if you have your monthly revive available, you have "
                 f"{STREAK_REVIVE_WINDOW_HOURS} hours to use `/revivestreak`!)*"
             )
+            await _sync_streak_roles(user_id, entry["streak_days"], entry["phase"])
             return True
         return False
 
@@ -4080,6 +4143,7 @@ async def _advance_streak_phase(user_id: int, entry: dict, now: datetime) -> boo
             entry.clear()
             entry.update(_new_streak_entry())
             entry["revive_month"] = revive_month
+            await _sync_streak_roles(user_id, entry["streak_days"], entry["phase"])
             return True
         return False
 
@@ -4127,6 +4191,7 @@ async def record_streak_message(user_id: int) -> None:
             f"Come back and chat after <t:{ts}:t> (<t:{ts}:R>) to get your next streak.\n"
             f"**Message Streak:** {entry['streak_days']} {day_word}"
         )
+        await _sync_streak_roles(user_id, entry["streak_days"], entry["phase"])
 
 
 @tasks.loop(minutes=STREAK_CHECK_INTERVAL_MINUTES)
@@ -4190,6 +4255,7 @@ async def revivestreak(interaction: discord.Interaction):
     _streak_dirty = True
     save_streak_db()
     await backup_streak_db_to_log_channel()
+    await _sync_streak_roles(interaction.user.id, entry["streak_days"], entry["phase"])
 
     ts = int(datetime.fromisoformat(entry["phase_end"]).timestamp())
     day_word = "Day" if entry["streak_days"] == 1 else "Days"
