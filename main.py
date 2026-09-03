@@ -153,6 +153,18 @@ OVERALL_MESSAGE_LOG_CHANNEL_ID = 1542639777809965167  # channel the all-time JSO
 OVERALL_MESSAGE_DB_FILE = "overall_message_data.json"
 OVERALL_MESSAGE_SAVE_INTERVAL_MINUTES = 5  # how often in-memory counts are flushed to disk + backed up
 
+# ---------- Chat streak config ----------
+STREAK_ANNOUNCE_CHANNEL_ID = 1528015385511723079  # gained/lost streak messages are posted here
+STREAK_LOG_CHANNEL_ID = 1545181057857355857        # streak JSON "database" message lives here
+STREAK_DB_FILE = "streak_data.json"
+STREAK_MESSAGES_REQUIRED = 3        # messages needed within the window to bank the day's streak
+STREAK_WINDOW_HOURS = 24            # length of each streak window
+STREAK_REVIVE_WINDOW_HOURS = 24     # how long after losing a streak /revivestreak still works
+STREAK_REVIVE_MONTHLY_LIMIT = 1     # /revivestreak uses allowed per user per calendar month
+STREAK_CHECK_INTERVAL_MINUTES = 5   # how often the loop checks for expired windows/revive grace periods
+STREAK_LEAVE_EMOJI = "💔"
+STREAK_GAIN_EMOJI = "🔥"
+
 # Image-card rendering (ported from the old discord.js leaderboard.js design) — assets live
 # next to this file: two Orbitron weights and an optional background image. Falls back to a
 # plain dark canvas if the assets aren't present, so the command still works out of the box.
@@ -291,6 +303,13 @@ _message_leaderboard_dirty: bool = False
 # never resets — see OVERALL_MESSAGE_LOG_CHANNEL_ID.
 _overall_message_counts: dict = {}
 _overall_message_dirty: bool = False
+
+# In-memory chat-streak state: {user_id: {"streak_days": int, "messages_in_window": int,
+# "window_end": iso str | None, "status": "active" | "lost", "lost_at": iso str | None,
+# "revive_month": "YYYY-MM" str | None}}. Same load/flush pattern as the other trackers —
+# see restore_streak_db_from_log_channel() and streak_save_loop below.
+_streak_data: dict = {}
+_streak_dirty: bool = False
 
 # Per-user cooldown gate shared by BOTH leaderboards: {user_id: last counted message's time.time()}.
 # A message only counts toward either leaderboard if MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS has
@@ -623,7 +642,7 @@ async def purge_user_activity_data(user_id: int) -> str:
     giveaway entries alone: those are structural/roles-based records tied to features the
     person is still using, not activity tracking, matching the privacy panel's "This does
     NOT include ... roles you currently hold" wording."""
-    global _message_leaderboard_dirty, _overall_message_dirty
+    global _message_leaderboard_dirty, _overall_message_dirty, _streak_dirty
     removed = []
 
     if _message_leaderboard_counts.pop(user_id, None) is not None:
@@ -639,6 +658,12 @@ async def purge_user_activity_data(user_id: int) -> str:
         await backup_overall_message_to_log_channel()
 
     _message_count_cooldowns.pop(user_id, None)
+
+    if _streak_data.pop(user_id, None) is not None:
+        removed.append("chat streak")
+        _streak_dirty = False
+        save_streak_db()
+        await backup_streak_db_to_log_channel()
 
     invite_db = load_invite_db()
     invited_users = invite_db.get("invited_users", {})
@@ -3932,6 +3957,235 @@ async def before_overall_message_save_loop():
     await bot.wait_until_ready()
 
 
+# ============================================================
+# CHAT STREAKS — every user has a rolling STREAK_WINDOW_HOURS window. Any non-bot message
+# anywhere in the guild counts toward it (same 5s anti-spam gate + activity-tracking opt-out
+# as the message leaderboards, since this is hooked into that same gated block in on_message).
+# Once STREAK_MESSAGES_REQUIRED messages land inside a window, the streak banks, a fresh
+# window opens, and a 🔥 message posts in STREAK_ANNOUNCE_CHANNEL_ID. If a window expires
+# without enough messages, the streak is lost (💔 message posted) and the user has
+# STREAK_REVIVE_WINDOW_HOURS to run /revivestreak — capped at STREAK_REVIVE_MONTHLY_LIMIT
+# uses per calendar month — before it resets to zero for good.
+# ============================================================
+
+def _new_streak_entry() -> dict:
+    return {
+        "streak_days": 0,
+        "messages_in_window": 0,
+        "window_end": None,
+        "status": "active",
+        "lost_at": None,
+        "revive_month": None,
+    }
+
+
+def load_streak_db() -> dict:
+    data = _load_json_file(STREAK_DB_FILE)
+    if data is None:
+        return {"users": {}}
+    data.setdefault("users", {})
+    return data
+
+
+def save_streak_db() -> None:
+    _atomic_write_json(
+        STREAK_DB_FILE,
+        {"users": _streak_data, "last_updated": discord.utils.utcnow().isoformat()},
+    )
+
+
+def _load_streak_cache_from_db(data: dict) -> None:
+    _streak_data.clear()
+    for uid, entry in data.get("users", {}).items():
+        merged = _new_streak_entry()
+        merged.update(entry)
+        _streak_data[int(uid)] = merged
+
+
+async def backup_streak_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(STREAK_LOG_CHANNEL_ID, STREAK_DB_FILE, STREAK_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up streak db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill a command
+        print(f"Unexpected error backing up streak db: {e}")
+
+
+async def restore_streak_db_from_log_channel():
+    if _load_json_file(STREAK_DB_FILE) is not None:
+        _load_streak_cache_from_db(load_streak_db())
+        await backup_streak_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(STREAK_LOG_CHANNEL_ID, STREAK_DB_FILE, STREAK_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore streak db from log channel: {e}")
+        return
+    if found:
+        _load_streak_cache_from_db(load_streak_db())
+        print("Restored streak db from log channel backup.")
+    else:
+        print("No existing streak db backup found — starting fresh.")
+
+
+def _streak_current_month(now: datetime) -> str:
+    return f"{now.year:04d}-{now.month:02d}"
+
+
+async def _send_streak_channel_message(content: str) -> None:
+    try:
+        channel = bot.get_channel(STREAK_ANNOUNCE_CHANNEL_ID) or await bot.fetch_channel(STREAK_ANNOUNCE_CHANNEL_ID)
+        if channel is not None:
+            await channel.send(content)
+    except discord.HTTPException as e:
+        print(f"Failed to send streak announcement: {e}")
+
+
+async def _expire_streak_window_if_needed(user_id: int, entry: dict, now: datetime) -> bool:
+    """If entry's active window has passed without enough messages, marks it lost and
+    posts the 💔 message. Returns True if a loss was just processed."""
+    if entry["status"] != "active" or entry["window_end"] is None:
+        return False
+    window_end = datetime.fromisoformat(entry["window_end"])
+    if now < window_end or entry["messages_in_window"] >= STREAK_MESSAGES_REQUIRED:
+        return False
+
+    entry["status"] = "lost"
+    entry["lost_at"] = now.isoformat()
+    entry["messages_in_window"] = 0
+    entry["window_end"] = None
+
+    await _send_streak_channel_message(
+        f"{STREAK_LEAVE_EMOJI} <@{user_id}>, you've lost your message streak!\n"
+        f"*(Psst... if you have your monthly revive available, you have "
+        f"{STREAK_REVIVE_WINDOW_HOURS} hours to use `/revivestreak`!)*"
+    )
+    return True
+
+
+async def record_streak_message(user_id: int) -> None:
+    """Called from on_message for every message that already passed the shared anti-spam +
+    opt-out gate. Advances the user's streak window, banking/announcing a new streak day
+    once STREAK_MESSAGES_REQUIRED is reached."""
+    global _streak_dirty
+    now = discord.utils.utcnow()
+    entry = _streak_data.setdefault(user_id, _new_streak_entry())
+
+    if await _expire_streak_window_if_needed(user_id, entry, now):
+        _streak_dirty = True
+        save_streak_db()
+        await backup_streak_db_to_log_channel()
+
+    # While a streak is lost, messages don't silently start a new one — the user must
+    # either /revivestreak or wait out the grace period (handled by streak_check_loop).
+    if entry["status"] != "active":
+        return
+
+    if entry["window_end"] is None:
+        entry["window_end"] = (now + timedelta(hours=STREAK_WINDOW_HOURS)).isoformat()
+        entry["messages_in_window"] = 1
+    else:
+        entry["messages_in_window"] += 1
+
+    _streak_dirty = True
+
+    if entry["messages_in_window"] >= STREAK_MESSAGES_REQUIRED:
+        entry["streak_days"] += 1
+        entry["messages_in_window"] = 0
+        next_window_end = now + timedelta(hours=STREAK_WINDOW_HOURS)
+        entry["window_end"] = next_window_end.isoformat()
+
+        ts = int(next_window_end.timestamp())
+        day_word = "Day" if entry["streak_days"] == 1 else "Days"
+        await _send_streak_channel_message(
+            f"{STREAK_GAIN_EMOJI} <@{user_id}>, you've accumulated a chat streak!\n"
+            f"Come back and chat after <t:{ts}:t> (<t:{ts}:R>) to get your next streak.\n"
+            f"**Message Streak:** {entry['streak_days']} {day_word}"
+        )
+
+    save_streak_db()
+    await backup_streak_db_to_log_channel()
+
+
+@tasks.loop(minutes=STREAK_CHECK_INTERVAL_MINUTES)
+async def streak_check_loop():
+    """Backstop for users who go completely silent: catches windows that expired (loss) and
+    revive grace periods that ran out (silent reset to zero) without needing a new message
+    to trigger the check."""
+    global _streak_dirty
+    if not _streak_data:
+        return
+
+    now = discord.utils.utcnow()
+    changed = False
+
+    for user_id, entry in list(_streak_data.items()):
+        if await _expire_streak_window_if_needed(user_id, entry, now):
+            changed = True
+            continue
+
+        if entry["status"] == "lost" and entry["lost_at"] is not None:
+            lost_at = datetime.fromisoformat(entry["lost_at"])
+            if now >= lost_at + timedelta(hours=STREAK_REVIVE_WINDOW_HOURS):
+                _streak_data[user_id] = _new_streak_entry()
+                # Preserve the monthly revive usage marker across the reset.
+                _streak_data[user_id]["revive_month"] = entry.get("revive_month")
+                changed = True
+
+    if changed:
+        _streak_dirty = True
+        save_streak_db()
+        await backup_streak_db_to_log_channel()
+
+
+@streak_check_loop.before_loop
+async def before_streak_check_loop():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="revivestreak", description="Revive a chat streak you recently lost")
+async def revivestreak(interaction: discord.Interaction):
+    now = discord.utils.utcnow()
+    entry = _streak_data.get(interaction.user.id)
+
+    if entry is None or entry["status"] != "lost":
+        await interaction.response.send_message("You don't have a lost streak to revive right now.", ephemeral=True)
+        return
+
+    lost_at = datetime.fromisoformat(entry["lost_at"])
+    if now >= lost_at + timedelta(hours=STREAK_REVIVE_WINDOW_HOURS):
+        await interaction.response.send_message(
+            "Your revive window for that lost streak has expired.", ephemeral=True
+        )
+        return
+
+    current_month = _streak_current_month(now)
+    if entry.get("revive_month") == current_month:
+        await interaction.response.send_message(
+            "You've already used your monthly revive — you'll be able to revive again next month.",
+            ephemeral=True,
+        )
+        return
+
+    entry["status"] = "active"
+    entry["lost_at"] = None
+    entry["messages_in_window"] = 0
+    entry["window_end"] = (now + timedelta(hours=STREAK_WINDOW_HOURS)).isoformat()
+    entry["revive_month"] = current_month
+
+    global _streak_dirty
+    _streak_dirty = True
+    save_streak_db()
+    await backup_streak_db_to_log_channel()
+
+    ts = int(datetime.fromisoformat(entry["window_end"]).timestamp())
+    day_word = "Day" if entry["streak_days"] == 1 else "Days"
+    await interaction.response.send_message(
+        f"✅ Revived! Your **{entry['streak_days']} {day_word}** streak is back — "
+        f"send {STREAK_MESSAGES_REQUIRED} messages before <t:{ts}:R> to keep it going."
+    )
+
+
 # ---------- Leaderboard image card (ported from leaderboard.js) ----------
 # Per-user cooldown, mirroring the JS version's cooldowns Map.
 _leaderboard_cooldowns: dict[int, float] = {}
@@ -5907,6 +6161,7 @@ async def on_message(message: discord.Message):
                 if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
                     record_message_for_leaderboard(message.author.id)
                 record_overall_message(message.author.id)
+                await record_streak_message(message.author.id)
 
     await bot.process_commands(message)
 
@@ -7153,6 +7408,7 @@ async def on_ready():
     await restore_message_leaderboard_from_log_channel()
     await restore_overall_message_from_log_channel()
     await restore_optout_db_from_log_channel()
+    await restore_streak_db_from_log_channel()
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
@@ -7200,6 +7456,8 @@ async def on_ready():
         message_leaderboard_rollover_loop.start()
     if not overall_message_save_loop.is_running():
         overall_message_save_loop.start()
+    if not streak_check_loop.is_running():
+        streak_check_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
