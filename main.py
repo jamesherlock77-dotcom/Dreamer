@@ -104,6 +104,13 @@ SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim cha
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
 
+# ---------- Data privacy panel (Toggle Activity Tracking / Delete My Data) ----------
+BOT_DISPLAY_NAME = "Arena Hub Bot"  # shown in the privacy panel's copy
+PRIVACY_PANEL_CHANNEL_ID = 1528230357072347146   # the privacy panel is posted/refreshed here
+DATA_DELETE_REQUEST_CHANNEL_ID = 1544698404574072842  # "Delete My Data" requests are sent here for staff to approve/deny
+DATA_OPTOUT_LOG_CHANNEL_ID = 1544739792611319858  # activity-tracking opt-out JSON "database" message lives here
+DATA_OPTOUT_DB_FILE = "data_optout_data.json"
+
 TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
@@ -112,6 +119,7 @@ TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
 SCRIMS_DB_FILE = "scrims_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
+# (DATA_OPTOUT_DB_FILE is declared above, next to the privacy-panel channel config it belongs with)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
@@ -259,6 +267,16 @@ pending_scrim_requests: dict = {}
 # Set once the first on_ready pass has fully finished, so if Discord fires on_ready again
 # on a later reconnect (same process, no actual restart), we don't log a spurious "restarted".
 _startup_logged: bool = False
+
+# User IDs who've opted OUT of activity tracking via the privacy panel's "Toggle Activity
+# Tracking" button. Everyone is tracked by default (i.e. absence from this set = tracked).
+# Kept in memory for a cheap check on every message; the source of truth is
+# DATA_OPTOUT_DB_FILE, loaded on startup by restore_optout_db_from_log_channel().
+_data_optout_ids: set = set()
+
+# User IDs with a "Delete My Data" request currently awaiting staff approval in
+# DATA_DELETE_REQUEST_CHANNEL_ID, so the same user can't queue up multiple pending requests.
+pending_data_delete_requests: set = set()
 
 # In-memory weekly message-leaderboard counters: {user_id: message_count}. Loaded on startup
 # from its backup channel (restore_message_leaderboard_from_log_channel) and periodically
@@ -541,6 +559,103 @@ async def restore_ticket_db_from_log_channel():
         print("Restored ticket db from log channel backup.")
     else:
         print("No existing ticket db backup found — starting fresh.")
+
+
+# ---------- Data privacy (activity-tracking opt-out / delete-my-data) ----------
+# Backed by DATA_OPTOUT_DB_FILE, backed up as an auto-updated message in
+# DATA_OPTOUT_LOG_CHANNEL_ID the same way teams/tickets/etc. are. "opted_out" holds the
+# IDs of users who've opted out of activity tracking (everyone else is tracked by
+# default). "deleted_users" is just a bare marker — not the data itself — kept so we can
+# confirm to someone that a deletion already happened if they ask again later, per the
+# privacy panel's copy.
+def load_optout_db() -> dict:
+    data = _load_json_file(DATA_OPTOUT_DB_FILE)
+    if data is None:
+        return {"opted_out": [], "deleted_users": [], "panel_message_id": None}
+    data.setdefault("opted_out", [])
+    data.setdefault("deleted_users", [])
+    data.setdefault("panel_message_id", None)
+    return data
+
+
+def save_optout_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    _atomic_write_json(DATA_OPTOUT_DB_FILE, data)
+
+
+def _sync_optout_cache(data: dict) -> None:
+    """Refreshes the in-memory _data_optout_ids cache from a loaded db dict, so the
+    per-message tracking check doesn't have to hit the filesystem every time."""
+    _data_optout_ids.clear()
+    _data_optout_ids.update(int(uid) for uid in data.get("opted_out", []))
+
+
+async def backup_optout_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(DATA_OPTOUT_LOG_CHANNEL_ID, DATA_OPTOUT_DB_FILE, DATA_OPTOUT_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up data-optout db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill a command
+        print(f"Unexpected error backing up data-optout db: {e}")
+
+
+async def restore_optout_db_from_log_channel():
+    if _load_json_file(DATA_OPTOUT_DB_FILE) is not None:
+        _sync_optout_cache(load_optout_db())
+        await backup_optout_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(DATA_OPTOUT_LOG_CHANNEL_ID, DATA_OPTOUT_DB_FILE, DATA_OPTOUT_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore data-optout db from log channel: {e}")
+        return
+    if found:
+        _sync_optout_cache(load_optout_db())
+        print("Restored data-optout db from log channel backup.")
+    else:
+        print("No existing data-optout db backup found — starting fresh (everyone tracked by default).")
+
+
+async def purge_user_activity_data(user_id: int) -> str:
+    """Removes user_id's tracked activity data — the weekly/all-time message-leaderboard
+    counts and their invite-tracker record — from the JSON stores, for a "Delete My Data"
+    request approved by staff. Deliberately leaves team membership, tickets, scrims, and
+    giveaway entries alone: those are structural/roles-based records tied to features the
+    person is still using, not activity tracking, matching the privacy panel's "This does
+    NOT include ... roles you currently hold" wording."""
+    global _message_leaderboard_dirty, _overall_message_dirty
+    removed = []
+
+    if _message_leaderboard_counts.pop(user_id, None) is not None:
+        removed.append("weekly message-leaderboard count")
+        _message_leaderboard_dirty = False
+        save_message_leaderboard_db()
+        await backup_message_leaderboard_to_log_channel()
+
+    if _overall_message_counts.pop(user_id, None) is not None:
+        removed.append("all-time message count")
+        _overall_message_dirty = False
+        save_overall_message_db()
+        await backup_overall_message_to_log_channel()
+
+    _message_count_cooldowns.pop(user_id, None)
+
+    invite_db = load_invite_db()
+    invited_users = invite_db.get("invited_users", {})
+    stale_keys = [
+        key for key, record in invited_users.items()
+        if record.get("user_id") == user_id or key == str(user_id)
+    ]
+    for key in stale_keys:
+        del invited_users[key]
+    if stale_keys:
+        removed.append(f"{len(stale_keys)} invite-tracker record(s)")
+        save_invite_db(invite_db)
+        await backup_invite_db_to_log_channel()
+
+    if not removed:
+        return "No stored activity data was found for this user."
+    return "Removed: " + ", ".join(removed) + "."
 
 
 def find_team_by_leader(db: dict, user_id: int):
@@ -1071,6 +1186,276 @@ async def refresh_support_ticket_panel():
         print(f"Panel posted fine, but couldn't pin it (non-critical — detection no longer depends on this): {e}")
 
 
+# ---------- Data privacy panel (Toggle Activity Tracking / Delete My Data) ----------
+class DataDeleteApprovalView(discord.ui.View):
+    """Sent to DATA_DELETE_REQUEST_CHANNEL_ID once a member confirms they want their data
+    deleted. Staff approve or deny here. Same non-restart-persistent trade-off as
+    ConfirmTeamView above (an in-flight request is lost if the bot restarts before staff
+    action it) — acceptable for the same reason: it's rare, and the requester can just
+    click Delete My Data again."""
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=None)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message(
+                "Only staff can action data-deletion requests.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete", style=discord.ButtonStyle.danger, custom_id="data_delete_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+        summary = await purge_user_activity_data(self.requester_id)
+
+        db = load_optout_db()
+        if self.requester_id not in db["deleted_users"]:
+            db["deleted_users"].append(self.requester_id)
+        save_optout_db(db)
+        await backup_optout_db_to_log_channel()
+
+        pending_data_delete_requests.discard(self.requester_id)
+
+        await log_bot_event(
+            title="🗑️ User data deleted",
+            description=f"<@{self.requester_id}>'s (`{self.requester_id}`) activity data was deleted, "
+                        f"approved by {interaction.user.mention}.",
+            colour=discord.Colour.red(),
+            fields=[("Removed", summary, False)],
+        )
+
+        try:
+            user = await bot.fetch_user(self.requester_id)
+            await user.send(
+                f"✅ Your data-deletion request was approved — your activity data has been "
+                f"permanently deleted from {BOT_DISPLAY_NAME}."
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(f"🗑️ Deleted <@{self.requester_id}>'s data.\n{summary}")
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary, custom_id="data_delete_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+        pending_data_delete_requests.discard(self.requester_id)
+
+        try:
+            user = await bot.fetch_user(self.requester_id)
+            await user.send(
+                f"Your data-deletion request in {BOT_DISPLAY_NAME} was denied by staff. "
+                f"Reach out to staff if you'd like to know why."
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(f"Denied the data-deletion request from <@{self.requester_id}>.")
+
+
+class DataDeleteConfirmView(discord.ui.View):
+    """Ephemeral "are you sure?" shown to the member before their request is forwarded to
+    staff — mirrors ConfirmDeleteTeamView's Yes/Cancel pattern elsewhere in the bot."""
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=120)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete my data", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.requester_id in pending_data_delete_requests:
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(
+                content="You already have a data-deletion request awaiting staff review.", view=self
+            )
+            return
+
+        await interaction.response.defer()
+        pending_data_delete_requests.add(self.requester_id)
+
+        for child in self.children:
+            child.disabled = True
+        await safe_edit_original_response(
+            interaction,
+            content="🗑️ Your data-deletion request has been sent to staff for review.",
+            view=self,
+        )
+
+        try:
+            channel = bot.get_channel(DATA_DELETE_REQUEST_CHANNEL_ID) or await bot.fetch_channel(
+                DATA_DELETE_REQUEST_CHANNEL_ID
+            )
+            embed = discord.Embed(
+                title="🗑️ Data-deletion request",
+                description=f"{interaction.user.mention} (`{interaction.user.id}`) has requested that "
+                            f"all of their tracked activity data be permanently deleted.",
+                colour=discord.Colour.orange(),
+                timestamp=discord.utils.utcnow(),
+            )
+            await channel.send(embed=embed, view=DataDeleteApprovalView(interaction.user.id))
+        except discord.HTTPException as e:
+            pending_data_delete_requests.discard(self.requester_id)
+            print(f"Failed to send data-deletion request to staff: {e}")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Cancelled — nothing was deleted.", view=self)
+
+
+class PrivacyPanelView(discord.ui.LayoutView):
+    """Posted/refreshed in PRIVACY_PANEL_CHANNEL_ID — two Components V2 cards mirroring the
+    reference privacy panel: one to toggle activity-tracking opt-out, one to request full
+    data deletion. Persistent (custom_id-based, no per-instance state needed in the
+    callbacks), so it keeps working across restarts once re-registered in on_ready."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        toggle_button = discord.ui.Button(
+            label="Toggle Activity Tracking",
+            emoji="📊",
+            style=discord.ButtonStyle.secondary,
+            custom_id="privacy_toggle_tracking_button",
+        )
+        toggle_button.callback = self._toggle_tracking_callback
+
+        delete_button = discord.ui.Button(
+            label="Delete My Data",
+            emoji="🗑️",
+            style=discord.ButtonStyle.danger,
+            custom_id="privacy_delete_data_button",
+        )
+        delete_button.callback = self._delete_data_callback
+
+        toggle_text = (
+            f"## 📊 Activity Tracking Opt-Out\n"
+            f"{BOT_DISPLAY_NAME} reads message text to count activity toward streaks, "
+            f"the leaderboard, and message contests.\n\n"
+            f"Click below to opt out — your messages will stop counting toward those "
+            f"features. This is reversible; click again anytime to opt back in.\n\n"
+            f"**This does not affect:** moderation/keyword-safety scanning, which applies "
+            f"to all messages in the server regardless of this setting, the same as any "
+            f"server-wide word filter.\n\n"
+            f"Your choice here is separate from full data deletion — use the Delete My Data "
+            f"panel below if you want your existing history removed instead."
+        )
+        delete_text = (
+            f"## 🗑️ Delete My Data\n"
+            f"You can request permanent deletion of the activity data {BOT_DISPLAY_NAME} "
+            f"has stored about you.\n\n"
+            f"**This includes:** message/activity counts and invite-tracker records.\n\n"
+            f"**This does NOT include:** messages you've already sent in the server, team "
+            f"membership, tickets, or roles you currently hold — those are untouched.\n\n"
+            f"⚠️ **This is permanent.** Once approved by staff, we keep a brief note that a "
+            f"deletion occurred (not the data itself) so we can confirm it to you if you ask "
+            f"again later.\n\n"
+            f"Click below to start — a staff member will need to approve the request before "
+            f"anything is deleted."
+        )
+
+        self.add_item(
+            discord.ui.Container(
+                discord.ui.TextDisplay(toggle_text),
+                discord.ui.ActionRow(toggle_button),
+            )
+        )
+        self.add_item(
+            discord.ui.Container(
+                discord.ui.TextDisplay(delete_text),
+                discord.ui.ActionRow(delete_button),
+            )
+        )
+
+    async def _toggle_tracking_callback(self, interaction: discord.Interaction):
+        db = load_optout_db()
+        opted_out = set(db["opted_out"])
+
+        if interaction.user.id in opted_out:
+            opted_out.discard(interaction.user.id)
+            now_tracked = True
+        else:
+            opted_out.add(interaction.user.id)
+            now_tracked = False
+
+        db["opted_out"] = list(opted_out)
+        save_optout_db(db)
+        _sync_optout_cache(db)
+        await backup_optout_db_to_log_channel()
+
+        if now_tracked:
+            message = "✅ You're opted back **in** — your messages will count toward activity tracking again."
+        else:
+            message = "🚫 You're opted **out** — your messages will no longer count toward activity tracking."
+        await interaction.response.send_message(message, ephemeral=True)
+
+    async def _delete_data_callback(self, interaction: discord.Interaction):
+        if interaction.user.id in pending_data_delete_requests:
+            await interaction.response.send_message(
+                "You already have a data-deletion request awaiting staff review.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            "Are you sure? This will permanently delete your tracked activity data once staff approve it.",
+            view=DataDeleteConfirmView(interaction.user.id),
+            ephemeral=True,
+        )
+
+
+async def refresh_privacy_panel():
+    """Posts the privacy panel if one isn't already up in PRIVACY_PANEL_CHANNEL_ID — same
+    "post once, remember the message ID, don't repost on every restart" approach as
+    refresh_support_ticket_panel() above."""
+    channel = bot.get_channel(PRIVACY_PANEL_CHANNEL_ID) or await bot.fetch_channel(PRIVACY_PANEL_CHANNEL_ID)
+
+    db = load_optout_db()
+    existing_id = db.get("panel_message_id")
+    if existing_id is not None:
+        try:
+            await channel.fetch_message(existing_id)
+            return  # panel already posted — leave it alone
+        except discord.NotFound:
+            pass  # was deleted — fall through and repost
+        except discord.HTTPException as e:
+            print(f"Couldn't verify the existing privacy panel message ({e}) — leaving it as-is rather than risk a duplicate.")
+            return
+
+    sent = await channel.send(view=PrivacyPanelView())
+    db["panel_message_id"] = sent.id
+    save_optout_db(db)
+    await backup_optout_db_to_log_channel()
+
+    try:
+        await channel.edit(
+            topic=f"{BOT_DISPLAY_NAME} — manage your activity-tracking preferences and request data deletion here.",
+            reason="Privacy panel posted",
+        )
+    except discord.HTTPException as e:
+        print(f"Privacy panel posted fine, but couldn't set the channel topic (non-critical): {e}")
 
 
 # ---------- Tournament sticky sign-up message ----------
@@ -5512,13 +5897,16 @@ async def on_message(message: discord.Message):
 
         # Shared 5s-per-user anti-spam gate for BOTH leaderboards: a message only counts if
         # this long has passed since that user's last counted message, anywhere in the guild.
-        now_ts = time.time()
-        last_counted = _message_count_cooldowns.get(message.author.id)
-        if last_counted is None or now_ts - last_counted >= MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS:
-            _message_count_cooldowns[message.author.id] = now_ts
-            if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
-                record_message_for_leaderboard(message.author.id)
-            record_overall_message(message.author.id)
+        # Also gated on the privacy panel's opt-out: everyone is tracked by default, but a
+        # user's ID in _data_optout_ids means they've opted out via "Toggle Activity Tracking".
+        if message.author.id not in _data_optout_ids:
+            now_ts = time.time()
+            last_counted = _message_count_cooldowns.get(message.author.id)
+            if last_counted is None or now_ts - last_counted >= MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS:
+                _message_count_cooldowns[message.author.id] = now_ts
+                if message.channel.id == MESSAGE_LEADERBOARD_TRACKED_CHANNEL_ID:
+                    record_message_for_leaderboard(message.author.id)
+                record_overall_message(message.author.id)
 
     await bot.process_commands(message)
 
@@ -6764,6 +7152,7 @@ async def on_ready():
     await restore_scrim_db_from_log_channel()
     await restore_message_leaderboard_from_log_channel()
     await restore_overall_message_from_log_channel()
+    await restore_optout_db_from_log_channel()
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
@@ -6773,6 +7162,7 @@ async def on_ready():
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayView())
+    bot.add_view(PrivacyPanelView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
@@ -6786,6 +7176,10 @@ async def on_ready():
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
+    try:
+        await refresh_privacy_panel()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh privacy panel: {e}")
     try:
         await post_tournament_panel_if_missing()
     except discord.HTTPException as e:
