@@ -4727,6 +4727,119 @@ def _render_message_rank_card(
     return buf.getvalue()
 
 
+# ---------- Streak card (/streakcount) ----------
+STREAK_CARD_CANVAS_WIDTH = 1100
+STREAK_CARD_CANVAS_HEIGHT = 320
+STREAK_CARD_ACCENT_COLOR = (255, 122, 26, 255)  # 🔥 orange — streak avatar ring + streak number
+
+
+def _render_streak_card(username: str, avatar_bytes: bytes | None, streak_days: int, rank: int | None) -> bytes:
+    """Wide banner card: avatar on the left, username above two stat columns
+    (Current Streak / Global Rank) on the right. Runs synchronously — call via
+    asyncio.to_thread, same as the other leaderboard/rank cards."""
+    W, H = STREAK_CARD_CANVAS_WIDTH, STREAK_CARD_CANVAS_HEIGHT
+
+    try:
+        bg = Image.open(LEADERBOARD_BG_PATH).convert("RGBA")
+    except (FileNotFoundError, OSError):
+        try:
+            bg = Image.open(LEADERBOARD_BG_FALLBACK_PATH).convert("RGBA")
+        except (FileNotFoundError, OSError):
+            bg = Image.new("RGBA", (W, H), (24, 24, 28, 255))
+    canvas = bg.resize((W, H)).copy()
+
+    panel_box = (30, 30, W - 30, H - 30)
+    _leaderboard_blend_shape(
+        canvas,
+        lambda d: (
+            d.rounded_rectangle(panel_box, radius=24, fill=(0, 0, 0, 140)),
+            d.rounded_rectangle(panel_box, radius=24, outline=(255, 255, 255, 40), width=2),
+        ),
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    avatar_diameter = 180
+    avatar_x = 70
+    avatar_y = (H - avatar_diameter) // 2
+    avatar_img = _circular_avatar(avatar_bytes, avatar_diameter)
+    canvas.paste(avatar_img, (avatar_x, avatar_y), avatar_img)
+    draw = ImageDraw.Draw(canvas)
+    draw.ellipse(
+        (avatar_x - 3, avatar_y - 3, avatar_x + avatar_diameter + 3, avatar_y + avatar_diameter + 3),
+        outline=STREAK_CARD_ACCENT_COLOR,
+        width=5,
+    )
+
+    text_x = avatar_x + avatar_diameter + 55
+    username_y = 95
+
+    font_username = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 44)
+    max_username_width = (W - 60) - text_x
+    username_font_size = 44
+    while font_username.getlength(username) > max_username_width and username_font_size > 22:
+        username_font_size -= 2
+        font_username = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, username_font_size)
+    draw.text((text_x, username_y), username, font=font_username, fill=(255, 255, 255, 255), anchor="lm")
+
+    label_y = username_y + 75
+    stat_y = label_y + 60
+
+    col1_x = text_x
+    col2_x = text_x + 330
+
+    font_label = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 24)
+    font_stat = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 52)
+
+    day_word = "Day" if streak_days == 1 else "Days"
+    rank_text = f"#{rank}" if rank is not None else "—"
+
+    draw.text((col1_x, label_y), "Current Streak", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text(
+        (col1_x, stat_y), f"{streak_days} {day_word}", font=font_stat, fill=STREAK_CARD_ACCENT_COLOR, anchor="lm"
+    )
+
+    draw.text((col2_x, label_y), "Global Rank", font=font_label, fill=(200, 200, 200, 255), anchor="lm")
+    draw.text((col2_x, stat_y), rank_text, font=font_stat, fill=(94, 224, 236, 255), anchor="lm")
+
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@bot.tree.command(name="streakcount", description="Show your (or someone else's) chat streak")
+@app_commands.describe(user="Whose streak to show — defaults to you")
+async def streakcount(interaction: discord.Interaction, user: discord.Member | None = None):
+    await interaction.response.defer()
+
+    target = user or interaction.user
+    entry = _streak_data.get(target.id)
+    streak_days = entry["streak_days"] if entry else 0
+
+    if streak_days <= 0:
+        who = "You don't" if target.id == interaction.user.id else f"**{target.display_name}** doesn't"
+        await interaction.followup.send(f"{who} have an active streak right now — send some messages to start one!")
+        return
+
+    ranked = sorted(
+        ((uid, e["streak_days"]) for uid, e in _streak_data.items() if e["streak_days"] > 0),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    rank = next((i + 1 for i, (uid, _days) in enumerate(ranked) if uid == target.id), None)
+
+    avatar_bytes = await _fetch_leaderboard_avatar_bytes(target)
+
+    try:
+        image_bytes = await asyncio.to_thread(_render_streak_card, target.name, avatar_bytes, streak_days, rank)
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render streak card: {e!r}")
+        await interaction.followup.send("Something went wrong generating that card.")
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename="streak.png")
+    await interaction.followup.send(file=file)
+
+
 @bot.tree.command(name="messages", description="Show your (or someone else's) message stats")
 @app_commands.describe(
     select="Weekly (resets Sundays) or all-time — defaults to Weekly",
