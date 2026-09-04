@@ -297,6 +297,11 @@ pending_invites: dict = {}
 # outstanding. Used to stop a leader from having more than one scrim request pending at once.
 pending_scrim_requests: dict = {}
 
+# Requester user ID -> {"team": ..., "leader_id": ..., "dm_channel_id": ..., "dm_message_id": ...}
+# for whichever /requestteam request (if any) that user currently has outstanding. Used to
+# stop someone from having more than one join request pending at the same time.
+pending_team_join_requests: dict = {}
+
 # Set once the first on_ready pass has fully finished, so if Discord fires on_ready again
 # on a later reconnect (same process, no actual restart), we don't log a spurious "restarted".
 _startup_logged: bool = False
@@ -2807,6 +2812,222 @@ class InviteResponseView(discord.ui.View):
                 pass
 
 
+# ---------- Cancel-pending-team-join-request helper + view ----------
+async def _cancel_pending_team_join_request(
+    requester_id: int, note: str = "This join request was cancelled."
+) -> dict | None:
+    """Clears requester_id's pending-team-join-request record (if any) and, if the DM sent to
+    the leader can still be reached, edits it to `note` and strips the Accept/Decline buttons
+    so the leader can no longer act on it. Returns the popped record, or None if there wasn't
+    one — mirrors _cancel_pending_invite."""
+    pending = pending_team_join_requests.pop(requester_id, None)
+    if pending is None:
+        return None
+
+    try:
+        dm_channel = bot.get_channel(pending["dm_channel_id"])
+        if dm_channel is None:
+            dm_channel = await bot.fetch_channel(pending["dm_channel_id"])
+        message = await dm_channel.fetch_message(pending["dm_message_id"])
+        await message.edit(content=note, view=None)
+    except discord.HTTPException:
+        pass  # DM/message may already be gone — the record is still cleared either way
+
+    return pending
+
+
+class CancelTeamJoinRequestView(discord.ui.View):
+    """Shown ephemerally to a user who already has a /requestteam request pending, with a
+    single red button that cancels it so they're free to send a new one — mirrors
+    CancelInviteView."""
+
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=120)
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This prompt isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel Request", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        pending = await _cancel_pending_team_join_request(
+            self.requester_id, note="This join request was cancelled by the requester."
+        )
+        for child in self.children:
+            child.disabled = True
+
+        if pending is None:
+            await safe_edit_original_response(
+                interaction,
+                content="That request is no longer pending — you're free to send a new one.",
+                view=self,
+            )
+            return
+
+        await log_team_event(
+            "🚫 Team Join Request Cancelled",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team", pending.get("team", "Unknown"), True),
+                ("Requester", f"<@{self.requester_id}> (`{self.requester_id}`)", True),
+                ("Leader", f"<@{pending['leader_id']}> (`{pending['leader_id']}`)", True),
+            ],
+        )
+
+        await safe_edit_original_response(
+            interaction,
+            content=f"✅ Cancelled your pending request to join **{pending.get('team', 'that team')}**. "
+            f"You can now request to join a different team.",
+            view=self,
+        )
+
+
+# ---------- Team join request response view (DM'd to the team leader) ----------
+class TeamJoinRequestView(discord.ui.View):
+    def __init__(self, team_name: str, requester_id: int, guild_id: int, leader_id: int):
+        super().__init__(timeout=86400)  # 24h to respond
+        self.team_name = team_name
+        self.requester_id = requester_id
+        self.guild_id = guild_id
+        self.leader_id = leader_id
+        self.message: discord.Message = None  # set by the caller after sending
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message("This request isn't for you.", ephemeral=True)
+            return False
+        return True
+
+    def _clear_pending(self):
+        # Only clear the requester's pending-request slot if it's still tracking *this*
+        # request — avoids wiping out a newer request they may have sent after this resolved.
+        pending = pending_team_join_requests.get(self.requester_id)
+        if pending and pending.get("leader_id") == self.leader_id and pending.get("team") == self.team_name:
+            pending_team_join_requests.pop(self.requester_id, None)
+
+    async def _notify_requester(self, content: str):
+        try:
+            guild = bot.get_guild(self.guild_id)
+            requester = guild.get_member(self.requester_id) or await guild.fetch_member(self.requester_id)
+            await requester.send(content)
+        except discord.HTTPException:
+            pass  # requester may have DMs off — the leader-facing flow still completes
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+        db = load_db()
+        info = db["teams"].get(self.team_name)
+        if info is None:
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(interaction, content="This team no longer exists.", view=self)
+            return
+
+        if find_team_by_member(db["teams"], self.requester_id):
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(
+                interaction,
+                content="That user already joined a team while this request was pending.",
+                view=self,
+            )
+            return
+
+        if not info.get("bypass_member_limit", False) and len(info.get("members", [])) >= MAX_TEAM_MEMBERS:
+            self._clear_pending()
+            for child in self.children:
+                child.disabled = True
+            await safe_edit_original_response(
+                interaction,
+                content=f"**{self.team_name}** is already at the {MAX_TEAM_MEMBERS}-member cap — remove someone first.",
+                view=self,
+            )
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        member = guild.get_member(self.requester_id) or await guild.fetch_member(self.requester_id)
+        role = guild.get_role(info["role_id"])
+        if role:
+            await member.add_roles(role, reason="Team join request accepted")
+
+        if self.requester_id not in info["members"]:
+            info["members"].append(self.requester_id)
+        record_team_join(info, self.requester_id)
+        save_db(db)
+        await backup_db_to_log_channel()
+
+        self._clear_pending()
+
+        channel = guild.get_channel(info["channel_id"])
+        if channel:
+            await channel.send(f"🎉 {member.mention} just joined the team!")
+
+        await self._notify_requester(f"✅ {interaction.user.mention} accepted your request to join **{self.team_name}**! 🎉")
+
+        await log_team_event(
+            "✅ Join Request Accepted — Member Joined",
+            colour=discord.Colour.green(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("New Member", f"{member.mention} (`{member.id}`)", True),
+                ("Accepted By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
+
+        for child in self.children:
+            child.disabled = True
+        await safe_edit_original_response(
+            interaction, content=f"✅ Added {member.mention} to **{self.team_name}**.", view=self
+        )
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._clear_pending()
+        for child in self.children:
+            child.disabled = True
+        await self._notify_requester(f"❌ Your request to join **{self.team_name}** was declined.")
+        await log_team_event(
+            "❌ Join Request Declined",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("Requester", f"<@{self.requester_id}> (`{self.requester_id}`)", True),
+                ("Declined By", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ],
+        )
+        await interaction.response.edit_message(content="Request declined.", view=self)
+
+    async def on_timeout(self):
+        # The leader never responded within 24h — free up the requester's pending slot and
+        # disable the stale buttons, same as an explicit decline.
+        self._clear_pending()
+        for child in self.children:
+            child.disabled = True
+        await log_team_event(
+            "⌛ Join Request Expired",
+            colour=discord.Colour.dark_grey(),
+            fields=[
+                ("Team", self.team_name, True),
+                ("Requester", f"<@{self.requester_id}> (`{self.requester_id}`)", True),
+                ("Leader", f"<@{self.leader_id}> (`{self.leader_id}`)", True),
+            ],
+        )
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 async def _cancel_pending_scrim_request(leader_id: int, note: str = "This scrim request was cancelled.") -> dict | None:
     """Clears leader_id's pending-scrim-request record (if any) and, if the DM message can
     still be found, disables its buttons and appends note to it. Returns the cleared record,
@@ -5285,6 +5506,100 @@ async def invite(interaction: discord.Interaction, user: discord.Member):
     }
 
     await interaction.followup.send(f"Invite sent to {user.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="requestteam", description="Ask a team's leader if you can join their team")
+@app_commands.describe(team="The team you want to join")
+async def requestteam(interaction: discord.Interaction, team: str):
+    await interaction.response.defer(ephemeral=True)
+
+    db = load_db()
+
+    if find_team_by_member(db["teams"], interaction.user.id):
+        await interaction.followup.send("You're already on a team — leave it first with `/leaveteam`.", ephemeral=True)
+        return
+
+    # Only one outstanding join request per user at a time — if they already have one
+    # pending, give them a way to cancel it instead of letting them queue up another.
+    if interaction.user.id in pending_team_join_requests:
+        await interaction.followup.send(
+            "You already have a pending join request. Click the red button below to cancel.",
+            view=CancelTeamJoinRequestView(interaction.user.id),
+            ephemeral=True,
+        )
+        return
+
+    team_key = find_team_key_ci(db["teams"], team)
+    if not team_key:
+        await interaction.followup.send("No team found with that name.", ephemeral=True)
+        return
+
+    info = db["teams"][team_key]
+    leader_id = info.get("leader_id")
+    if leader_id is None:
+        await interaction.followup.send(f"**{team_key}** doesn't have a leader on record.", ephemeral=True)
+        return
+
+    if not info.get("bypass_member_limit", False) and len(info.get("members", [])) >= MAX_TEAM_MEMBERS:
+        await interaction.followup.send(
+            f"**{team_key}** is already at the {MAX_TEAM_MEMBERS}-member cap — try again later.",
+            ephemeral=True,
+        )
+        return
+
+    leader = interaction.guild.get_member(leader_id) or await interaction.guild.fetch_member(leader_id)
+
+    view = TeamJoinRequestView(team_key, interaction.user.id, interaction.guild.id, leader_id)
+    try:
+        sent = await leader.send(
+            f"{interaction.user.mention} wants to join **{team_key}** {info['emoji']}! "
+            f"Would you like to accept them?",
+            view=view,
+        )
+    except discord.Forbidden:
+        await log_team_event(
+            "⚠️ Join Request Failed (DMs Closed)",
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Team", team_key, True),
+                ("Requester", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Leader", f"<@{leader_id}> (`{leader_id}`)", True),
+            ],
+        )
+        await interaction.followup.send(
+            f"Couldn't DM {team_key}'s leader (they may have DMs off).", ephemeral=True
+        )
+        return
+
+    await log_team_event(
+        "📨 Join Request Sent",
+        colour=discord.Colour.blue(),
+        fields=[
+            ("Team", team_key, True),
+            ("Requester", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+            ("Leader", f"<@{leader_id}> (`{leader_id}`)", True),
+        ],
+    )
+
+    view.message = sent
+    pending_team_join_requests[interaction.user.id] = {
+        "team": team_key,
+        "leader_id": leader_id,
+        "dm_channel_id": sent.channel.id,
+        "dm_message_id": sent.id,
+    }
+
+    await interaction.followup.send(f"Request sent to **{team_key}**'s leader.", ephemeral=True)
+
+
+@requestteam.autocomplete("team")
+async def requestteam_team_autocomplete(interaction: discord.Interaction, current: str):
+    db = load_db()
+    return [
+        app_commands.Choice(name=key, value=key)
+        for key in db["teams"].keys()
+        if current.lower() in key.lower()
+    ][:25]
 
 
 @bot.tree.command(name="startscrim", description="Challenge another team's leader to a scrim")
