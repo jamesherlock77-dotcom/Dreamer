@@ -104,6 +104,14 @@ SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim cha
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
 
+# ---------- Staff Games schedule-ping panel (reaction toggles a notify role) ----------
+SCHEDULE_PING_CHANNEL_ID = 1546145947736871012  # the panel is posted/pinned here
+SCHEDULE_PING_ROLE_ID = 1544471293704019988     # added/removed as people react/unreact
+SCHEDULE_PING_EMOJI = "🗓️"  # the "schedule" emoji people react with to opt in/out
+# The panel's message ID is persisted as "schedule_ping_message_id" inside TICKETS_DB_FILE
+# (backed up via the same TICKET_LOG_CHANNEL_ID pipeline as the ticket panel) rather than
+# standing up a whole new file/channel for one message ID — see send_schedule_ping_panel().
+
 # ---------- Data privacy panel (Toggle Activity Tracking / Delete My Data) ----------
 BOT_DISPLAY_NAME = "Arena Hub Bot"  # shown in the privacy panel's copy
 PRIVACY_PANEL_CHANNEL_ID = 1528230357072347146   # the privacy panel is posted/refreshed here
@@ -566,10 +574,11 @@ async def restore_db_from_log_channel():
 def load_ticket_db() -> dict:
     data = _load_json_file(TICKETS_DB_FILE)
     if data is None:
-        return {"next_number": 1, "tickets": {}, "panel_message_id": None}
+        return {"next_number": 1, "tickets": {}, "panel_message_id": None, "schedule_ping_message_id": None}
     data.setdefault("next_number", 1)
     data.setdefault("tickets", {})
     data.setdefault("panel_message_id", None)
+    data.setdefault("schedule_ping_message_id", None)
     return data
 
 
@@ -1235,6 +1244,84 @@ async def refresh_support_ticket_panel():
         await sent.pin(reason="Support ticket panel")
     except discord.HTTPException as e:
         print(f"Panel posted fine, but couldn't pin it (non-critical — detection no longer depends on this): {e}")
+
+
+# ---------- Staff Games schedule-ping panel ----------
+class ScheduleGamesPanelView(discord.ui.LayoutView):
+    """Components V2 container styled like SupportPanelView — accent-bordered card with a
+    title, body text, and the hub banner. No button here: opting in/out happens by
+    reacting/unreacting with SCHEDULE_PING_EMOJI on the message itself (handled by
+    on_raw_reaction_add/remove), not through a component."""
+
+    def __init__(self, *, include_banner: bool = True):
+        super().__init__(timeout=None)
+
+        description = (
+            "Staff members will post join codes here whenever they're hosting a game.\n"
+            "Feel free to jump in as soon as you see a code.\n\n"
+            f"**If you wish to be notified next time a game starts, react with {SCHEDULE_PING_EMOJI} "
+            "below.**"
+        )
+
+        children = [
+            discord.ui.TextDisplay("# Welcome to Staff Games!! 🔧"),
+            discord.ui.TextDisplay(description),
+        ]
+        if include_banner:
+            children.append(
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
+            )
+
+        self.add_item(discord.ui.Container(*children))
+
+
+async def send_schedule_ping_panel():
+    """Posts the Staff Games schedule-ping panel to SCHEDULE_PING_CHANNEL_ID once, reacts to
+    it with SCHEDULE_PING_EMOJI, and pins it — safe to call on every startup since it only
+    posts a fresh panel the first time (or if the old one was deleted).
+
+    "Already posted" is detected the same way as the support panel: the message ID is
+    remembered (here as "schedule_ping_message_id" in TICKETS_DB_FILE) and we try to fetch
+    that exact message on startup rather than relying on pin state, which can silently fail
+    (permissions, or the channel's pin cap) and would otherwise cause a duplicate post on
+    every restart."""
+    channel = bot.get_channel(SCHEDULE_PING_CHANNEL_ID) or await bot.fetch_channel(SCHEDULE_PING_CHANNEL_ID)
+    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
+
+    db = load_ticket_db()
+    existing_id = db.get("schedule_ping_message_id")
+    if existing_id is not None:
+        try:
+            await channel.fetch_message(existing_id)
+            return  # panel already posted — leave it alone
+        except discord.NotFound:
+            pass  # was deleted — fall through and repost
+        except discord.HTTPException as e:
+            print(f"Couldn't verify the existing schedule-ping panel message ({e}) — leaving it as-is rather than risk a duplicate.")
+            return
+
+    view = ScheduleGamesPanelView(include_banner=include_banner)
+
+    if not include_banner:
+        print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — schedule-ping panel sent without image.")
+        sent = await channel.send(view=view)
+    else:
+        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+        sent = await channel.send(view=view, file=file)
+
+    db["schedule_ping_message_id"] = sent.id
+    save_ticket_db(db)
+    await backup_ticket_db_to_log_channel()
+
+    try:
+        await sent.add_reaction(SCHEDULE_PING_EMOJI)
+    except discord.HTTPException as e:
+        print(f"Schedule-ping panel posted fine, but couldn't add the initial reaction: {e}")
+
+    try:
+        await sent.pin(reason="Staff Games schedule-ping panel")
+    except discord.HTTPException as e:
+        print(f"Schedule-ping panel posted fine, but couldn't pin it (non-critical — detection doesn't depend on this): {e}")
 
 
 # ---------- Data privacy panel (Toggle Activity Tracking / Delete My Data) ----------
@@ -6788,6 +6875,65 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         print(f"[ERROR] Failed to downgrade premium for {team_key}: {e}")
 
 
+def _is_schedule_ping_reaction(payload: discord.RawReactionActionEvent) -> bool:
+    return (
+        payload.channel_id == SCHEDULE_PING_CHANNEL_ID
+        and str(payload.emoji) == SCHEDULE_PING_EMOJI
+        and payload.user_id != bot.user.id
+    )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not _is_schedule_ping_reaction(payload):
+        return
+
+    db = load_ticket_db()
+    if payload.message_id != db.get("schedule_ping_message_id"):
+        return  # some other reaction in that channel — not the panel message
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    role = guild.get_role(SCHEDULE_PING_ROLE_ID)
+    member = payload.member or guild.get_member(payload.user_id)
+    if role is None or member is None:
+        return
+
+    try:
+        await member.add_roles(role, reason="Reacted to the Staff Games schedule-ping panel")
+    except discord.HTTPException as e:
+        print(f"[schedule-ping] Failed to add role to {payload.user_id}: {e}")
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if not _is_schedule_ping_reaction(payload):
+        return
+
+    db = load_ticket_db()
+    if payload.message_id != db.get("schedule_ping_message_id"):
+        return
+
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    role = guild.get_role(SCHEDULE_PING_ROLE_ID)
+    member = guild.get_member(payload.user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(payload.user_id)
+        except discord.HTTPException:
+            return
+    if role is None:
+        return
+
+    try:
+        await member.remove_roles(role, reason="Un-reacted from the Staff Games schedule-ping panel")
+    except discord.HTTPException as e:
+        print(f"[schedule-ping] Failed to remove role from {payload.user_id}: {e}")
+
+
 @bot.tree.command(
     name="syncinvites",
     description="(Staff) Rebuild the invite database by rescanning the Invite Tracker channel's history",
@@ -7939,6 +8085,10 @@ async def on_ready():
         await refresh_support_ticket_panel()
     except discord.HTTPException as e:
         print(f"Failed to refresh support ticket panel: {e}")
+    try:
+        await send_schedule_ping_panel()
+    except discord.HTTPException as e:
+        print(f"Failed to refresh schedule-ping panel: {e}")
     try:
         await refresh_privacy_panel()
     except discord.HTTPException as e:
