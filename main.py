@@ -1114,6 +1114,7 @@ class TicketThreadView(discord.ui.LayoutView):
 
             if ticket is not None:
                 ticket["closed"] = True
+                ticket["closed_at"] = discord.utils.utcnow().isoformat()
                 save_ticket_db(db)
                 await backup_ticket_db_to_log_channel()
 
@@ -5475,6 +5476,10 @@ def _pct_val(part: int, whole: int) -> float:
     return (part / whole * 100) if whole else 0.0
 
 
+def _avg(values: list[float]) -> float:
+    return (sum(values) / len(values)) if values else 0.0
+
+
 def _top_line(rank: int, user_id_or_str, value, unit: str) -> str:
     uid = int(user_id_or_str)
     return f"{rank}. <@{uid}> — **{value:,}** {unit}"
@@ -5517,41 +5522,24 @@ _TICKET_LOAD_BANDS = [  # lower % of tickets sitting open is better
     (60.0, 45, "🟠", "Needs Attention"),
     (100.1, 15, "🔴", "Overloaded"),
 ]
-
-# (metric key -> (short title, "what to do" advice)) shown in the Recommendations
-# section whenever that metric grades as Needs Improvement/Needs Attention/Poor/Overloaded.
-_ACTIVITYCHART_ADVICE = {
-    "msg_alltime": (
-        "Grow overall participation",
-        "Run recurring events that reward posting (giveaways, QOTD, community challenges), "
-        "and make sure quiet channels have a clear reason for people to visit.",
-    ),
-    "msg_weekly": (
-        "Weekly activity has cooled off",
-        "Post more discussion prompts/polls this week, keep `/qotd` pinging its role consistently, "
-        "and check whether a recent change (new rule, ended event) quieted things down.",
-    ),
-    "retention": (
-        "New members aren't sticking around",
-        "Tighten up onboarding — a clear welcome message, easy-to-find rules, and an obvious "
-        "first step (like joining a team) in someone's first few minutes noticeably improves retention.",
-    ),
-    "streaks": (
-        "Few members are keeping a chat streak",
-        "Promote the streak feature more visibly (pinned message, mention it in the welcome flow) "
-        "and consider a small reward or role for hitting streak milestones.",
-    ),
-    "teams": (
-        "Most members aren't on a team",
-        "Advertise `/createteam` and `/requestteam` more, lower the friction to join one, and "
-        "consider a recruitment event or a spotlight for teams that are looking for members.",
-    ),
-    "tickets": (
-        "The support ticket queue is backed up",
-        "Add more staff coverage for ticket hours, or set up a pinned FAQ/auto-response for the "
-        "most common requests so fewer of them need a human at all.",
-    ),
-}
+_CO_LEADER_BANDS = [  # % of teams that have appointed a co-leader
+    (60.0, 100, "🟢", "Excellent"),
+    (35.0, 75, "🟡", "Good"),
+    (15.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_COMMAND_DIVERSITY_BANDS = [  # % of the bot's registered commands that get used at all
+    (70.0, 100, "🟢", "Excellent"),
+    (45.0, 75, "🟡", "Good"),
+    (25.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_GIVEAWAY_PARTICIPATION_BANDS = [  # average entries per giveaway, as % of server size
+    (15.0, 100, "🟢", "Excellent"),
+    (7.0, 75, "🟡", "Good"),
+    (3.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
 
 
 def _grade(pct: float, bands: list[tuple[float, int, str, str]], higher_is_better: bool = True) -> tuple[str, str, int]:
@@ -5576,6 +5564,79 @@ def _overall_grade(score: float) -> tuple[str, str]:
     if score >= 40:
         return "🟠", "Needs Improvement"
     return "🔴", "Poor"
+
+
+# Metric key -> function(ctx) -> (short title, "what to do" advice). Called with a
+# context dict of every number the /activitychart run computed, so tips can quote the
+# server's actual figures back instead of reading like generic boilerplate. Shown for
+# any metric that grades as Needs Improvement/Needs Attention/Poor/Overloaded.
+_ACTIVITYCHART_ADVICE = {
+    "msg_alltime": lambda c: (
+        "Grow overall participation",
+        f"Only **{c['msg_alltime_pct']:.1f}%** of {c['total_members']:,} members have ever sent a tracked "
+        f"message. Run recurring events that reward posting (giveaways, QOTD, community challenges), "
+        f"make sure quiet channels have a clear reason to visit, and check that onboarding actually "
+        f"points new members at where the conversation happens.",
+    ),
+    "msg_weekly": lambda c: (
+        "Weekly activity has cooled off",
+        f"Only **{c['active_weekly']:,}** of the **{c['active_alltime']:,}** members who've ever been "
+        f"active posted this week ({c['reengagement_pct']:.1f}% re-engagement). Post more discussion "
+        f"prompts/polls, keep `/qotd`'s ping consistent, and check whether a recent change (new rule, "
+        f"ended event) quieted things down.",
+    ),
+    "retention": lambda c: (
+        "New members aren't sticking around",
+        f"Only **{c['retention_pct']:.1f}%** of {c['total_invited']:,} tracked invites are still in the "
+        f"server. Tighten up onboarding — a clear welcome message, easy-to-find rules, and an obvious "
+        f"first step (like joining a team) in someone's first few minutes noticeably improves retention."
+        + (f" Members who left did so after **{c['avg_days_to_leave']:.1f} days** on average — if that's "
+           f"short, the first-week experience is likely the problem." if c.get("avg_days_to_leave") is not None else ""),
+    ),
+    "streaks": lambda c: (
+        "Few members are keeping a chat streak",
+        f"Only **{c['streak_pct']:.1f}%** of members have an active chat streak"
+        + (f", and **{c['at_risk_count']:,}** more just lost theirs and are still in the revive window."
+           if c["at_risk_count"] else ".")
+        + " Promote the streak feature more visibly (pinned message, mention it in the welcome flow) "
+          "and consider a small reward or role for hitting streak milestones.",
+    ),
+    "teams": lambda c: (
+        "Most members aren't on a team",
+        f"Only **{c['team_pct']:.1f}%** of members are on one of the {c['num_teams']:,} existing teams. "
+        f"Advertise `/createteam` and `/requestteam` more, lower the friction to join one, and consider "
+        f"a recruitment event or a spotlight for teams that are looking for members.",
+    ),
+    "co_leader": lambda c: (
+        "Most teams have no co-leader",
+        f"Only **{c['co_leader_count']:,}** of {c['num_teams']:,} teams ({c['co_leader_pct']:.1f}%) has "
+        f"appointed a co-leader with `/setcoleader`. Without one, a team goes quiet the moment its leader "
+        f"disappears — encourage leaders to set one, especially on larger or premium teams.",
+    ),
+    "tickets": lambda c: (
+        "The support ticket queue is backed up",
+        f"**{c['open_tickets']:,}** of {c['total_tickets']:,} tickets are still open "
+        f"({c['open_ticket_pct']:.1f}%). Add more staff coverage for ticket hours, or set up a pinned "
+        f"FAQ/auto-response for the most common categories"
+        + (f" (right now that's **{c['top_ticket_category']}**)" if c.get("top_ticket_category") else "")
+        + " so fewer of them need a human at all.",
+    ),
+    "command_diversity": lambda c: (
+        "Most slash commands go unused",
+        f"Only **{c['distinct_commands_used']:,}** of {c['total_registered_commands']:,} registered "
+        f"commands ({c['command_diversity_pct']:.1f}%) have ever been run. Some of that is expected "
+        f"(staff-only tools), but if member-facing commands are sitting idle, they may be undiscoverable — "
+        f"consider a `/help`-style pinned command list or mentioning underused features in announcements.",
+    ),
+    "giveaway_participation": lambda c: (
+        "Giveaways aren't pulling much of a crowd",
+        f"Giveaways average **{c['avg_entries']:.1f} entries** — about {c['giveaway_participation_pct']:.1f}% "
+        f"of the server — per giveaway"
+        + (f", and **{c['dead_giveaways']:,}** ended with zero entries." if c.get("dead_giveaways") else ".")
+        + " Try prizes more relevant to your community, ping a broader role when one starts, or shorten "
+          "the entry window so it feels more urgent.",
+    ),
+}
 
 
 class ActivityChartView(discord.ui.LayoutView):
@@ -5604,6 +5665,7 @@ async def activitychart(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     guild = interaction.guild
+    now = discord.utils.utcnow()
     human_members = [m for m in guild.members if not m.bot]
     total_members = len(human_members)
 
@@ -5624,10 +5686,17 @@ async def activitychart(interaction: discord.Interaction):
     msg_alltime_emoji, msg_alltime_label, msg_alltime_score = _grade(msg_alltime_pct, _ENGAGEMENT_BANDS)
     msg_weekly_emoji, msg_weekly_label, msg_weekly_score = _grade(msg_weekly_pct, _ENGAGEMENT_BANDS)
 
+    avg_msgs_per_sender = (total_msgs_alltime / active_alltime) if active_alltime else 0.0
+    # Of everyone who's EVER posted, what fraction is still showing up this week — a
+    # sustained-engagement signal that's easy to miss when only looking at raw totals.
+    reengagement_pct = _pct_val(active_weekly, active_alltime)
+
     messages_body = (
         f"Tracked senders (all-time): **{active_alltime:,}** / {total_members:,} members ({_pct(active_alltime, total_members)}) — {msg_alltime_emoji} {msg_alltime_label}\n"
         f"Tracked senders (this week): **{active_weekly:,}** / {total_members:,} members ({_pct(active_weekly, total_members)}) — {msg_weekly_emoji} {msg_weekly_label}\n"
         f"Total tracked messages — all-time: **{total_msgs_alltime:,}** · this week: **{total_msgs_weekly:,}**\n"
+        f"Average messages per active sender (all-time): **{avg_msgs_per_sender:,.1f}**\n"
+        f"Weekly re-engagement (active this week ÷ ever active): **{reengagement_pct:.1f}%**\n"
         f"Opted out of tracking: **{optout_count:,}** ({_pct(optout_count, total_members)})\n\n"
         f"**Top 5 this week:**\n"
         + ("\n".join(_top_line(i + 1, uid, n, "messages") for i, (uid, n) in enumerate(top_weekly)) or "*No activity this week yet.*")
@@ -5648,13 +5717,55 @@ async def activitychart(interaction: discord.Interaction):
             inviter_retained[r["inviter_id"]] = inviter_retained.get(r["inviter_id"], 0) + 1
     top_inviters = sorted(inviter_retained.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
+    # Join-method breakdown (custom invite links vs the server's vanity URL), each with
+    # its own retention rate — useful for spotting whether one acquisition channel is
+    # bringing in members who don't stick.
+    via_invite = [r for r in invited_users.values() if r.get("method") == "invite"]
+    via_vanity = [r for r in invited_users.values() if r.get("method") == "vanity"]
+    invite_retained_pct = _pct_val(sum(1 for r in via_invite if r.get("still_in_server")), len(via_invite))
+    vanity_retained_pct = _pct_val(sum(1 for r in via_vanity if r.get("still_in_server")), len(via_vanity))
+
+    # Recent growth, from joined_at timestamps.
+    joins_7d = joins_30d = 0
+    for r in invited_users.values():
+        joined_at = r.get("joined_at")
+        if not joined_at:
+            continue
+        try:
+            joined_dt = datetime.fromisoformat(joined_at)
+        except ValueError:
+            continue
+        age_days = (now - joined_dt).total_seconds() / 86400
+        if age_days <= 7:
+            joins_7d += 1
+        if age_days <= 30:
+            joins_30d += 1
+
+    # How long members who left typically stuck around — a short average points at a
+    # rough first-week experience rather than a slow long-term fade.
+    days_to_leave = []
+    for r in invited_users.values():
+        if r.get("still_in_server") or not r.get("joined_at") or not r.get("left_at"):
+            continue
+        try:
+            joined_dt = datetime.fromisoformat(r["joined_at"])
+            left_dt = datetime.fromisoformat(r["left_at"])
+        except ValueError:
+            continue
+        days_to_leave.append((left_dt - joined_dt).total_seconds() / 86400)
+    avg_days_to_leave = _avg(days_to_leave) if days_to_leave else None
+
     retention_pct = _pct_val(retained, total_invited)
     retention_emoji, retention_label, retention_score = _grade(retention_pct, _RETENTION_BANDS)
 
     retention_body = (
         f"Tracked invited members: **{total_invited:,}**\n"
         f"Still in the server: **{retained:,}** ({_pct(retained, total_invited)}) — {retention_emoji} {retention_label}\n"
-        f"Left: **{left:,}** ({_pct(left, total_invited)})\n\n"
+        f"Left: **{left:,}** ({_pct(left, total_invited)})"
+        + (f" · left after **{avg_days_to_leave:,.1f}** days on average\n" if avg_days_to_leave is not None else "\n")
+        + f"New joins — last 7 days: **{joins_7d:,}** · last 30 days: **{joins_30d:,}**\n"
+        f"Retention by join method — invite link: **{invite_retained_pct:.1f}%** ({len(via_invite):,} tracked) · "
+        f"vanity URL: **{vanity_retained_pct:.1f}%** ({len(via_vanity):,} tracked)\n\n"
         f"**Top inviters (still-retained invites):**\n"
         + ("\n".join(_top_line(i + 1, uid, n, "retained invites") for i, (uid, n) in enumerate(top_inviters)) or "*No invite data on record.*")
     )
@@ -5664,13 +5775,23 @@ async def activitychart(interaction: discord.Interaction):
         uid: e for uid, e in _streak_data.items()
         if e.get("phase") != "lost" and e.get("streak_days", 0) > 0
     }
+    at_risk_streaks = {uid: e for uid, e in _streak_data.items() if e.get("phase") == "lost"}
+    building_streaks = {
+        uid: e for uid, e in _streak_data.items()
+        if e.get("phase") == "counting" and e.get("streak_days", 0) == 0 and e.get("messages_in_window", 0) > 0
+    }
     top_streaks = sorted(active_streaks.items(), key=lambda kv: kv[1].get("streak_days", 0), reverse=True)[:5]
+    longest_streak = max((e.get("streak_days", 0) for e in active_streaks.values()), default=0)
+    avg_active_streak_len = _avg([e.get("streak_days", 0) for e in active_streaks.values()])
 
     streak_pct = _pct_val(len(active_streaks), total_members)
     streak_emoji, streak_label, streak_score = _grade(streak_pct, _STREAK_BANDS)
 
     streak_body = (
-        f"Active streaks: **{len(active_streaks):,}** / {total_members:,} members ({_pct(len(active_streaks), total_members)}) — {streak_emoji} {streak_label}\n\n"
+        f"Active streaks: **{len(active_streaks):,}** / {total_members:,} members ({_pct(len(active_streaks), total_members)}) — {streak_emoji} {streak_label}\n"
+        f"At risk (just lost, still revivable): **{len(at_risk_streaks):,}**\n"
+        f"Building toward day 1: **{len(building_streaks):,}**\n"
+        f"Longest current streak: **{longest_streak:,}** day(s) · average among active: **{avg_active_streak_len:,.1f}** day(s)\n\n"
         f"**Top 5 current streaks:**\n"
         + ("\n".join(_top_line(i + 1, uid, e["streak_days"], "day(s)") for i, (uid, e) in enumerate(top_streaks)) or "*No active streaks right now.*")
     )
@@ -5686,16 +5807,40 @@ async def activitychart(interaction: discord.Interaction):
         team_sizes.append(len(mids))
     total_in_teams = len(team_member_ids)
     num_teams = len(teams)
-    avg_team_size = (sum(team_sizes) / len(team_sizes)) if team_sizes else 0.0
+    avg_team_size = _avg(team_sizes)
     fullest = sorted(teams.items(), key=lambda kv: len(kv[1].get("members", [])), reverse=True)[:5]
 
     team_pct = _pct_val(total_in_teams, total_members)
     team_emoji, team_label, team_score = _grade(team_pct, _TEAM_BANDS)
 
+    co_leader_count = sum(1 for info in teams.values() if info.get("co_leader_id"))
+    co_leader_pct = _pct_val(co_leader_count, num_teams)
+    co_leader_emoji, co_leader_label, co_leader_score = _grade(co_leader_pct, _CO_LEADER_BANDS)
+
+    premium_team_count = 0
+    for info in teams.values():
+        leader = guild.get_member(info.get("leader_id"))
+        if leader and any(r.id in (PREMIUM_ROLE_ID, PREMIUM_ROLE_ID_2) for r in leader.roles):
+            premium_team_count += 1
+
+    # Size distribution relative to the member cap, so staff can see at a glance whether
+    # most teams are thriving, half-full, or barely started.
+    full_teams = mid_teams = small_teams = 0
+    for size in team_sizes:
+        ratio = size / MAX_TEAM_MEMBERS if MAX_TEAM_MEMBERS else 0
+        if ratio >= 0.75:
+            full_teams += 1
+        elif ratio >= 0.4:
+            mid_teams += 1
+        else:
+            small_teams += 1
+
     teams_body = (
-        f"Total teams: **{num_teams:,}**\n"
+        f"Total teams: **{num_teams:,}** (**{premium_team_count:,}** premium)\n"
         f"Members on a team: **{total_in_teams:,}** / {total_members:,} ({_pct(total_in_teams, total_members)}) — {team_emoji} {team_label}\n"
-        f"Average team size: **{avg_team_size:.1f}** (cap is {MAX_TEAM_MEMBERS})\n\n"
+        f"Average team size: **{avg_team_size:.1f}** (cap is {MAX_TEAM_MEMBERS})\n"
+        f"Teams with a co-leader: **{co_leader_count:,}** / {num_teams:,} ({co_leader_pct:.1f}%) — {co_leader_emoji} {co_leader_label}\n"
+        f"Size mix — full (≥75%): **{full_teams:,}** · mid (40-74%): **{mid_teams:,}** · small (<40%): **{small_teams:,}**\n\n"
         f"**Largest teams:**\n"
         + ("\n".join(
             f"{i + 1}. **{key}** — {len(info.get('members', []))}/{MAX_TEAM_MEMBERS} members"
@@ -5714,18 +5859,61 @@ async def activitychart(interaction: discord.Interaction):
         for uid_str, n in data.get("users", {}).items():
             per_user_team_cmd_totals[uid_str] = per_user_team_cmd_totals.get(uid_str, 0) + n
     top_team_cmd_users = sorted(per_user_team_cmd_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    team_cmd_adoption_pct = _pct_val(len(per_user_team_cmd_totals), total_members)
 
     createteam_users = usage.get("createteam", {}).get("users", {})
     top_team_creators = sorted(createteam_users.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
     commands_body = (
-        f"Total team-command uses tracked: **{total_team_cmd_uses:,}** (since last restart-safe reset)\n\n"
+        f"Total team-command uses tracked: **{total_team_cmd_uses:,}** (since last restart-safe reset)\n"
+        f"Members who've used at least one team command: **{len(per_user_team_cmd_totals):,}** ({team_cmd_adoption_pct:.1f}% of members)\n\n"
         f"**Most-used team commands:**\n"
         + ("\n".join(f"{i + 1}. `/{name}` — **{d.get('total', 0):,}** uses" for i, (name, d) in enumerate(top_team_commands)) or "*No team commands used yet.*")
         + "\n\n**Most active team-command users:**\n"
         + ("\n".join(_top_line(i + 1, uid, n, "uses") for i, (uid, n) in enumerate(top_team_cmd_users)) or "*None yet.*")
         + "\n\n**Who's creating teams (`/createteam` uses):**\n"
         + ("\n".join(_top_line(i + 1, uid, n, "teams created") for i, (uid, n) in enumerate(top_team_creators)) or "*No teams created yet.*")
+    )
+
+    # ---------- Bot-wide command usage ----------
+    total_all_cmd_uses = sum(d.get("total", 0) for d in usage.values())
+    top_all_commands = sorted(usage.items(), key=lambda kv: kv[1].get("total", 0), reverse=True)[:8]
+    distinct_commands_used = sum(1 for d in usage.values() if d.get("total", 0) > 0)
+    total_registered_commands = len(list(bot.tree.walk_commands())) or 1
+    command_diversity_pct = _pct_val(distinct_commands_used, total_registered_commands)
+    command_diversity_emoji, command_diversity_label, command_diversity_score = _grade(
+        command_diversity_pct, _COMMAND_DIVERSITY_BANDS
+    )
+    all_users_who_ran_a_command: set[str] = set()
+    for d in usage.values():
+        all_users_who_ran_a_command.update(d.get("users", {}).keys())
+    bot_adoption_pct = _pct_val(len(all_users_who_ran_a_command), total_members)
+
+    botwide_body = (
+        f"Total slash-command uses tracked: **{total_all_cmd_uses:,}**\n"
+        f"Distinct commands used at least once: **{distinct_commands_used:,}** / {total_registered_commands:,} "
+        f"({command_diversity_pct:.1f}%) — {command_diversity_emoji} {command_diversity_label}\n"
+        f"Members who've run any command: **{len(all_users_who_ran_a_command):,}** ({bot_adoption_pct:.1f}% of members)\n\n"
+        f"**Most-used commands server-wide:**\n"
+        + ("\n".join(f"{i + 1}. `/{name}` — **{d.get('total', 0):,}** uses" for i, (name, d) in enumerate(top_all_commands)) or "*No commands used yet.*")
+    )
+
+    # ---------- Giveaways ----------
+    giveaways = db.get("giveaways", {})
+    total_giveaways = len(giveaways)
+    active_giveaways = sum(1 for g in giveaways.values() if not g.get("ended"))
+    ended_giveaways = total_giveaways - active_giveaways
+    entry_counts = [len(g.get("entries", [])) for g in giveaways.values()]
+    avg_entries = _avg(entry_counts)
+    dead_giveaways = sum(1 for g in giveaways.values() if g.get("ended") and not g.get("entries"))
+    giveaway_participation_pct = _pct_val(avg_entries, total_members) if total_members else 0.0
+    giveaway_emoji, giveaway_label, giveaway_score = _grade(giveaway_participation_pct, _GIVEAWAY_PARTICIPATION_BANDS)
+
+    giveaways_body = (
+        f"Total giveaways run: **{total_giveaways:,}** (**{active_giveaways:,}** active, **{ended_giveaways:,}** ended)\n"
+        f"Average entries per giveaway: **{avg_entries:,.1f}** (~{giveaway_participation_pct:.1f}% of members) — {giveaway_emoji} {giveaway_label}\n"
+        f"Giveaways that ended with zero entries: **{dead_giveaways:,}**"
+        if total_giveaways else "No giveaways have been run yet."
     )
 
     # ---------- Tickets & scrims ----------
@@ -5735,8 +5923,32 @@ async def activitychart(interaction: discord.Interaction):
     open_tickets = sum(1 for t in tickets.values() if not t.get("closed"))
     closed_tickets = total_tickets - open_tickets
 
+    # Resolution time only exists for tickets closed after this tracking was added —
+    # older closed tickets without a closed_at are simply skipped rather than skewing
+    # the average with a missing value treated as zero.
+    resolution_hours = []
+    category_counts: dict[str, int] = {}
+    for t in tickets.values():
+        category = t.get("category") or "Uncategorized"
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if t.get("closed") and t.get("created_at") and t.get("closed_at"):
+            try:
+                created_dt = datetime.fromisoformat(t["created_at"])
+                closed_dt = datetime.fromisoformat(t["closed_at"])
+                resolution_hours.append((closed_dt - created_dt).total_seconds() / 3600)
+            except ValueError:
+                pass
+    avg_resolution_hours = _avg(resolution_hours) if resolution_hours else None
+    top_categories = sorted(category_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    top_ticket_category = top_categories[0][0] if top_categories else None
+
     scrim_db = load_scrim_db()
-    total_scrims = len(scrim_db.get("scrims", {}))
+    active_scrims = scrim_db.get("scrims", {})
+    total_scrims = len(active_scrims)
+    teams_in_active_scrims = {info.get("team_a") for info in active_scrims.values()} | {
+        info.get("team_b") for info in active_scrims.values()
+    }
+    teams_in_active_scrims.discard(None)
 
     open_ticket_pct = _pct_val(open_tickets, total_tickets)
     ticket_emoji, ticket_label, ticket_score = _grade(open_ticket_pct, _TICKET_LOAD_BANDS, higher_is_better=False)
@@ -5744,14 +5956,18 @@ async def activitychart(interaction: discord.Interaction):
     support_body = (
         f"Tickets — total: **{total_tickets:,}** · open: **{open_tickets:,}** · closed: **{closed_tickets:,}**"
         + (f" — {ticket_emoji} {ticket_label}" if total_tickets else "")
-        + f"\nActive scrim channels: **{total_scrims:,}**"
+        + "\n"
+        + (f"Average time to close: **{avg_resolution_hours:,.1f} hours**\n" if avg_resolution_hours is not None else "Average time to close: *not enough tracked closures yet*\n")
+        + ("**Top ticket categories:** " + ", ".join(f"{name} ({n:,})" for name, n in top_categories) + "\n" if top_categories else "")
+        + f"Active scrim channels: **{total_scrims:,}** (**{len(teams_in_active_scrims):,}** teams currently scrimming)"
     )
 
     overview_body = (
         f"Server members (excluding bots): **{total_members:,}**\n"
-        f"Sent a tracked message all-time: **{_pct(active_alltime, total_members)}**\n"
-        f"On a team: **{_pct(total_in_teams, total_members)}**\n"
-        f"Have an active chat streak: **{_pct(len(active_streaks), total_members)}**\n"
+        f"Sent a tracked message all-time: **{_pct(active_alltime, total_members)}** · weekly re-engagement: **{reengagement_pct:.1f}%**\n"
+        f"On a team: **{_pct(total_in_teams, total_members)}** across **{num_teams:,}** teams\n"
+        f"Have an active chat streak: **{_pct(len(active_streaks), total_members)}** (**{len(at_risk_streaks):,}** at risk right now)\n"
+        f"New joins in the last 7 days: **{joins_7d:,}**\n"
         f"Opted out of activity tracking: **{_pct(optout_count, total_members)}**"
     )
 
@@ -5761,12 +5977,15 @@ async def activitychart(interaction: discord.Interaction):
     # zero tickets ever opened) are left out and the remaining weights are rescaled so
     # the average still adds up to a fair 0-100 score.
     components = [
-        ("msg_alltime", "Message Activity (All-Time)", 20, msg_alltime_pct, msg_alltime_emoji, msg_alltime_label, msg_alltime_score, total_members > 0),
+        ("msg_alltime", "Message Activity (All-Time)", 15, msg_alltime_pct, msg_alltime_emoji, msg_alltime_label, msg_alltime_score, total_members > 0),
         ("msg_weekly", "Message Activity (This Week)", 15, msg_weekly_pct, msg_weekly_emoji, msg_weekly_label, msg_weekly_score, total_members > 0),
-        ("retention", "Invite Retention", 20, retention_pct, retention_emoji, retention_label, retention_score, total_invited > 0),
-        ("streaks", "Chat Streaks", 15, streak_pct, streak_emoji, streak_label, streak_score, total_members > 0),
-        ("teams", "Team Participation", 20, team_pct, team_emoji, team_label, team_score, total_members > 0),
+        ("retention", "Invite Retention", 15, retention_pct, retention_emoji, retention_label, retention_score, total_invited > 0),
+        ("streaks", "Chat Streaks", 10, streak_pct, streak_emoji, streak_label, streak_score, total_members > 0),
+        ("teams", "Team Participation", 15, team_pct, team_emoji, team_label, team_score, total_members > 0),
+        ("co_leader", "Team Co-Leader Coverage", 5, co_leader_pct, co_leader_emoji, co_leader_label, co_leader_score, num_teams > 0),
         ("tickets", "Support Load", 10, open_ticket_pct, ticket_emoji, ticket_label, ticket_score, total_tickets > 0),
+        ("command_diversity", "Command Diversity", 5, command_diversity_pct, command_diversity_emoji, command_diversity_label, command_diversity_score, total_all_cmd_uses > 0),
+        ("giveaway_participation", "Giveaway Participation", 5, giveaway_participation_pct, giveaway_emoji, giveaway_label, giveaway_score, total_giveaways > 0),
     ]
     usable = [c for c in components if c[7]]
     total_weight = sum(c[2] for c in usable)
@@ -5782,17 +6001,50 @@ async def activitychart(interaction: discord.Interaction):
 
     score_body = (
         f"# {overall_emoji} {overall_score:.0f}/100 — {overall_label}\n"
-        f"This is a weighted blend of everything below — it's a quick read on server health, not the whole story.\n\n"
+        f"This is a weighted blend of {len(usable)} metric(s) below — a quick read on server health, not the whole story.\n\n"
         + "\n".join(score_lines)
     )
 
     # ---------- Recommendations ----------
-    weak_components = [c for c in components if c[7] and c[5] in ("Needs Improvement", "Needs Attention", "Poor", "Overloaded")]
+    advice_ctx = {
+        "total_members": total_members,
+        "msg_alltime_pct": msg_alltime_pct,
+        "active_alltime": active_alltime,
+        "active_weekly": active_weekly,
+        "reengagement_pct": reengagement_pct,
+        "retention_pct": retention_pct,
+        "total_invited": total_invited,
+        "avg_days_to_leave": avg_days_to_leave,
+        "streak_pct": streak_pct,
+        "at_risk_count": len(at_risk_streaks),
+        "team_pct": team_pct,
+        "num_teams": num_teams,
+        "co_leader_count": co_leader_count,
+        "co_leader_pct": co_leader_pct,
+        "open_tickets": open_tickets,
+        "total_tickets": total_tickets,
+        "open_ticket_pct": open_ticket_pct,
+        "top_ticket_category": top_ticket_category,
+        "distinct_commands_used": distinct_commands_used,
+        "total_registered_commands": total_registered_commands,
+        "command_diversity_pct": command_diversity_pct,
+        "avg_entries": avg_entries,
+        "giveaway_participation_pct": giveaway_participation_pct,
+        "dead_giveaways": dead_giveaways,
+    }
+
+    # Weakest (lowest-scoring) issues first, so staff tackle the highest-impact problem
+    # first instead of reading down an arbitrary list.
+    weak_components = sorted(
+        (c for c in components if c[7] and c[5] in ("Needs Improvement", "Needs Attention", "Poor", "Overloaded")),
+        key=lambda c: c[6],
+    )
     if weak_components:
         rec_lines = []
-        for key, name, *_rest in weak_components:
-            title, advice = _ACTIVITYCHART_ADVICE[key]
-            rec_lines.append(f"**{name} — {title}**\n{advice}")
+        for key, name, weight, *_rest, score, _has_data in weak_components:
+            title, advice = _ACTIVITYCHART_ADVICE[key](advice_ctx)
+            priority = "🔴 High priority" if score <= 20 else "🟠 Medium priority"
+            rec_lines.append(f"**{name} — {title}**\n-# {priority}\n{advice}")
         recommendations_body = "\n\n".join(rec_lines)
     else:
         recommendations_body = (
@@ -5808,6 +6060,8 @@ async def activitychart(interaction: discord.Interaction):
         ("🔥 Chat Streaks", streak_body),
         ("🛡️ Teams", teams_body),
         ("⚙️ Team Command Usage", commands_body),
+        ("🤖 Bot-Wide Command Usage", botwide_body),
+        ("🎉 Giveaways", giveaways_body),
         ("🎫 Tickets & Scrims", support_body),
         ("🛠️ What To Improve", recommendations_body),
     ]
