@@ -5471,9 +5471,111 @@ def _pct(part: int, whole: int) -> str:
     return f"{(part / whole * 100):.1f}%" if whole else "0.0%"
 
 
+def _pct_val(part: int, whole: int) -> float:
+    return (part / whole * 100) if whole else 0.0
+
+
 def _top_line(rank: int, user_id_or_str, value, unit: str) -> str:
     uid = int(user_id_or_str)
     return f"{rank}. <@{uid}> — **{value:,}** {unit}"
+
+
+# ---------- /activitychart grading ----------
+# Each metric is converted into a 0-100 "health score" via bands below, then combined
+# into a single weighted overall score. Bands are (threshold, score, emoji, label).
+# For "higher is better" metrics, the first band whose threshold the value meets or
+# exceeds (checked highest-first) wins. For "lower is better" metrics (e.g. how loaded
+# the ticket queue is), the first band whose threshold the value is at or under
+# (checked lowest-first) wins.
+_ENGAGEMENT_BANDS = [
+    (40.0, 100, "🟢", "Excellent"),
+    (20.0, 75, "🟡", "Good"),
+    (10.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_RETENTION_BANDS = [
+    (70.0, 100, "🟢", "Excellent"),
+    (50.0, 75, "🟡", "Good"),
+    (30.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_STREAK_BANDS = [
+    (15.0, 100, "🟢", "Excellent"),
+    (7.0, 75, "🟡", "Good"),
+    (3.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_TEAM_BANDS = [
+    (50.0, 100, "🟢", "Excellent"),
+    (30.0, 75, "🟡", "Good"),
+    (15.0, 45, "🟠", "Needs Improvement"),
+    (0.0, 15, "🔴", "Poor"),
+]
+_TICKET_LOAD_BANDS = [  # lower % of tickets sitting open is better
+    (20.0, 100, "🟢", "Excellent"),
+    (40.0, 75, "🟡", "Good"),
+    (60.0, 45, "🟠", "Needs Attention"),
+    (100.1, 15, "🔴", "Overloaded"),
+]
+
+# (metric key -> (short title, "what to do" advice)) shown in the Recommendations
+# section whenever that metric grades as Needs Improvement/Needs Attention/Poor/Overloaded.
+_ACTIVITYCHART_ADVICE = {
+    "msg_alltime": (
+        "Grow overall participation",
+        "Run recurring events that reward posting (giveaways, QOTD, community challenges), "
+        "and make sure quiet channels have a clear reason for people to visit.",
+    ),
+    "msg_weekly": (
+        "Weekly activity has cooled off",
+        "Post more discussion prompts/polls this week, keep `/qotd` pinging its role consistently, "
+        "and check whether a recent change (new rule, ended event) quieted things down.",
+    ),
+    "retention": (
+        "New members aren't sticking around",
+        "Tighten up onboarding — a clear welcome message, easy-to-find rules, and an obvious "
+        "first step (like joining a team) in someone's first few minutes noticeably improves retention.",
+    ),
+    "streaks": (
+        "Few members are keeping a chat streak",
+        "Promote the streak feature more visibly (pinned message, mention it in the welcome flow) "
+        "and consider a small reward or role for hitting streak milestones.",
+    ),
+    "teams": (
+        "Most members aren't on a team",
+        "Advertise `/createteam` and `/requestteam` more, lower the friction to join one, and "
+        "consider a recruitment event or a spotlight for teams that are looking for members.",
+    ),
+    "tickets": (
+        "The support ticket queue is backed up",
+        "Add more staff coverage for ticket hours, or set up a pinned FAQ/auto-response for the "
+        "most common requests so fewer of them need a human at all.",
+    ),
+}
+
+
+def _grade(pct: float, bands: list[tuple[float, int, str, str]], higher_is_better: bool = True) -> tuple[str, str, int]:
+    """Returns (emoji, label, score 0-100) for the band this percentage falls into.
+
+    For higher_is_better metrics, `bands` must be sorted with the highest threshold
+    first (checked pct >= threshold). For lower-is-better metrics, `bands` must be
+    sorted with the lowest threshold first (checked pct <= threshold)."""
+    for threshold, score, emoji, label in bands:
+        if (pct >= threshold) if higher_is_better else (pct <= threshold):
+            return emoji, label, score
+    _, score, emoji, label = bands[-1]
+    return emoji, label, score
+
+
+def _overall_grade(score: float) -> tuple[str, str]:
+    """Returns (emoji, label) for a final weighted score out of 100."""
+    if score >= 85:
+        return "🟢", "Excellent"
+    if score >= 65:
+        return "🟡", "Good"
+    if score >= 40:
+        return "🟠", "Needs Improvement"
+    return "🔴", "Poor"
 
 
 class ActivityChartView(discord.ui.LayoutView):
@@ -5517,9 +5619,14 @@ async def activitychart(interaction: discord.Interaction):
 
     optout_count = len(_data_optout_ids)
 
+    msg_alltime_pct = _pct_val(active_alltime, total_members)
+    msg_weekly_pct = _pct_val(active_weekly, total_members)
+    msg_alltime_emoji, msg_alltime_label, msg_alltime_score = _grade(msg_alltime_pct, _ENGAGEMENT_BANDS)
+    msg_weekly_emoji, msg_weekly_label, msg_weekly_score = _grade(msg_weekly_pct, _ENGAGEMENT_BANDS)
+
     messages_body = (
-        f"Tracked senders (all-time): **{active_alltime:,}** / {total_members:,} members ({_pct(active_alltime, total_members)})\n"
-        f"Tracked senders (this week): **{active_weekly:,}** / {total_members:,} members ({_pct(active_weekly, total_members)})\n"
+        f"Tracked senders (all-time): **{active_alltime:,}** / {total_members:,} members ({_pct(active_alltime, total_members)}) — {msg_alltime_emoji} {msg_alltime_label}\n"
+        f"Tracked senders (this week): **{active_weekly:,}** / {total_members:,} members ({_pct(active_weekly, total_members)}) — {msg_weekly_emoji} {msg_weekly_label}\n"
         f"Total tracked messages — all-time: **{total_msgs_alltime:,}** · this week: **{total_msgs_weekly:,}**\n"
         f"Opted out of tracking: **{optout_count:,}** ({_pct(optout_count, total_members)})\n\n"
         f"**Top 5 this week:**\n"
@@ -5541,9 +5648,12 @@ async def activitychart(interaction: discord.Interaction):
             inviter_retained[r["inviter_id"]] = inviter_retained.get(r["inviter_id"], 0) + 1
     top_inviters = sorted(inviter_retained.items(), key=lambda kv: kv[1], reverse=True)[:5]
 
+    retention_pct = _pct_val(retained, total_invited)
+    retention_emoji, retention_label, retention_score = _grade(retention_pct, _RETENTION_BANDS)
+
     retention_body = (
         f"Tracked invited members: **{total_invited:,}**\n"
-        f"Still in the server: **{retained:,}** ({_pct(retained, total_invited)})\n"
+        f"Still in the server: **{retained:,}** ({_pct(retained, total_invited)}) — {retention_emoji} {retention_label}\n"
         f"Left: **{left:,}** ({_pct(left, total_invited)})\n\n"
         f"**Top inviters (still-retained invites):**\n"
         + ("\n".join(_top_line(i + 1, uid, n, "retained invites") for i, (uid, n) in enumerate(top_inviters)) or "*No invite data on record.*")
@@ -5556,8 +5666,11 @@ async def activitychart(interaction: discord.Interaction):
     }
     top_streaks = sorted(active_streaks.items(), key=lambda kv: kv[1].get("streak_days", 0), reverse=True)[:5]
 
+    streak_pct = _pct_val(len(active_streaks), total_members)
+    streak_emoji, streak_label, streak_score = _grade(streak_pct, _STREAK_BANDS)
+
     streak_body = (
-        f"Active streaks: **{len(active_streaks):,}** / {total_members:,} members ({_pct(len(active_streaks), total_members)})\n\n"
+        f"Active streaks: **{len(active_streaks):,}** / {total_members:,} members ({_pct(len(active_streaks), total_members)}) — {streak_emoji} {streak_label}\n\n"
         f"**Top 5 current streaks:**\n"
         + ("\n".join(_top_line(i + 1, uid, e["streak_days"], "day(s)") for i, (uid, e) in enumerate(top_streaks)) or "*No active streaks right now.*")
     )
@@ -5576,9 +5689,12 @@ async def activitychart(interaction: discord.Interaction):
     avg_team_size = (sum(team_sizes) / len(team_sizes)) if team_sizes else 0.0
     fullest = sorted(teams.items(), key=lambda kv: len(kv[1].get("members", [])), reverse=True)[:5]
 
+    team_pct = _pct_val(total_in_teams, total_members)
+    team_emoji, team_label, team_score = _grade(team_pct, _TEAM_BANDS)
+
     teams_body = (
         f"Total teams: **{num_teams:,}**\n"
-        f"Members on a team: **{total_in_teams:,}** / {total_members:,} ({_pct(total_in_teams, total_members)})\n"
+        f"Members on a team: **{total_in_teams:,}** / {total_members:,} ({_pct(total_in_teams, total_members)}) — {team_emoji} {team_label}\n"
         f"Average team size: **{avg_team_size:.1f}** (cap is {MAX_TEAM_MEMBERS})\n\n"
         f"**Largest teams:**\n"
         + ("\n".join(
@@ -5622,9 +5738,13 @@ async def activitychart(interaction: discord.Interaction):
     scrim_db = load_scrim_db()
     total_scrims = len(scrim_db.get("scrims", {}))
 
+    open_ticket_pct = _pct_val(open_tickets, total_tickets)
+    ticket_emoji, ticket_label, ticket_score = _grade(open_ticket_pct, _TICKET_LOAD_BANDS, higher_is_better=False)
+
     support_body = (
-        f"Tickets — total: **{total_tickets:,}** · open: **{open_tickets:,}** · closed: **{closed_tickets:,}**\n"
-        f"Active scrim channels: **{total_scrims:,}**"
+        f"Tickets — total: **{total_tickets:,}** · open: **{open_tickets:,}** · closed: **{closed_tickets:,}**"
+        + (f" — {ticket_emoji} {ticket_label}" if total_tickets else "")
+        + f"\nActive scrim channels: **{total_scrims:,}**"
     )
 
     overview_body = (
@@ -5635,7 +5755,53 @@ async def activitychart(interaction: discord.Interaction):
         f"Opted out of activity tracking: **{_pct(optout_count, total_members)}**"
     )
 
+    # ---------- Overall score ----------
+    # Each metric contributes to the overall score, weighted by how much it matters to
+    # general server health. Metrics with no data to grade (e.g. zero invites tracked,
+    # zero tickets ever opened) are left out and the remaining weights are rescaled so
+    # the average still adds up to a fair 0-100 score.
+    components = [
+        ("msg_alltime", "Message Activity (All-Time)", 20, msg_alltime_pct, msg_alltime_emoji, msg_alltime_label, msg_alltime_score, total_members > 0),
+        ("msg_weekly", "Message Activity (This Week)", 15, msg_weekly_pct, msg_weekly_emoji, msg_weekly_label, msg_weekly_score, total_members > 0),
+        ("retention", "Invite Retention", 20, retention_pct, retention_emoji, retention_label, retention_score, total_invited > 0),
+        ("streaks", "Chat Streaks", 15, streak_pct, streak_emoji, streak_label, streak_score, total_members > 0),
+        ("teams", "Team Participation", 20, team_pct, team_emoji, team_label, team_score, total_members > 0),
+        ("tickets", "Support Load", 10, open_ticket_pct, ticket_emoji, ticket_label, ticket_score, total_tickets > 0),
+    ]
+    usable = [c for c in components if c[7]]
+    total_weight = sum(c[2] for c in usable)
+    overall_score = (sum(c[2] * c[6] for c in usable) / total_weight) if total_weight else 0.0
+    overall_emoji, overall_label = _overall_grade(overall_score)
+
+    score_lines = []
+    for _key, name, weight, pct, emoji, label, score, has_data in components:
+        if has_data:
+            score_lines.append(f"{emoji} **{name}** — {pct:.1f}% ({label}, weight {weight}%)")
+        else:
+            score_lines.append(f"⚪ **{name}** — *no data yet, excluded from score*")
+
+    score_body = (
+        f"# {overall_emoji} {overall_score:.0f}/100 — {overall_label}\n"
+        f"This is a weighted blend of everything below — it's a quick read on server health, not the whole story.\n\n"
+        + "\n".join(score_lines)
+    )
+
+    # ---------- Recommendations ----------
+    weak_components = [c for c in components if c[7] and c[5] in ("Needs Improvement", "Needs Attention", "Poor", "Overloaded")]
+    if weak_components:
+        rec_lines = []
+        for key, name, *_rest in weak_components:
+            title, advice = _ACTIVITYCHART_ADVICE[key]
+            rec_lines.append(f"**{name} — {title}**\n{advice}")
+        recommendations_body = "\n\n".join(rec_lines)
+    else:
+        recommendations_body = (
+            "Nothing needs urgent attention right now — the server's core numbers are healthy. "
+            "Keep doing what's working, and re-run `/activitychart` after any big event to see how it moved things."
+        )
+
     sections = [
+        ("🏆 Overall Score", score_body),
         ("📊 Overview", overview_body),
         ("💬 Message Activity", messages_body),
         ("📥 Invite Retention", retention_body),
@@ -5643,6 +5809,7 @@ async def activitychart(interaction: discord.Interaction):
         ("🛡️ Teams", teams_body),
         ("⚙️ Team Command Usage", commands_body),
         ("🎫 Tickets & Scrims", support_body),
+        ("🛠️ What To Improve", recommendations_body),
     ]
 
     await interaction.followup.send(view=ActivityChartView(sections))
