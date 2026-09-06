@@ -345,6 +345,14 @@ _overall_message_dirty: bool = False
 _streak_data: dict = {}
 _streak_dirty: bool = False
 
+# In-memory per-command usage counters, used by /activitychart: {command_name: {"total": int,
+# "users": {user_id_str: int}}}. Same load/flush pattern as the trackers above — loaded from
+# TICKETS_DB_FILE's "command_usage" key on startup (piggybacking on that file/channel rather
+# than standing up a new one, same reasoning as schedule_ping_message_id) and periodically
+# flushed by command_usage_save_loop instead of hitting disk/Discord on every command run.
+_command_usage_counts: dict = {}
+_command_usage_dirty: bool = False
+
 # Per-user cooldown gate shared by BOTH leaderboards: {user_id: last counted message's time.time()}.
 # A message only counts toward either leaderboard if MESSAGE_COUNT_SPAM_COOLDOWN_SECONDS has
 # passed since that user's last counted message — stops someone inflating their count (on
@@ -574,11 +582,18 @@ async def restore_db_from_log_channel():
 def load_ticket_db() -> dict:
     data = _load_json_file(TICKETS_DB_FILE)
     if data is None:
-        return {"next_number": 1, "tickets": {}, "panel_message_id": None, "schedule_ping_message_id": None}
+        return {
+            "next_number": 1,
+            "tickets": {},
+            "panel_message_id": None,
+            "schedule_ping_message_id": None,
+            "command_usage": {},
+        }
     data.setdefault("next_number", 1)
     data.setdefault("tickets", {})
     data.setdefault("panel_message_id", None)
     data.setdefault("schedule_ping_message_id", None)
+    data.setdefault("command_usage", {})
     return data
 
 
@@ -613,6 +628,41 @@ async def restore_ticket_db_from_log_channel():
         print("Restored ticket db from log channel backup.")
     else:
         print("No existing ticket db backup found — starting fresh.")
+
+
+def load_command_usage_into_memory() -> None:
+    """Pulls the "command_usage" snapshot out of the (already-restored) tickets db into the
+    in-memory _command_usage_counts dict. Call this right after restore_ticket_db_from_log_channel()
+    on startup."""
+    data = load_ticket_db()
+    _command_usage_counts.clear()
+    for command_name, entry in (data.get("command_usage") or {}).items():
+        _command_usage_counts[command_name] = {
+            "total": entry.get("total", 0),
+            "users": {str(uid): n for uid, n in (entry.get("users") or {}).items()},
+        }
+
+
+def record_command_usage(command_name: str, user_id: int) -> None:
+    """Bumps the in-memory usage counters for command_name/user_id and marks the flush loop
+    dirty. Cheap, synchronous, no I/O — see command_usage_save_loop for the periodic
+    disk+Discord flush, same reasoning as the message-count trackers."""
+    global _command_usage_dirty
+    entry = _command_usage_counts.setdefault(command_name, {"total": 0, "users": {}})
+    entry["total"] += 1
+    uid_str = str(user_id)
+    entry["users"][uid_str] = entry["users"].get(uid_str, 0) + 1
+    _command_usage_dirty = True
+
+
+async def flush_command_usage() -> None:
+    """Snapshots _command_usage_counts into TICKETS_DB_FILE's "command_usage" key and backs
+    it up. No await happens between the load and the save below, so this can't race with
+    another coroutine's load-mutate-save of the same file."""
+    db = load_ticket_db()
+    db["command_usage"] = _command_usage_counts
+    save_ticket_db(db)
+    await backup_ticket_db_to_log_channel()
 
 
 # ---------- Data privacy (activity-tracking opt-out / delete-my-data) ----------
@@ -1285,6 +1335,22 @@ async def send_schedule_ping_panel():
     every restart."""
     channel = bot.get_channel(SCHEDULE_PING_CHANNEL_ID) or await bot.fetch_channel(SCHEDULE_PING_CHANNEL_ID)
     include_banner = os.path.exists(SUPPORT_BANNER_PATH)
+
+    # Belt-and-suspenders against @everyone/@here spam in this channel: the permission
+    # overwrite is what actually stops the ping from firing at all (Discord notifies people
+    # the instant a message sends, so deleting it afterward in on_message can't un-notify
+    # them) — the on_message deletion below is just cleanup for the literal text.
+    overwrite = channel.overwrites_for(channel.guild.default_role)
+    if overwrite.mention_everyone is not False:
+        overwrite.mention_everyone = False
+        try:
+            await channel.set_permissions(
+                channel.guild.default_role,
+                overwrite=overwrite,
+                reason="Block @everyone/@here pings in the Staff Event Codes channel",
+            )
+        except discord.HTTPException as e:
+            print(f"Couldn't restrict @everyone/@here pings in the schedule-ping channel: {e}")
 
     db = load_ticket_db()
     existing_id = db.get("schedule_ping_message_id")
@@ -4284,6 +4350,20 @@ async def before_overall_message_save_loop():
     await bot.wait_until_ready()
 
 
+@tasks.loop(minutes=5)
+async def command_usage_save_loop():
+    global _command_usage_dirty
+    if not _command_usage_dirty:
+        return
+    _command_usage_dirty = False
+    await flush_command_usage()
+
+
+@command_usage_save_loop.before_loop
+async def before_command_usage_save_loop():
+    await bot.wait_until_ready()
+
+
 # ============================================================
 # CHAT STREAKS — three phases per user, driven by "phase_end":
 #   "counting" — an open window where STREAK_MESSAGES_REQUIRED messages must land before
@@ -5376,6 +5456,196 @@ async def syncglobalmessages(interaction: discord.Interaction):
             f"Counted {total_messages:,} messages across {len(counts)} member(s)."
         )
     )
+
+
+# ---------- /activitychart: full server activity/analytics report ----------
+_ACTIVITYCHART_TEAM_COMMANDS = {
+    "createteam", "teammembers", "invite", "requestteam", "startscrim", "leaveteam",
+    "forceadd", "forcekick", "setcoleader", "staffleaderpromote", "leaderpromote",
+    "changeteamsettings", "staffchangesetting", "bypassteamlimit", "premiumteamsettings",
+    "cleanuporphanteams", "syncteammembers", "globalteammessage",
+}
+
+
+def _pct(part: int, whole: int) -> str:
+    return f"{(part / whole * 100):.1f}%" if whole else "0.0%"
+
+
+def _top_line(rank: int, user_id_or_str, value, unit: str) -> str:
+    uid = int(user_id_or_str)
+    return f"{rank}. <@{uid}> — **{value:,}** {unit}"
+
+
+class ActivityChartView(discord.ui.LayoutView):
+    """One Components V2 container per section, same accent-bordered card style as the rest
+    of the bot's panels — built fresh every /activitychart run from a snapshot of the
+    in-memory trackers plus the teams/invite/ticket/scrim JSON dbs."""
+
+    def __init__(self, sections: list[tuple[str, str]]):
+        super().__init__(timeout=None)
+        children = []
+        for i, (heading, body) in enumerate(sections):
+            if i > 0:
+                children.append(discord.ui.Separator())
+            children.append(discord.ui.TextDisplay(f"**{heading}**\n{body}"))
+        self.add_item(discord.ui.Container(*children))
+
+
+@bot.tree.command(name="activitychart", description="(Staff) Full server activity & engagement report")
+async def activitychart(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    # Discord's own "<bot> is thinking..." loading state doubles as the "let it scan
+    # through" indicator the report needs — no separate progress message required.
+    await interaction.response.defer(thinking=True)
+
+    guild = interaction.guild
+    human_members = [m for m in guild.members if not m.bot]
+    total_members = len(human_members)
+
+    # ---------- Messages ----------
+    overall_counts = _overall_message_counts
+    weekly_counts = _message_leaderboard_counts
+    active_alltime = len(overall_counts)
+    active_weekly = len(weekly_counts)
+    total_msgs_alltime = sum(overall_counts.values())
+    total_msgs_weekly = sum(weekly_counts.values())
+    top_alltime = sorted(overall_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_weekly = sorted(weekly_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    optout_count = len(_data_optout_ids)
+
+    messages_body = (
+        f"Tracked senders (all-time): **{active_alltime:,}** / {total_members:,} members ({_pct(active_alltime, total_members)})\n"
+        f"Tracked senders (this week): **{active_weekly:,}** / {total_members:,} members ({_pct(active_weekly, total_members)})\n"
+        f"Total tracked messages — all-time: **{total_msgs_alltime:,}** · this week: **{total_msgs_weekly:,}**\n"
+        f"Opted out of tracking: **{optout_count:,}** ({_pct(optout_count, total_members)})\n\n"
+        f"**Top 5 this week:**\n"
+        + ("\n".join(_top_line(i + 1, uid, n, "messages") for i, (uid, n) in enumerate(top_weekly)) or "*No activity this week yet.*")
+        + "\n\n**Top 5 all-time:**\n"
+        + ("\n".join(_top_line(i + 1, uid, n, "messages") for i, (uid, n) in enumerate(top_alltime)) or "*No tracked messages yet.*")
+    )
+
+    # ---------- Retention ----------
+    invite_db = load_invite_db()
+    invited_users = invite_db.get("invited_users", {})
+    total_invited = len(invited_users)
+    retained = sum(1 for r in invited_users.values() if r.get("still_in_server"))
+    left = total_invited - retained
+
+    inviter_retained: dict[int, int] = {}
+    for r in invited_users.values():
+        if r.get("still_in_server") and r.get("inviter_id"):
+            inviter_retained[r["inviter_id"]] = inviter_retained.get(r["inviter_id"], 0) + 1
+    top_inviters = sorted(inviter_retained.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    retention_body = (
+        f"Tracked invited members: **{total_invited:,}**\n"
+        f"Still in the server: **{retained:,}** ({_pct(retained, total_invited)})\n"
+        f"Left: **{left:,}** ({_pct(left, total_invited)})\n\n"
+        f"**Top inviters (still-retained invites):**\n"
+        + ("\n".join(_top_line(i + 1, uid, n, "retained invites") for i, (uid, n) in enumerate(top_inviters)) or "*No invite data on record.*")
+    )
+
+    # ---------- Chat streaks ----------
+    active_streaks = {
+        uid: e for uid, e in _streak_data.items()
+        if e.get("phase") != "lost" and e.get("streak_days", 0) > 0
+    }
+    top_streaks = sorted(active_streaks.items(), key=lambda kv: kv[1].get("streak_days", 0), reverse=True)[:5]
+
+    streak_body = (
+        f"Active streaks: **{len(active_streaks):,}** / {total_members:,} members ({_pct(len(active_streaks), total_members)})\n\n"
+        f"**Top 5 current streaks:**\n"
+        + ("\n".join(_top_line(i + 1, uid, e["streak_days"], "day(s)") for i, (uid, e) in enumerate(top_streaks)) or "*No active streaks right now.*")
+    )
+
+    # ---------- Teams ----------
+    db = load_db()
+    teams = db["teams"]
+    team_member_ids: set[int] = set()
+    team_sizes = []
+    for info in teams.values():
+        mids = info.get("members", [])
+        team_member_ids.update(mids)
+        team_sizes.append(len(mids))
+    total_in_teams = len(team_member_ids)
+    num_teams = len(teams)
+    avg_team_size = (sum(team_sizes) / len(team_sizes)) if team_sizes else 0.0
+    fullest = sorted(teams.items(), key=lambda kv: len(kv[1].get("members", [])), reverse=True)[:5]
+
+    teams_body = (
+        f"Total teams: **{num_teams:,}**\n"
+        f"Members on a team: **{total_in_teams:,}** / {total_members:,} ({_pct(total_in_teams, total_members)})\n"
+        f"Average team size: **{avg_team_size:.1f}** (cap is {MAX_TEAM_MEMBERS})\n\n"
+        f"**Largest teams:**\n"
+        + ("\n".join(
+            f"{i + 1}. **{key}** — {len(info.get('members', []))}/{MAX_TEAM_MEMBERS} members"
+            for i, (key, info) in enumerate(fullest)
+        ) or "*No teams exist yet.*")
+    )
+
+    # ---------- Team-command usage ----------
+    usage = _command_usage_counts
+    team_cmd_usage = {name: data for name, data in usage.items() if name in _ACTIVITYCHART_TEAM_COMMANDS}
+    total_team_cmd_uses = sum(d.get("total", 0) for d in team_cmd_usage.values())
+    top_team_commands = sorted(team_cmd_usage.items(), key=lambda kv: kv[1].get("total", 0), reverse=True)[:8]
+
+    per_user_team_cmd_totals: dict[str, int] = {}
+    for data in team_cmd_usage.values():
+        for uid_str, n in data.get("users", {}).items():
+            per_user_team_cmd_totals[uid_str] = per_user_team_cmd_totals.get(uid_str, 0) + n
+    top_team_cmd_users = sorted(per_user_team_cmd_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    createteam_users = usage.get("createteam", {}).get("users", {})
+    top_team_creators = sorted(createteam_users.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    commands_body = (
+        f"Total team-command uses tracked: **{total_team_cmd_uses:,}** (since last restart-safe reset)\n\n"
+        f"**Most-used team commands:**\n"
+        + ("\n".join(f"{i + 1}. `/{name}` — **{d.get('total', 0):,}** uses" for i, (name, d) in enumerate(top_team_commands)) or "*No team commands used yet.*")
+        + "\n\n**Most active team-command users:**\n"
+        + ("\n".join(_top_line(i + 1, uid, n, "uses") for i, (uid, n) in enumerate(top_team_cmd_users)) or "*None yet.*")
+        + "\n\n**Who's creating teams (`/createteam` uses):**\n"
+        + ("\n".join(_top_line(i + 1, uid, n, "teams created") for i, (uid, n) in enumerate(top_team_creators)) or "*No teams created yet.*")
+    )
+
+    # ---------- Tickets & scrims ----------
+    ticket_db = load_ticket_db()
+    tickets = ticket_db.get("tickets", {})
+    total_tickets = len(tickets)
+    open_tickets = sum(1 for t in tickets.values() if not t.get("closed"))
+    closed_tickets = total_tickets - open_tickets
+
+    scrim_db = load_scrim_db()
+    total_scrims = len(scrim_db.get("scrims", {}))
+
+    support_body = (
+        f"Tickets — total: **{total_tickets:,}** · open: **{open_tickets:,}** · closed: **{closed_tickets:,}**\n"
+        f"Active scrim channels: **{total_scrims:,}**"
+    )
+
+    overview_body = (
+        f"Server members (excluding bots): **{total_members:,}**\n"
+        f"Sent a tracked message all-time: **{_pct(active_alltime, total_members)}**\n"
+        f"On a team: **{_pct(total_in_teams, total_members)}**\n"
+        f"Have an active chat streak: **{_pct(len(active_streaks), total_members)}**\n"
+        f"Opted out of activity tracking: **{_pct(optout_count, total_members)}**"
+    )
+
+    sections = [
+        ("📊 Overview", overview_body),
+        ("💬 Message Activity", messages_body),
+        ("📥 Invite Retention", retention_body),
+        ("🔥 Chat Streaks", streak_body),
+        ("🛡️ Teams", teams_body),
+        ("⚙️ Team Command Usage", commands_body),
+        ("🎫 Tickets & Scrims", support_body),
+    ]
+
+    await interaction.followup.send(view=ActivityChartView(sections))
 
 
 # ---------- Slash commands ----------
@@ -6719,6 +6989,25 @@ class MemberCountView(discord.ui.LayoutView):
 async def on_message(message: discord.Message):
     if (
         message.guild is not None
+        and message.channel.id == SCHEDULE_PING_CHANNEL_ID
+        and not message.author.bot
+        and ("@everyone" in message.content or "@here" in message.content)
+    ):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        try:
+            await message.channel.send(
+                f"{message.author.mention} @everyone/@here pings aren't allowed in this channel.",
+                delete_after=6,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    if (
+        message.guild is not None
         and not message.author.bot
         and message.content.strip().lower() == ".membercount"
     ):
@@ -7975,6 +8264,8 @@ async def on_app_command_completion(
     interaction: discord.Interaction,
     command: app_commands.Command | app_commands.ContextMenu,
 ):
+    record_command_usage(command.qualified_name, interaction.user.id)
+
     options_text = ""
     try:
         data = interaction.data or {}
@@ -8060,6 +8351,7 @@ async def on_ready():
     await restore_overall_message_from_log_channel()
     await restore_optout_db_from_log_channel()
     await restore_streak_db_from_log_channel()
+    load_command_usage_into_memory()
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
@@ -8113,6 +8405,8 @@ async def on_ready():
         overall_message_save_loop.start()
     if not streak_check_loop.is_running():
         streak_check_loop.start()
+    if not command_usage_save_loop.is_running():
+        command_usage_save_loop.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced.")
 
