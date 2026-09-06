@@ -1257,14 +1257,12 @@ class ScheduleGamesPanelView(discord.ui.LayoutView):
         super().__init__(timeout=None)
 
         description = (
-            "Staff members will post join codes here whenever they're hosting a game.\n"
-            "Feel free to jump in as soon as you see a code.\n\n"
-            f"**If you wish to be notified next time a game starts, react with {SCHEDULE_PING_EMOJI} "
-            "below.**"
+            f"React to this message with {SCHEDULE_PING_EMOJI} to be alerted whenever a "
+            "Staff Event Code goes live here in this channel!"
         )
 
         children = [
-            discord.ui.TextDisplay("# Welcome to Staff Games!! 🔧"),
+            discord.ui.TextDisplay("# Staff Event Codes"),
             discord.ui.TextDisplay(description),
         ]
         if include_banner:
