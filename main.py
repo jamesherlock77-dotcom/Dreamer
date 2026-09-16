@@ -7471,12 +7471,6 @@ class BugReportLookedAtView(discord.ui.View):
         label="Looked At", emoji="👀", style=discord.ButtonStyle.success, custom_id="bugreport_lookedat_button"
     )
     async def looked_at(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not has_staff_role(interaction.user):
-            await interaction.response.send_message(
-                "Only staff can mark a bug report as looked at.", ephemeral=True
-            )
-            return
-
         if not interaction.message.embeds:
             await interaction.response.send_message("Couldn't find the report on this message.", ephemeral=True)
             return
@@ -7509,26 +7503,32 @@ class BugReportLookedAtView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-        try:
-            log_channel = bot.get_channel(BUG_REPORT_LOG_CHANNEL_ID) or await bot.fetch_channel(
-                BUG_REPORT_LOG_CHANNEL_ID
-            )
-            if log_channel is not None:
-                await log_channel.send(embed=embed)
-        except discord.HTTPException as e:
-            print(f"Failed to log looked-at bug report: {e}")
+
+def message_is_in_bug_report_channel(message: discord.Message) -> bool:
+    """True if the message was posted directly in one of BUG_REPORT_CHANNEL_IDS, or inside
+    a thread/forum post whose parent is one of them (e.g. the starter message of a new
+    post in a Forum channel — its channel.id is the thread's, not the forum's)."""
+    channel = message.channel
+    if channel.id in BUG_REPORT_CHANNEL_IDS:
+        return True
+    parent_id = getattr(channel, "parent_id", None)
+    return parent_id in BUG_REPORT_CHANNEL_IDS
 
 
 async def handle_potential_bug_report(message: discord.Message) -> None:
     """Checks a message posted in BUG_REPORT_CHANNEL_IDS against the Bug Report template
-    and, if it matches, posts a triage embed with a 'Looked At' button under it."""
+    and, if it matches, posts a triage embed with a 'Looked At' button into
+    BUG_REPORT_LOG_CHANNEL_ID."""
     report = parse_bug_report(message.content)
     if report is None:
         return
 
     embed = build_bug_report_embed(message, report)
     try:
-        await message.channel.send(embed=embed, view=BugReportLookedAtView())
+        log_channel = bot.get_channel(BUG_REPORT_LOG_CHANNEL_ID) or await bot.fetch_channel(
+            BUG_REPORT_LOG_CHANNEL_ID
+        )
+        await log_channel.send(embed=embed, view=BugReportLookedAtView())
     except discord.HTTPException as e:
         print(f"Failed to post bug report triage embed: {e}")
 
@@ -7592,7 +7592,7 @@ async def on_message(message: discord.Message):
     if (
         message.guild is not None
         and not message.author.bot
-        and message.channel.id in BUG_REPORT_CHANNEL_IDS
+        and message_is_in_bug_report_channel(message)
     ):
         try:
             await handle_potential_bug_report(message)
