@@ -59,6 +59,10 @@ TOURNAMENT_CLEAR_PURGE_CHANNEL_ID = 1533581676184076398  # fully purged when the
 TOURNAMENT_SIGNUP_CAP = 7                  # max sign-ups per team for the sticky tournament message
 TOURNAMENT_STICKY_DEBOUNCE_SECONDS = 5     # min gap between re-sticking a team's sign-up message, per channel
 
+# ---------- Bug report triage ----------
+BUG_REPORT_CHANNEL_IDS = {1549290697335767090, 1549892832565788723}  # scanned for the Bug Report template
+BUG_REPORT_LOG_CHANNEL_ID = 1549893135193342042  # "Looked At" reports are posted here for the record
+
 # ---------- Lurkr level role sync ----------
 # Thresholds checked highest-first: a member's target role is the first one whose
 # level requirement they meet or exceed. Update this list if the Lurkr level-role
@@ -7392,6 +7396,143 @@ async def _process_invite_tracker_message(message: discord.Message) -> None:
     await backup_invite_db_to_log_channel()
 
 
+# ---------- Bug report triage ----------
+# Matches the Bug Report template posted in BUG_REPORT_CHANNEL_IDS:
+#   Title:
+#   Description (explanation):
+#   Video Proof:
+#   Level (Big/Mid/Small):
+# Labels are matched case-insensitively and allow an optional parenthetical suffix
+# (e.g. "Description (explanation):" or "Level (Big/Mid/Small):"), since the exact
+# wording in parentheses can vary between reports.
+_BUG_REPORT_LABELS: dict[str, str] = {
+    "title": r"title",
+    "description": r"description(?:\s*\([^)]*\))?",
+    "video_proof": r"video\s*proof",
+    "level": r"level(?:\s*\([^)]*\))?",
+}
+_BUG_REPORT_LABEL_RE = re.compile(
+    rf"(?im)^[ \t]*(?:{'|'.join(_BUG_REPORT_LABELS.values())})[ \t]*:[ \t]*"
+)
+
+
+def parse_bug_report(content: str) -> dict[str, str] | None:
+    """Loosely parses a message against the Bug Report template above. Returns a dict with
+    title/description/video_proof/level, or None if title, description, and level aren't
+    all present (video_proof is optional — someone may not always attach proof)."""
+    matches = list(_BUG_REPORT_LABEL_RE.finditer(content))
+    if not matches:
+        return None
+
+    found: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        label_text = m.group(0)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        body = content[start:end].strip()
+        for name, sub_pattern in _BUG_REPORT_LABELS.items():
+            if re.match(rf"(?i)^[ \t]*(?:{sub_pattern})[ \t]*:", label_text) and name not in found:
+                found[name] = body
+                break
+
+    if not all(found.get(key) for key in ("title", "description", "level")):
+        return None
+    found.setdefault("video_proof", "")
+    return found
+
+
+def build_bug_report_embed(message: discord.Message, report: dict[str, str]) -> discord.Embed:
+    embed = discord.Embed(
+        title="🐛 New Bug Report",
+        colour=discord.Colour.orange(),
+        timestamp=message.created_at,
+        url=message.jump_url,
+    )
+    embed.add_field(name="Title", value=report["title"][:1024], inline=False)
+    embed.add_field(name="Description", value=report["description"][:1024], inline=False)
+    embed.add_field(name="Video Proof", value=report["video_proof"][:1024] or "—", inline=False)
+    embed.add_field(name="Level", value=report["level"][:1024], inline=False)
+    embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
+    embed.set_footer(text=f"Reported in #{message.channel}")
+    return embed
+
+
+class BugReportLookedAtView(discord.ui.View):
+    """Persistent 'Looked At' button attached under a freshly-detected bug report embed.
+    Uses a fixed custom_id (registered once via bot.add_view in on_ready) so it keeps
+    working across restarts; the original report message is recovered from the embed's
+    url (its jump link) rather than baked into the custom_id, since a per-message id
+    can't be re-registered as a persistent view after a restart."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Looked At", emoji="👀", style=discord.ButtonStyle.success, custom_id="bugreport_lookedat_button"
+    )
+    async def looked_at(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_staff_role(interaction.user):
+            await interaction.response.send_message(
+                "Only staff can mark a bug report as looked at.", ephemeral=True
+            )
+            return
+
+        if not interaction.message.embeds:
+            await interaction.response.send_message("Couldn't find the report on this message.", ephemeral=True)
+            return
+        embed = interaction.message.embeds[0]
+
+        report_message = None
+        if embed.url:
+            m = re.search(r"/channels/\d+/(\d+)/(\d+)", embed.url)
+            if m:
+                channel_id, message_id = int(m.group(1)), int(m.group(2))
+                try:
+                    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                    report_message = await channel.fetch_message(message_id)
+                except discord.HTTPException:
+                    report_message = None
+
+        await interaction.response.defer()
+
+        if report_message is not None:
+            try:
+                await report_message.add_reaction("✅")
+            except discord.HTTPException:
+                pass
+
+        button.disabled = True
+        embed.colour = discord.Colour.green()
+        embed.add_field(name="Looked At By", value=interaction.user.mention, inline=False)
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
+
+        try:
+            log_channel = bot.get_channel(BUG_REPORT_LOG_CHANNEL_ID) or await bot.fetch_channel(
+                BUG_REPORT_LOG_CHANNEL_ID
+            )
+            if log_channel is not None:
+                await log_channel.send(embed=embed)
+        except discord.HTTPException as e:
+            print(f"Failed to log looked-at bug report: {e}")
+
+
+async def handle_potential_bug_report(message: discord.Message) -> None:
+    """Checks a message posted in BUG_REPORT_CHANNEL_IDS against the Bug Report template
+    and, if it matches, posts a triage embed with a 'Looked At' button under it."""
+    report = parse_bug_report(message.content)
+    if report is None:
+        return
+
+    embed = build_bug_report_embed(message, report)
+    try:
+        await message.channel.send(embed=embed, view=BugReportLookedAtView())
+    except discord.HTTPException as e:
+        print(f"Failed to post bug report triage embed: {e}")
+
+
 class MemberCountView(discord.ui.LayoutView):
     """A Components V2 'container' — Discord's own rounded, accent-bordered card
     element — holding the live member count. Built fresh per send since the count
@@ -7447,6 +7588,16 @@ async def on_message(message: discord.Message):
             await _process_invite_tracker_message(message)
         except discord.HTTPException as e:
             print(f"Failed to process an invite tracker message: {e}")
+
+    if (
+        message.guild is not None
+        and not message.author.bot
+        and message.channel.id in BUG_REPORT_CHANNEL_IDS
+    ):
+        try:
+            await handle_potential_bug_report(message)
+        except discord.HTTPException as e:
+            print(f"Failed to process a potential bug report: {e}")
 
     if message.guild is not None and not message.author.bot:
         await maybe_restick_tournament_message(message)
@@ -8783,6 +8934,7 @@ async def on_ready():
     bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayView())
     bot.add_view(PrivacyPanelView())
+    bot.add_view(BugReportLookedAtView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
