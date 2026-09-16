@@ -7441,65 +7441,103 @@ def parse_bug_report(content: str) -> dict[str, str] | None:
     return found
 
 
-def build_bug_report_embed(message: discord.Message, report: dict[str, str]) -> discord.Embed:
-    embed = discord.Embed(
-        title="🐛 New Bug Report",
-        colour=discord.Colour.orange(),
-        timestamp=message.created_at,
-        url=message.jump_url,
-    )
-    embed.add_field(name="Title", value=report["title"][:1024], inline=False)
-    embed.add_field(name="Description", value=report["description"][:1024], inline=False)
-    embed.add_field(name="Video Proof", value=report["video_proof"][:1024] or "—", inline=False)
-    embed.add_field(name="Level", value=report["level"][:1024], inline=False)
-    embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
-    embed.set_footer(text=f"Reported in #{message.channel}")
-    return embed
+class BugReportView(discord.ui.LayoutView):
+    """Components V2 card for a detected bug report, styled like the bot's other panels
+    (MetaUpdateView, TicketThreadView) — a coloured container with the report laid out
+    plus a persistent 'Looked At' button.
 
+    Call with no arguments to get a placeholder used only to re-register the button's
+    custom_id after a restart (see on_ready). The button's own callback rebuilds the
+    view straight from the message's live components (LayoutView.from_message) rather
+    than relying on 'self', so a click still edits the real report content correctly
+    even when routed through that restart-only placeholder."""
 
-class BugReportLookedAtView(discord.ui.View):
-    """Persistent 'Looked At' button attached under a freshly-detected bug report embed.
-    Uses a fixed custom_id (registered once via bot.add_view in on_ready) so it keeps
-    working across restarts; the original report message is recovered from the embed's
-    url (its jump link) rather than baked into the custom_id, since a per-message id
-    can't be re-registered as a persistent view after a restart."""
+    LEVEL_STYLE = {
+        "big": ("🔴", discord.Colour.red()),
+        "mid": ("🟠", discord.Colour.orange()),
+        "small": ("🟢", discord.Colour.green()),
+    }
 
-    def __init__(self):
+    def __init__(self, message: discord.Message | None = None, report: dict[str, str] | None = None):
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Looked At", emoji="👀", style=discord.ButtonStyle.success, custom_id="bugreport_lookedat_button"
-    )
-    async def looked_at(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.message.embeds:
-            await interaction.response.send_message("Couldn't find the report on this message.", ephemeral=True)
-            return
-        embed = interaction.message.embeds[0]
+        button = discord.ui.Button(
+            label="Looked At", emoji="👀", style=discord.ButtonStyle.success, custom_id="bugreport_lookedat_button"
+        )
+        button.callback = self._on_looked_at
 
-        report_message = None
-        if embed.url:
-            m = re.search(r"/channels/\d+/(\d+)/(\d+)", embed.url)
-            if m:
-                channel_id, message_id = int(m.group(1)), int(m.group(2))
-                try:
-                    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-                    report_message = await channel.fetch_message(message_id)
-                except discord.HTTPException:
-                    report_message = None
+        if message is None or report is None:
+            self.add_item(discord.ui.Container(discord.ui.ActionRow(button)))
+            return
+
+        emoji, colour = self._level_style(report["level"])
+
+        children = [
+            discord.ui.TextDisplay(f"-# 🐛 Bug Report  •  {message.author}"),
+            discord.ui.TextDisplay(f"### {report['title']}"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f"**📝 Description**\n{report['description']}"),
+        ]
+        if report["video_proof"]:
+            children.append(discord.ui.TextDisplay(f"**🎥 Video Proof**\n{report['video_proof']}"))
+        children.append(discord.ui.TextDisplay(f"**{emoji} Level**\n{report['level']}"))
+        children.append(discord.ui.Separator())
+        children.append(discord.ui.ActionRow(button))
+        children.append(discord.ui.TextDisplay(f"-# [Jump to report]({message.jump_url})"))
+
+        self.add_item(discord.ui.Container(*children, accent_colour=colour))
+
+    @classmethod
+    def _level_style(cls, level_text: str) -> tuple[str, discord.Colour]:
+        key = level_text.strip().lower()
+        for name, style in cls.LEVEL_STYLE.items():
+            if name in key:
+                return style
+        return "⚪", discord.Colour.blurple()
+
+    async def _on_looked_at(self, interaction: discord.Interaction) -> None:
+        rebuilt = discord.ui.LayoutView.from_message(interaction.message, timeout=None)
+        button = discord.utils.find(
+            lambda item: isinstance(item, discord.ui.Button) and item.custom_id == "bugreport_lookedat_button",
+            rebuilt.walk_children(),
+        )
+        container = discord.utils.find(lambda item: isinstance(item, discord.ui.Container), rebuilt.children)
+        if button is None or container is None:
+            await interaction.response.send_message("Couldn't update this report.", ephemeral=True)
+            return
 
         await interaction.response.defer()
 
-        if report_message is not None:
+        # The jump link is the last text component — use it to find and tick the
+        # original report message.
+        jump_match = None
+        for item in rebuilt.walk_children():
+            if isinstance(item, discord.ui.TextDisplay) and "discord.com/channels/" in item.content:
+                jump_match = re.search(r"/channels/\d+/(\d+)/(\d+)", item.content)
+        if jump_match:
+            channel_id, message_id = int(jump_match.group(1)), int(jump_match.group(2))
             try:
+                channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+                report_message = await channel.fetch_message(message_id)
                 await report_message.add_reaction("✅")
             except discord.HTTPException:
                 pass
 
         button.disabled = True
-        embed.colour = discord.Colour.green()
-        embed.add_field(name="Looked At By", value=interaction.user.mention, inline=False)
+        button.style = discord.ButtonStyle.secondary
+        button.emoji = None
+        button.label = "Looked At ✓"
+        container.accent_colour = discord.Colour.greyple()
+
+        items = container.children  # a copy — safe to reorder before re-adding
+        row_index = next((i for i, item in enumerate(items) if isinstance(item, discord.ui.ActionRow)), len(items))
+        items.insert(row_index, discord.ui.TextDisplay(f"✅ **Looked at by** {interaction.user.mention}"))
+        container.clear_items()
+        for item in items:
+            container.add_item(item)
+
         try:
-            await interaction.message.edit(embed=embed, view=self)
+            await interaction.message.edit(view=rebuilt)
         except discord.HTTPException:
             pass
 
@@ -7517,20 +7555,19 @@ def message_is_in_bug_report_channel(message: discord.Message) -> bool:
 
 async def handle_potential_bug_report(message: discord.Message) -> None:
     """Checks a message posted in BUG_REPORT_CHANNEL_IDS against the Bug Report template
-    and, if it matches, posts a triage embed with a 'Looked At' button into
+    and, if it matches, posts a triage card with a 'Looked At' button into
     BUG_REPORT_LOG_CHANNEL_ID."""
     report = parse_bug_report(message.content)
     if report is None:
         return
 
-    embed = build_bug_report_embed(message, report)
     try:
         log_channel = bot.get_channel(BUG_REPORT_LOG_CHANNEL_ID) or await bot.fetch_channel(
             BUG_REPORT_LOG_CHANNEL_ID
         )
-        await log_channel.send(embed=embed, view=BugReportLookedAtView())
+        await log_channel.send(view=BugReportView(message, report))
     except discord.HTTPException as e:
-        print(f"Failed to post bug report triage embed: {e}")
+        print(f"Failed to post bug report triage card: {e}")
 
 
 class MemberCountView(discord.ui.LayoutView):
@@ -8934,7 +8971,7 @@ async def on_ready():
     bot.add_view(TournamentSignupView())
     bot.add_view(GiveawayView())
     bot.add_view(PrivacyPanelView())
-    bot.add_view(BugReportLookedAtView())
+    bot.add_view(BugReportView())
     await bot.tree.sync()
     try:
         await sync_existing_teams()
