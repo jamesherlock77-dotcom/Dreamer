@@ -15,7 +15,6 @@ import emoji as emoji_lib
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from playwright.async_api import async_playwright
 from PIL import Image, ImageDraw, ImageFont
 
 # Autocomplete responses can occasionally arrive after Discord has already invalidated
@@ -123,6 +122,17 @@ DATA_DELETE_REQUEST_CHANNEL_ID = 1544698404574072842  # "Delete My Data" request
 DATA_OPTOUT_LOG_CHANNEL_ID = 1544739792611319858  # activity-tracking opt-out JSON "database" message lives here
 DATA_OPTOUT_DB_FILE = "data_optout_data.json"
 
+# ---------- Content contest channel (TikTok/YouTube submissions only) ----------
+# One submission per person: a valid link gets reacted on and the author immediately loses
+# send-message perms in the channel so they can't post a second entry. /checkcontest tallies
+# non-accept-emoji reactions on every valid entry as "votes" for a top-10 leaderboard.
+CONTEST_CHANNEL_ID = 1553132574602432622        # submissions are posted/voted on here
+CONTEST_ACCEPT_EMOJI = "<:Icon:1528174744069869578>"  # reacted onto every accepted submission
+CONTEST_LINK_RE = re.compile(
+    r"https?://(?:[\w-]+\.)?(?:tiktok\.com|youtube\.com|youtu\.be)/\S+",
+    re.IGNORECASE,
+)
+
 TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
@@ -137,16 +147,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORT_BANNER_PATH = os.path.join(BASE_DIR, "support_banner.png")
 SUPPORT_BANNER_FILENAME = "support_banner.png"
 
-# ---------- Meta Quest update tracker config ----------
-META_UPDATE_CHANNEL_ID = 1528008387420356629  # where update announcements are posted
-META_LOG_CHANNEL_ID = 1535478538776608859     # last-logged-version JSON "database" message lives here
-META_URL = "https://www.meta.com/experiences/animal-company/7190422614401072/"
-META_VERSION_FILE = os.path.join(BASE_DIR, "lastMetaVersion.txt")  # legacy plaintext file — read only, for one-time migration
-META_VERSION_DB_FILE = "meta_version_data.json"
-META_CHECK_INTERVAL_MINUTES = 5  # how often to auto-check for a new version
-META_GAME_DISPLAY_NAME = "Wooster Games, Animal Company"  # bold subtitle line shown on the update embed
-META_EMBED_AUTHOR = "AC: Arena Hub"  # small eyebrow text shown above the embed title
-META_UPDATE_PING_ROLE_ID = 1528140472051040307  # pinged whenever a real update is detected
 
 # ---------- Weekly message leaderboard config ----------
 MESSAGE_LEADERBOARD_LOG_CHANNEL_ID = 1539159955922362369  # channel the leaderboard's JSON backup lives in
@@ -474,10 +474,9 @@ async def log_bot_event(
     """Sends one standardized embed to BOT_LOG_CHANNEL_ID — the global bot activity log.
     Covers every slash command run (via on_app_command_completion), every JSON db sync
     (backup/restore, hooked in _backup_file_to_channel / _restore_file_from_channel below,
-    so it automatically covers teams, giveaways, tickets, invites, scrims, and the meta
-    version file), and startup/restart (on_ready). Fire-and-forget: any failure here is
-    printed and swallowed so a logging hiccup never breaks the actual action that triggered
-    it."""
+    so it automatically covers teams, giveaways, tickets, invites, and scrims), and
+    startup/restart (on_ready). Fire-and-forget: any failure here is printed and swallowed
+    so a logging hiccup never breaks the actual action that triggered it."""
     try:
         channel = bot.get_channel(BOT_LOG_CHANNEL_ID) or await bot.fetch_channel(BOT_LOG_CHANNEL_ID)
         if channel is None:
@@ -994,7 +993,7 @@ SUPPORT_PANEL_TITLE = "Discord Support System"
 
 
 class SupportPanelView(discord.ui.LayoutView):
-    """A Components V2 container styled like MetaUpdateView elsewhere in
+    """A Components V2 container styled like other layout-view panels elsewhere in
     the bot — accent-bordered card with a title, rules, category dropdown, and the hub
     banner, instead of the old plain embed + separate View."""
 
@@ -1056,7 +1055,7 @@ class SupportPanelView(discord.ui.LayoutView):
 
 # ---------- Persistent "Close" button attached to every ticket thread's first message ----------
 class TicketThreadView(discord.ui.LayoutView):
-    """A Components V2 container styled like MetaUpdateView elsewhere in
+    """A Components V2 container styled like other layout-view panels elsewhere in
     the bot — replaces the old Embed + separate TicketCloseView with one native container
     holding the ticket details and the Close button together.
 
@@ -3721,340 +3720,104 @@ async def before_check_scrim_expiry():
 
 
 # ============================================================
-# META QUEST UPDATE TRACKER — watches the Animal Company store
-# page and posts an embed to META_UPDATE_CHANNEL_ID whenever the
-# version number changes.
+# CONTENT CONTEST CHANNEL — CONTEST_CHANNEL_ID only accepts
+# TikTok/YouTube links, one submission per person, voted on via
+# reactions and tallied by /checkcontest.
 # ============================================================
 
-def load_last_meta_version() -> str | None:
-    data = _load_json_file(META_VERSION_DB_FILE)
-    if data is not None:
-        return data.get("last_version") or None
-
-    # One-time migration: an older build of this bot stored the version as plain text
-    # in META_VERSION_FILE with no channel backup at all, so a redeploy silently wiped
-    # it (Railway wipes the container's disk on every redeploy). If that legacy file is
-    # still lying around locally, read it once so this rollout doesn't fire a spurious
-    # "update detected" — save_last_meta_version() below will write the JSON version.
-    if os.path.exists(META_VERSION_FILE):
-        with open(META_VERSION_FILE, "r", encoding="utf-8") as f:
-            v = f.read().strip()
-        return v or None
-
-    return None
-
-
-def save_last_meta_version(version: str) -> None:
-    _atomic_write_json(
-        META_VERSION_DB_FILE,
-        {"last_version": version, "last_updated": discord.utils.utcnow().isoformat()},
-    )
-
-
-async def backup_meta_version_to_log_channel():
-    try:
-        await _backup_file_to_channel(META_LOG_CHANNEL_ID, META_VERSION_DB_FILE, META_VERSION_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to back up meta version db to log channel: {e}")
-    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill the poll loop
-        print(f"Unexpected error backing up meta version db: {e}")
-
-
-async def restore_meta_version_from_log_channel():
-    """Pulls the last-logged version JSON from META_LOG_CHANNEL_ID into local storage on
-    startup — critical because Railway wipes the container's disk on every redeploy,
-    the same reason teams/giveaways/tickets are backed up this way. Falls back to
-    migrating the legacy local .txt file (if present) and immediately pushing a fresh
-    backup, so no previously-known version is lost."""
-    if _load_json_file(META_VERSION_DB_FILE) is not None:
-        # Local data already present (e.g. a crash-restart, not a fresh container) —
-        # push it straight to the log channel so the backup there is confirmed up to date.
-        await backup_meta_version_to_log_channel()
-        return
-
-    try:
-        found = await _restore_file_from_channel(META_LOG_CHANNEL_ID, META_VERSION_DB_FILE, META_VERSION_DB_FILE)
-    except discord.HTTPException as e:
-        print(f"Failed to restore meta version db from log channel: {e}")
-        found = False
-
-    if found:
-        print("Restored last-logged Meta version from log channel backup.")
-        return
-
-    # No backup in the channel yet — fall back to the legacy local .txt file, if any,
-    # migrate it into the JSON format, and push the first backup right away.
-    if os.path.exists(META_VERSION_FILE):
-        with open(META_VERSION_FILE, "r", encoding="utf-8") as f:
-            legacy_version = f.read().strip()
-        if legacy_version:
-            save_last_meta_version(legacy_version)
-            await backup_meta_version_to_log_channel()
-            print("Migrated last-logged Meta version from the legacy local file.")
-            return
-
-    print("No existing last-logged Meta version found — starting fresh.")
-
-
-def _sanitize_version_text(text: str | None, max_len: int = 1000) -> str | None:
-    """Remove HTML tags, collapse whitespace, and truncate to max_len."""
-    if text is None:
-        return None
-    s = str(text)
-    # Remove obvious HTML tags if present
-    s = re.sub(r"<[^>]+>", "", s)
-    # Collapse whitespace
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(s) > max_len:
-        return s[: max_len - 1] + "…"
-    return s
-
-
-# Only accepts an actual version-number shape (e.g. "1.85.2.3320") immediately after the
-# word "Version" — NOT just any text. The raw (pre-JS-render) HTML aiohttp fetches below
-# often contains the literal word "version" buried in unrelated embedded JS/config blobs
-# (analytics config, DTSG tokens, etc.); a loose regex would grab whatever text follows
-# THAT instead of the real game version, and since *a* match was found the old code
-# returned immediately without ever trying the reliable Playwright (real browser) path.
-# Requiring a numeric X.Y[.Z[.W]] shape makes false positives on that kind of JS/JSON
-# noise extremely unlikely, so a non-match here correctly falls through to Playwright.
-_VERSION_NUMBER_RE = re.compile(r"\bVersion\b[:\s\-–—]*([0-9]+(?:\.[0-9]+){1,4})", re.IGNORECASE)
-
-
-async def fetch_meta_version() -> str | None:
-    """Try to fetch the Meta store page and scrape the 'Version' text.
-    First tries a lightweight aiohttp request + a strict version-number regex; falls back
-    to Playwright (which renders the page's JS, same as a real browser) whenever that
-    strict match isn't found — which, since the store page is client-rendered, is the
-    common case. Returns the sanitized, truncated version string or None on failure.
-    """
-    # 1) Try aiohttp + a strict regex (fast, avoids needing Playwright / a browser on
-    # Railway) — but only trust it if it actually looks like a version number.
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AC-UpdateBot/1.0; +https://example.org/bot)"
-        }
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(META_URL) as resp:
-                if resp.status != 200:
-                    print(f"[DEBUG] fetch_meta_version: HTTP {resp.status} from {META_URL}")
-                else:
-                    text = await resp.text()
-                    m = _VERSION_NUMBER_RE.search(text)
-                    if m:
-                        return _sanitize_version_text(m.group(1), max_len=100)
-                    print(
-                        "[DEBUG] fetch_meta_version: no version-number-shaped match in the raw "
-                        "HTML (expected — the page is client-rendered) — falling back to Playwright."
-                    )
-    except Exception as e:
-        print(f"[DEBUG] aiohttp attempt failed: {e}")
-
-    # 2) Fallback to Playwright (only if aiohttp didn't find it)
-    try:
-        async with async_playwright() as p:
-            # --no-sandbox helps in many restricted containers; if it causes issues remove it.
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            page = await browser.new_page()
-            try:
-                await page.goto(META_URL, wait_until="networkidle", timeout=20000)
-            except Exception:
-                # Some pages never hit networkidle; retry without waiting for networkidle
-                try:
-                    await page.goto(META_URL, timeout=20000)
-                except Exception as e:
-                    await browser.close()
-                    print(f"[ERROR] Playwright failed to navigate to {META_URL}: {e}")
-                    return None
-
-            try:
-                version = await page.evaluate(
-                    """() => {
-                        // Only accept an actual version-number shape (e.g. "1.85.2.3320")
-                        // right after the word "Version" — same strictness as the aiohttp
-                        // regex, so a stray "version" elsewhere on the page can't be
-                        // mistaken for the real one.
-                        const versionShape = /^[:\s\-\u2013\u2014]*([0-9]+(?:\.[0-9]+){1,4})/;
-                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-                        let node;
-                        while (node = walker.nextNode()) {
-                            const t = node.textContent.trim();
-                            if (!t) continue;
-                            const idx = t.toLowerCase().indexOf('version');
-                            if (idx !== -1) {
-                                const after = t.slice(idx + 'version'.length);
-                                const match = after.match(versionShape);
-                                if (match) return match[1];
-                            }
-                        }
-                        const divs = [...document.querySelectorAll('div, span, p')];
-                        for (const el of divs) {
-                            const t = (el.innerText || '').trim();
-                            if (t.toLowerCase().startsWith('version')) {
-                                const match = t.slice('version'.length).match(versionShape);
-                                if (match) return match[1];
-                            }
-                        }
-                        return null;
-                    }"""
-                )
-            finally:
-                await browser.close()
-            return _sanitize_version_text(version, max_len=100)
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch Meta version (Playwright): {e}")
-        return None
-
-
-class MetaUpdateView(discord.ui.LayoutView):
-    """A Components V2 container styled like the old 'Update Detected!' embed — same
-    author eyebrow, title, timestamp/game name, two version fields, and (if the banner
-    was scraped) the banner image, just built out of native container components.
-    If ping_role_id is given, the role mention is included as its own component at the
-    top of the container, since Components V2 messages can't use a top-level content field."""
-
-    def __init__(
-        self,
-        current: str,
-        previous: str | None,
-        detected_ts: int,
-        include_banner: bool,
-        ping_role_id: int | None = None,
-    ):
-        super().__init__(timeout=None)
-        current_display = _sanitize_version_text(current, max_len=1000) or "Unknown"
-        previous_display = _sanitize_version_text(previous or current, max_len=1000) or "Unknown"
-
-        children = []
-        if ping_role_id is not None:
-            # Components V2 messages can't carry a top-level `content` field, so the
-            # role ping has to live inside the container as its own text component —
-            # putting it in `content` alongside a LayoutView makes Discord reject the send.
-            children.append(discord.ui.TextDisplay(f"<@&{ping_role_id}>"))
-        children += [
-            discord.ui.TextDisplay(f"-# {META_EMBED_AUTHOR}"),
-            discord.ui.TextDisplay(
-                f"# Update Detected!\n<t:{detected_ts}:F> ( <t:{detected_ts}:R> )\n**{META_GAME_DISPLAY_NAME}**"
-            ),
-            discord.ui.Separator(),
-            discord.ui.TextDisplay(f"🟢 | **Updated Version:**\n```{current_display}```"),
-            discord.ui.TextDisplay(f"🔴 | **Last Logged:**\n```{previous_display}```"),
-        ]
-        if include_banner:
-            children.append(
-                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{SUPPORT_BANNER_FILENAME}"))
+async def handle_contest_submission(message: discord.Message) -> None:
+    """Enforces the content-contest channel. A message that doesn't contain a TikTok or
+    YouTube link is deleted outright. A message that does gets the acceptance reaction and
+    the author immediately loses send-message permission in the channel, so everyone gets
+    exactly one entry."""
+    if not CONTEST_LINK_RE.search(message.content):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        try:
+            await message.channel.send(
+                f"{message.author.mention} only TikTok or YouTube links are allowed in "
+                f"this channel — your message was removed.",
+                delete_after=8,
             )
-
-        container = discord.ui.Container(*children)
-        self.add_item(container)
-
-
-async def check_for_meta_update() -> tuple[bool, str | None, str | None]:
-    """Checks the store for a new version and, if it changed, posts the update container
-    (with support_banner.png attached, same image used on the ticket panel and giveaway
-    embeds) to META_UPDATE_CHANNEL_ID. Returns (changed, current_version, previous_version)."""
-    previous = load_last_meta_version()
-    current = await fetch_meta_version()
-
-    if current and current != previous:
-        save_last_meta_version(current)
-        await backup_meta_version_to_log_channel()
-        channel = bot.get_channel(META_UPDATE_CHANNEL_ID) or await bot.fetch_channel(META_UPDATE_CHANNEL_ID)
-        if channel:
-            detected_ts = int(discord.utils.utcnow().timestamp())
-
-            file = None
-            include_banner = os.path.exists(SUPPORT_BANNER_PATH)
-            if include_banner:
-                file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
-            else:
-                print(f"Support banner image missing at {SUPPORT_BANNER_PATH} — update message sent without image.")
-
-            view = MetaUpdateView(current, previous, detected_ts, include_banner, ping_role_id=META_UPDATE_PING_ROLE_ID)
-
-            try:
-                if file is not None:
-                    await channel.send(view=view, file=file)
-                else:
-                    await channel.send(view=view)
-            except discord.HTTPException as e:
-                # If the container fails (still too large or otherwise invalid), fall back to a plaintext summary.
-                print(f"[ERROR] Failed to send meta update message: {e}")
-                try:
-                    short_current = _sanitize_version_text(current, max_len=800)
-                    short_previous = _sanitize_version_text(previous or current, max_len=800)
-                    fallback_msg = (
-                        f"<@&{META_UPDATE_PING_ROLE_ID}> Meta Update Detected!\n\nUpdated Version: {short_current}\n"
-                        f"Last Logged: {short_previous or 'None'}"
-                    )
-                    await channel.send(content=fallback_msg)
-                except Exception as e2:
-                    print(f"[ERROR] Failed to send fallback meta update message: {e2}")
-        return True, current, previous
-
-    return False, current, previous
-
-
-@tasks.loop(minutes=META_CHECK_INTERVAL_MINUTES)
-async def meta_poll_loop():
-    await check_for_meta_update()
-
-
-@meta_poll_loop.before_loop
-async def before_meta_poll_loop():
-    await bot.wait_until_ready()
-
-
-@bot.tree.command(name="checkupdate", description="Checks for an Animal Company update manually")
-async def checkupdate(interaction: discord.Interaction):
-    await interaction.response.defer()
-    changed, current, previous = await check_for_meta_update()
-
-    if current is None:
-        await interaction.followup.send("⚠️ Couldn't fetch the version from the Meta store page.")
+        except discord.HTTPException:
+            pass
         return
 
-    if changed:
-        await interaction.followup.send(
-            f"✅ Update detected!\nCurrent: `{current}`\nPrevious: `{previous or 'None'}`"
-        )
-    else:
-        await interaction.followup.send(f"No update detected.\nCurrent: `{current}`")
+    try:
+        await message.add_reaction(CONTEST_ACCEPT_EMOJI)
+    except discord.HTTPException as e:
+        print(f"[ERROR] Failed to react to contest submission {message.id}: {e}")
+
+    if isinstance(message.author, discord.Member):
+        try:
+            overwrite = message.channel.overwrites_for(message.author)
+            overwrite.send_messages = False
+            await message.channel.set_permissions(
+                message.author,
+                overwrite=overwrite,
+                reason="Contest entry accepted — one submission per person",
+            )
+        except discord.HTTPException as e:
+            print(f"[ERROR] Failed to lock {message.author} out of the contest channel: {e}")
 
 
 @bot.tree.command(
-    name="updateembed",
-    description="(Staff) Preview the update message's current look — doesn't save anything",
+    name="checkcontest",
+    description="(Staff) Show the top 10 most-voted contest entries",
 )
-async def updateembed(interaction: discord.Interaction):
+async def checkcontest(interaction: discord.Interaction):
+    if not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
     await interaction.response.defer()
 
-    if not has_staff_role(interaction.user):
-        await interaction.followup.send("You don't have permission to use this command.", ephemeral=True)
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command can only be used in a server.")
         return
 
-    current = await fetch_meta_version()
-    if current is None:
-        await interaction.followup.send(
-            "⚠️ Couldn't fetch the version from the Meta store page — nothing to preview.", ephemeral=True
-        )
+    try:
+        channel = guild.get_channel(CONTEST_CHANNEL_ID) or await guild.fetch_channel(CONTEST_CHANNEL_ID)
+    except discord.HTTPException:
+        await interaction.followup.send("Couldn't find the contest channel — check CONTEST_CHANNEL_ID.")
         return
 
-    previous = load_last_meta_version()
-    detected_ts = int(discord.utils.utcnow().timestamp())
+    entries: list[tuple[int, discord.Message]] = []
+    try:
+        async for msg in channel.history(limit=None):
+            if msg.author.bot or not CONTEST_LINK_RE.search(msg.content):
+                continue
+            # Every valid entry carries the acceptance reaction, so it's excluded from the
+            # tally — only other reactions count as votes.
+            votes = sum(r.count for r in msg.reactions if str(r.emoji) != CONTEST_ACCEPT_EMOJI)
+            entries.append((votes, msg))
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Couldn't read the contest channel's history: {e}")
+        return
 
-    file = None
-    include_banner = os.path.exists(SUPPORT_BANNER_PATH)
-    if include_banner:
-        file = discord.File(SUPPORT_BANNER_PATH, filename=SUPPORT_BANNER_FILENAME)
+    if not entries:
+        await interaction.followup.send("No contest entries found in that channel yet.")
+        return
 
-    view = MetaUpdateView(current, previous, detected_ts, include_banner)
+    entries.sort(key=lambda pair: pair[0], reverse=True)
+    top = entries[:10]
 
-    if file is not None:
-        await interaction.followup.send(view=view, file=file)
-    else:
-        await interaction.followup.send(view=view)
+    lines = [
+        f"**{i}.** {votes} vote{'s' if votes != 1 else ''} — {msg.author.mention} — "
+        f"[Jump to message]({msg.jump_url})"
+        for i, (votes, msg) in enumerate(top, start=1)
+    ]
+    embed = discord.Embed(
+        title="🏆 Top 10 Contest Entries",
+        description="\n".join(lines),
+        colour=discord.Colour.gold(),
+        timestamp=discord.utils.utcnow(),
+    )
+    await interaction.followup.send(embed=embed)
+
 
 
 # ============================================================
@@ -6155,8 +5918,8 @@ async def createteam(interaction: discord.Interaction, name: str, emoji: str, co
 
 class TeamMembersView(discord.ui.LayoutView):
     """A Components V2 container listing a team's members, styled to match
-    MetaUpdateView/MemberCountView elsewhere in the bot — accent-bordered card
-    instead of a plain embed."""
+    MemberCountView elsewhere in the bot — accent-bordered card instead of a plain
+    embed."""
 
     def __init__(self, key: str, info: dict, role: discord.Role):
         super().__init__(timeout=None)
@@ -7443,8 +7206,8 @@ def parse_bug_report(content: str) -> dict[str, str] | None:
 
 class BugReportView(discord.ui.LayoutView):
     """Components V2 card for a detected bug report, styled like the bot's other panels
-    (MetaUpdateView, TicketThreadView) — a coloured container with the report laid out
-    plus a persistent 'Looked At' button.
+    (TicketThreadView) — a coloured container with the report laid out plus a persistent
+    'Looked At' button.
 
     Call with no arguments to get a placeholder used only to re-register the button's
     custom_id after a restart (see on_ready). The button's own callback rebuilds the
@@ -7586,6 +7349,17 @@ class MemberCountView(discord.ui.LayoutView):
 
 @bot.event
 async def on_message(message: discord.Message):
+    if (
+        message.guild is not None
+        and message.channel.id == CONTEST_CHANNEL_ID
+        and not message.author.bot
+    ):
+        try:
+            await handle_contest_submission(message)
+        except discord.HTTPException as e:
+            print(f"Failed to process a contest submission: {e}")
+        return
+
     if (
         message.guild is not None
         and message.channel.id == SCHEDULE_PING_CHANNEL_ID
@@ -8953,7 +8727,6 @@ async def on_ready():
     _leaderboard_log_asset_status()
     await restore_db_from_log_channel()
     await restore_ticket_db_from_log_channel()
-    await restore_meta_version_from_log_channel()
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
     await restore_message_leaderboard_from_log_channel()
@@ -9003,8 +8776,6 @@ async def on_ready():
         print(f"Failed to backfill tournament sticky messages: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
-    if not meta_poll_loop.is_running():
-        meta_poll_loop.start()
     if not check_scrim_expiry.is_running():
         check_scrim_expiry.start()
     if not message_leaderboard_save_loop.is_running():
