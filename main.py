@@ -3735,14 +3735,6 @@ async def handle_contest_submission(message: discord.Message) -> None:
             await message.delete()
         except discord.HTTPException:
             pass
-        try:
-            await message.channel.send(
-                f"{message.author.mention} only TikTok or YouTube links are allowed in "
-                f"this channel — your message was removed.",
-                delete_after=8,
-            )
-        except discord.HTTPException:
-            pass
         return
 
     try:
@@ -3790,9 +3782,15 @@ async def checkcontest(interaction: discord.Interaction):
         async for msg in channel.history(limit=None):
             if msg.author.bot or not CONTEST_LINK_RE.search(msg.content):
                 continue
-            # Every valid entry carries the acceptance reaction, so it's excluded from the
-            # tally — only other reactions count as votes.
-            votes = sum(r.count for r in msg.reactions if str(r.emoji) != CONTEST_ACCEPT_EMOJI)
+            # The bot's own acceptance reaction sits on every valid entry, so its count is
+            # off by one — subtract that, but still count any real votes people cast using
+            # that same emoji (it's the easiest one to click). Other emoji reactions count
+            # in full.
+            votes = sum(
+                (r.count - 1) if str(r.emoji) == CONTEST_ACCEPT_EMOJI else r.count
+                for r in msg.reactions
+            )
+            votes = max(votes, 0)
             entries.append((votes, msg))
     except discord.HTTPException as e:
         await interaction.followup.send(f"Couldn't read the contest channel's history: {e}")
