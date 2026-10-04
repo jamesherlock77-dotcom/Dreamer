@@ -133,6 +133,14 @@ CONTEST_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------- Message log (every message in these categories is mirrored to one channel) ----------
+MESSAGE_LOG_CHANNEL_ID = 1556382089958654083
+MESSAGE_LOG_CATEGORY_IDS = {
+    1528007239929958564,
+    TEAM_CATEGORY_ID,
+    TEAM_CATEGORY_OVERFLOW_ID,
+}
+
 TEAM_LEAVE_EMOJI = "<:Capybara:1528229276254470144>"  # posted in the team channel when someone leaves/is kicked
 
 TEAMS_DB_FILE = "teams_data.json"
@@ -7345,8 +7353,63 @@ class MemberCountView(discord.ui.LayoutView):
         self.add_item(container)
 
 
+_message_log_queue: asyncio.Queue = asyncio.Queue()
+_message_log_task: asyncio.Task | None = None
+
+
+def _message_category_id(message: discord.Message) -> int | None:
+    """Category of the message's channel (for threads, the parent channel's category)."""
+    channel = message.channel
+    if isinstance(channel, discord.Thread):
+        channel = channel.parent
+    return getattr(channel, "category_id", None)
+
+
+async def _message_log_worker() -> None:
+    # One worker sends sequentially so busy channels don't blast Discord's rate limits.
+    while True:
+        message = await _message_log_queue.get()
+        try:
+            log_channel = bot.get_channel(MESSAGE_LOG_CHANNEL_ID) or await bot.fetch_channel(MESSAGE_LOG_CHANNEL_ID)
+
+            text = message.content or ""
+            if message.attachments:
+                text += "\n" + "\n".join(a.url for a in message.attachments)
+
+            embed = discord.Embed(
+                description=text[:3500] or "*no text*",
+                colour=discord.Colour.dark_grey(),
+                timestamp=message.created_at,
+            )
+            embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)", inline=True)
+            embed.add_field(name="Channel", value=f"{message.channel.mention} (`{message.channel.id}`)", inline=True)
+            embed.add_field(name="Link", value=f"[Jump to message]({message.jump_url})", inline=True)
+
+            await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:  # noqa: BLE001 - a logging failure must never kill the worker
+            print(f"[ERROR] Failed to log message {message.id}: {e!r}")
+        finally:
+            _message_log_queue.task_done()
+
+
+def queue_message_log(message: discord.Message) -> None:
+    global _message_log_task
+    if _message_log_task is None or _message_log_task.done():
+        _message_log_task = asyncio.create_task(_message_log_worker())
+    _message_log_queue.put_nowait(message)
+
+
 @bot.event
 async def on_message(message: discord.Message):
+    # Mirror every message in the logged categories. Placed first because several branches
+    # below return early (contest channel, .membercount, @everyone filter).
+    if (
+        message.guild is not None
+        and not message.author.bot
+        and _message_category_id(message) in MESSAGE_LOG_CATEGORY_IDS
+    ):
+        queue_message_log(message)
+
     if (
         message.guild is not None
         and message.channel.id == CONTEST_CHANNEL_ID
