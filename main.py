@@ -444,6 +444,260 @@ async def backup_db_to_log_channel():
     await _backup_file_to_channel(GIVEAWAY_LOG_CHANNEL_ID, GIVEAWAYS_DB_FILE, GIVEAWAYS_DB_FILE)
 
 
+# ---------- Database-channel protection: auto-recreate + channel ID registry ----------
+# Every channel that holds a JSON "database" message (teams, giveaways, tickets, invites,
+# scrims, opt-outs, both message leaderboards, streaks) is watched. If one is deleted it is
+# recreated straight away in DB_CHANNEL_CATEGORY_ID (same name/topic/permissions) and its JSON
+# file is re-posted from the saved copy. A recreated channel gets a NEW ID, so the current IDs
+# are kept in CHANNEL_REGISTRY_FILE, posted as an auto-updated message in
+# CHANNEL_REGISTRY_CHANNEL_ID, and applied over the hardcoded constants on every startup.
+CHANNEL_REGISTRY_CHANNEL_ID = 1559237638173622383  # the channel-ID registry JSON message lives here
+CHANNEL_REGISTRY_FILE = "channel_registry.json"
+DB_CHANNEL_CATEGORY_ID = 1528514812663955547       # recreated database channels are placed in this category
+
+# constant name -> (JSON file kept in that channel, name of a function that flushes in-memory
+# state to that file first, or None when the file on disk is always current)
+DB_CHANNEL_SPECS = {
+    "TEAM_LOG_CHANNEL_ID": (TEAMS_DB_FILE, None),
+    "GIVEAWAY_LOG_CHANNEL_ID": (GIVEAWAYS_DB_FILE, None),
+    "TICKET_LOG_CHANNEL_ID": (TICKETS_DB_FILE, None),
+    "INVITE_LOG_CHANNEL_ID": (INVITES_DB_FILE, None),
+    "SCRIM_LOG_CHANNEL_ID": (SCRIMS_DB_FILE, None),
+    "DATA_OPTOUT_LOG_CHANNEL_ID": (DATA_OPTOUT_DB_FILE, None),
+    "MESSAGE_LEADERBOARD_LOG_CHANNEL_ID": (MESSAGE_LEADERBOARD_DB_FILE, "save_message_leaderboard_db"),
+    "OVERALL_MESSAGE_LOG_CHANNEL_ID": (OVERALL_MESSAGE_DB_FILE, "save_overall_message_db"),
+    "STREAK_LOG_CHANNEL_ID": (STREAK_DB_FILE, "save_streak_db"),
+    "CHANNEL_REGISTRY_CHANNEL_ID": (CHANNEL_REGISTRY_FILE, None),
+}
+
+# constant name -> {"id", "name", "file", "topic", "slowmode", "nsfw", "overwrites"} for each database channel
+_channel_registry: dict = {}
+
+# Serialises recreations so a startup check and a delete event can't both rebuild the same channel.
+_db_channel_recreate_lock = asyncio.Lock()
+
+
+def _serialize_overwrites(channel) -> list:
+    entries = []
+    for target, overwrite in getattr(channel, "overwrites", {}).items():
+        allow, deny = overwrite.pair()
+        entries.append({
+            "id": target.id,
+            "type": "role" if isinstance(target, discord.Role) else "member",
+            "allow": allow.value,
+            "deny": deny.value,
+        })
+    return entries
+
+
+def _deserialize_overwrites(guild: discord.Guild, entries: list) -> dict:
+    result = {}
+    for entry in entries or []:
+        target = guild.get_role(entry["id"]) if entry.get("type") == "role" else guild.get_member(entry["id"])
+        if target is None:
+            continue
+        result[target] = discord.PermissionOverwrite.from_pair(
+            discord.Permissions(entry.get("allow", 0)), discord.Permissions(entry.get("deny", 0))
+        )
+    return result
+
+
+def _snapshot_db_channel(const_name: str, channel) -> dict:
+    return {
+        "id": channel.id,
+        "name": channel.name,
+        "file": DB_CHANNEL_SPECS[const_name][0],
+        "topic": getattr(channel, "topic", None),
+        "slowmode": getattr(channel, "slowmode_delay", 0),
+        "nsfw": getattr(channel, "nsfw", False),
+        "overwrites": _serialize_overwrites(channel),
+    }
+
+
+def _db_guild():
+    category = bot.get_channel(DB_CHANNEL_CATEGORY_ID)
+    if category is not None:
+        return category.guild
+    return bot.guilds[0] if bot.guilds else None
+
+
+async def _save_and_backup_channel_registry() -> None:
+    """Writes the registry locally, then edits the registry channel's message in place."""
+    _atomic_write_json(
+        CHANNEL_REGISTRY_FILE,
+        {"channels": _channel_registry, "last_updated": discord.utils.utcnow().isoformat()},
+    )
+    try:
+        await _backup_file_to_channel(CHANNEL_REGISTRY_CHANNEL_ID, CHANNEL_REGISTRY_FILE, CHANNEL_REGISTRY_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up channel registry: {e}")
+
+
+async def load_channel_registry_and_apply() -> None:
+    """Startup step 1 (before any database restore): loads the registry (from disk, or from
+    the registry channel if the disk was wiped) and rebinds every database-channel constant to
+    the ID recorded there, so a channel recreated before a redeploy is still found afterwards."""
+    data = _load_json_file(CHANNEL_REGISTRY_FILE)
+    if data is None:
+        await _restore_file_from_channel(CHANNEL_REGISTRY_CHANNEL_ID, CHANNEL_REGISTRY_FILE, CHANNEL_REGISTRY_FILE)
+        data = _load_json_file(CHANNEL_REGISTRY_FILE)
+    _channel_registry.clear()
+    for const_name, entry in ((data or {}).get("channels") or {}).items():
+        if const_name in DB_CHANNEL_SPECS and isinstance(entry, dict) and isinstance(entry.get("id"), int):
+            _channel_registry[const_name] = entry
+            globals()[const_name] = entry["id"]
+
+
+async def ensure_db_channels() -> None:
+    """Startup step 2 (after the database restores): recreates any database channel that was
+    deleted while the bot was offline, and refreshes the registry with every current ID."""
+    for const_name in DB_CHANNEL_SPECS:
+        channel_id = globals()[const_name]
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                channel = None
+            except discord.HTTPException as e:
+                print(f"Couldn't verify database channel {const_name} ({channel_id}): {e}")
+                continue  # transient/permission error — never recreate on a maybe
+        if channel is None:
+            try:
+                await _recreate_db_channel(const_name, reason="channel was missing at startup")
+            except Exception as e:  # noqa: BLE001
+                print(f"Failed to recreate database channel {const_name}: {e!r}")
+        else:
+            _channel_registry[const_name] = _snapshot_db_channel(const_name, channel)
+    await _save_and_backup_channel_registry()
+
+
+async def _find_channel_deleter(guild: discord.Guild, channel_id: int):
+    try:
+        async for entry in guild.audit_logs(limit=10, action=discord.AuditLogAction.channel_delete):
+            if getattr(entry.target, "id", None) == channel_id:
+                return entry.user
+    except discord.HTTPException:
+        pass
+    return None
+
+
+async def _recreate_db_channel(const_name: str, deleted_channel=None, reason: str = "") -> None:
+    async with _db_channel_recreate_lock:
+        file_name, flush_name = DB_CHANNEL_SPECS[const_name]
+        old_id = globals()[const_name]
+        if deleted_channel is not None and deleted_channel.id != old_id:
+            return  # already recreated by another task
+
+        guild = deleted_channel.guild if deleted_channel is not None else _db_guild()
+        if guild is None:
+            print(f"Can't recreate {const_name}: no guild available.")
+            return
+
+        snap = _channel_registry.get(const_name, {})
+        source = deleted_channel
+        name = (source.name if source is not None else snap.get("name")) or const_name.lower().replace("_", "-")
+        topic = source.topic if source is not None else snap.get("topic")
+        slowmode = source.slowmode_delay if source is not None else snap.get("slowmode", 0)
+        nsfw = source.nsfw if source is not None else snap.get("nsfw", False)
+        overwrites = (
+            source.overwrites if source is not None else _deserialize_overwrites(guild, snap.get("overwrites"))
+        )
+
+        category = guild.get_channel(DB_CHANNEL_CATEGORY_ID)
+        if not isinstance(category, discord.CategoryChannel):
+            category = getattr(source, "category", None)
+
+        kwargs = {"name": name, "topic": topic, "slowmode_delay": slowmode or 0, "nsfw": bool(nsfw),
+                  "reason": f"Database channel recreated: {reason or 'deleted'}"}
+        if category is not None:
+            kwargs["category"] = category
+        if overwrites:
+            kwargs["overwrites"] = overwrites  # keeps the original permissions; otherwise the category's apply
+
+        new_channel = await guild.create_text_channel(**kwargs)
+
+        globals()[const_name] = new_channel.id
+        _db_message_cache.pop(old_id, None)
+        _db_message_locks.pop(old_id, None)
+        _channel_registry[const_name] = _snapshot_db_channel(const_name, new_channel)
+
+        reposted = False
+        if const_name != "CHANNEL_REGISTRY_CHANNEL_ID":
+            flush = globals().get(flush_name) if flush_name else None
+            if flush is not None:
+                try:
+                    flush()
+                except Exception as e:  # noqa: BLE001
+                    print(f"Couldn't flush in-memory state for {file_name} before re-posting: {e!r}")
+            if _load_json_file(file_name) is not None:
+                try:
+                    await _backup_file_to_channel(new_channel.id, file_name, file_name)
+                    reposted = True
+                except discord.HTTPException as e:
+                    print(f"Failed to re-post {file_name} into recreated channel: {e}")
+            else:
+                print(f"No valid local copy of {file_name} to re-post into the recreated channel.")
+        # For the registry channel itself, this call is what re-posts its file.
+        await _save_and_backup_channel_registry()
+        if const_name == "CHANNEL_REGISTRY_CHANNEL_ID":
+            reposted = True
+
+        deleter = await _find_channel_deleter(guild, old_id) if deleted_channel is not None else None
+        description = (
+            f"`{file_name}`'s channel was deleted"
+            + (f" by {deleter.mention} (`{deleter.id}`)" if deleter else "")
+            + f" and has been recreated as {new_channel.mention}."
+            + (" The saved JSON was re-posted." if reposted else " **No saved JSON could be re-posted** — check the logs.")
+        )
+        if const_name == "CHANNEL_REGISTRY_CHANNEL_ID":
+            description += (
+                f"\n⚠️ Set `CHANNEL_REGISTRY_CHANNEL_ID = {new_channel.id}` in the code — the registry can't "
+                "record its own new ID, so a restart would otherwise look for the old channel."
+            )
+        await log_bot_event(
+            title="🛠️ Database channel recreated",
+            description=description,
+            colour=discord.Colour.orange(),
+            fields=[
+                ("Constant", f"`{const_name}`", True),
+                ("Old ID", f"`{old_id}`", True),
+                ("New ID", f"`{new_channel.id}`", True),
+            ],
+        )
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    for const_name in DB_CHANNEL_SPECS:
+        if globals()[const_name] == channel.id:
+            try:
+                await _recreate_db_channel(const_name, deleted_channel=channel, reason="deleted by a user")
+            except Exception as e:  # noqa: BLE001
+                print(f"Failed to recreate deleted database channel {const_name}: {e!r}")
+                await log_bot_event(
+                    title="❌ Couldn't recreate database channel",
+                    description=f"`{const_name}` (`{channel.id}`) was deleted and recreating it failed:\n```{e!r}```"[:4000],
+                    colour=discord.Colour.red(),
+                )
+            return
+
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    """Keeps the registry's recorded name/permissions current so a recreation matches the latest setup."""
+    for const_name in DB_CHANNEL_SPECS:
+        if globals()[const_name] == after.id:
+            snapshot = _snapshot_db_channel(const_name, after)
+            if snapshot != _channel_registry.get(const_name):
+                _channel_registry[const_name] = snapshot
+                try:
+                    await _save_and_backup_channel_registry()
+                except Exception as e:  # noqa: BLE001
+                    print(f"Failed to update channel registry: {e!r}")
+            return
+
+
 async def log_team_event(
     title: str,
     description: str = "",
@@ -8786,6 +9040,10 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready():
     _leaderboard_log_asset_status()
+    try:
+        await load_channel_registry_and_apply()
+    except Exception as e:
+        print(f"Failed to load channel registry: {e!r}")
     await restore_db_from_log_channel()
     await restore_ticket_db_from_log_channel()
     await restore_invite_db_from_log_channel()
@@ -8795,6 +9053,10 @@ async def on_ready():
     await restore_optout_db_from_log_channel()
     await restore_streak_db_from_log_channel()
     load_command_usage_into_memory()
+    try:
+        await ensure_db_channels()
+    except Exception as e:
+        print(f"Failed to verify database channels: {e!r}")
     bot.add_view(SupportPanelView())
     # Registers the "Close" button's custom_id against a callback so it keeps working on
     # existing ticket threads after a restart — called with no arguments, this just
