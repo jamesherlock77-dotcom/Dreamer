@@ -8989,6 +8989,150 @@ async def on_app_command_completion(
     )
 
 
+# ---------- /checktournament config ----------
+TOURNAMENT_SCHEDULE_BG_PATH = os.path.join(BASE_DIR, "tournament-bg.png")  # optional; falls back to the leaderboard background
+TOURNAMENT_SCHEDULE_FILENAME = "tournament_schedule.png"
+TOURNAMENT_SCHEDULE_ROWS = 7
+TOURNAMENT_SCHEDULE_FOOTER = "discord.gg/acarenahub"
+TOURNAMENT_SCHEDULE_INTRO = "Here's the Match Schedule, this will be updated after every match."
+
+# One dict per match, in order. Leave empty for a blank 01-07 sheet like the template, or fill:
+#   {"teams": "Alpha vs Bravo", "date": "Oct 14 • 8:00 PM", "best_of": "3", "status": "Upcoming"}
+_tournament_schedule: list[dict] = []
+
+
+def _render_tournament_schedule_image(matches: list[dict]) -> bytes:
+    """Draws the 'Match Schedules' card (title, column headers, 7 numbered rows, footer).
+    Synchronous — call via asyncio.to_thread."""
+    W, H = 1200, 672
+
+    try:
+        bg = Image.open(TOURNAMENT_SCHEDULE_BG_PATH).convert("RGBA")
+    except (FileNotFoundError, OSError):
+        try:
+            bg = Image.open(LEADERBOARD_BG_PATH).convert("RGBA")
+        except (FileNotFoundError, OSError):
+            try:
+                bg = Image.open(LEADERBOARD_BG_FALLBACK_PATH).convert("RGBA")
+            except (FileNotFoundError, OSError):
+                bg = Image.new("RGBA", (W, H), (24, 24, 28, 255))
+    bg = bg.resize((W, H))
+    canvas = bg.copy()
+
+    # Dark outer card, then a lighter inner panel behind the rows
+    _leaderboard_blend_shape(
+        canvas, lambda d: _leaderboard_rounded_rect(d, (25, 15, 1176, 619), 22, fill=(0, 0, 0, 185))
+    )
+    _leaderboard_blend_shape(
+        canvas, lambda d: _leaderboard_rounded_rect(d, (54, 142, 1151, 529), 16, fill=(255, 255, 255, 20))
+    )
+    draw = ImageDraw.Draw(canvas)
+
+    font_title = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 56)
+    font_head = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 18)
+    font_num = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 26)
+    font_cell = _leaderboard_load_font(LEADERBOARD_FONT_PATH, 20)
+    font_footer = _leaderboard_load_font(LEADERBOARD_FONT_EXTRABOLD_PATH, 26)
+
+    white = (255, 255, 255, 255)
+    soft = (255, 255, 255, 215)
+    gold = (232, 196, 40, 255)
+
+    # Column anchors
+    X_MATCH, X_TEAMS_CENTER, X_DATE, X_BEST, X_STATUS = 71, 356, 641, 878, 1025
+
+    # Title + rule beneath it
+    draw.text((68, 92), "Match Schedules", font=font_title, fill=white, anchor="ls")
+    _leaderboard_blend_shape(canvas, lambda d: d.rectangle((68, 108, 1132, 109), fill=(255, 255, 255, 45)))
+    draw = ImageDraw.Draw(canvas)
+
+    # Column headers
+    head_y = 127
+    draw.text((X_MATCH, head_y), "MATCH", font=font_head, fill=soft, anchor="lm")
+    draw.text((X_TEAMS_CENTER, head_y), "TEAMS", font=font_head, fill=soft, anchor="mm")
+    draw.text((X_DATE, head_y), "DATE", font=font_head, fill=soft, anchor="lm")
+    date_w = draw.textlength("DATE ", font=font_head)
+    draw.text((X_DATE + date_w, head_y), "[EST]", font=_leaderboard_load_font(LEADERBOARD_FONT_PATH, 14), fill=gold, anchor="lm")
+    draw.text((X_BEST, head_y), "BEST OF", font=font_head, fill=soft, anchor="lm")
+    draw.text((X_STATUS, head_y), "STATUS", font=font_head, fill=soft, anchor="lm")
+
+    def fit(text: str, font, max_width: int) -> str:
+        if draw.textlength(text, font=font) <= max_width:
+            return text
+        while text and draw.textlength(text + "…", font=font) > max_width:
+            text = text[:-1]
+        return text + "…"
+
+    # Rows
+    row_top, row_h = 150, 53
+    for i in range(TOURNAMENT_SCHEDULE_ROWS):
+        y_top = row_top + i * row_h
+        y_mid = y_top + row_h // 2 - 2
+        y_line = y_top + row_h - 4
+        _leaderboard_blend_shape(canvas, lambda d, y=y_line: d.rectangle((68, y, 1132, y + 1), fill=(255, 255, 255, 40)))
+        draw = ImageDraw.Draw(canvas)
+
+        draw.text((X_MATCH, y_mid), f"{i + 1:02d}", font=font_num, fill=white, anchor="lm")
+        if i < len(matches):
+            m = matches[i]
+            draw.text((X_TEAMS_CENTER, y_mid), fit(str(m.get("teams", "")), font_cell, 440), font=font_cell, fill=white, anchor="mm")
+            draw.text((X_DATE, y_mid), fit(str(m.get("date", "")), font_cell, 220), font=font_cell, fill=white, anchor="lm")
+            draw.text((X_BEST, y_mid), fit(str(m.get("best_of", "")), font_cell, 110), font=font_cell, fill=white, anchor="lm")
+            draw.text((X_STATUS, y_mid), fit(str(m.get("status", "")), font_cell, 120), font=font_cell, fill=white, anchor="lm")
+
+    # Footer
+    draw.text((600, 566), TOURNAMENT_SCHEDULE_FOOTER, font=font_footer, fill=white, anchor="mm")
+
+    out = io.BytesIO()
+    canvas.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+
+class TournamentScheduleView(discord.ui.LayoutView):
+    """Components V2 container: intro line, divider, then the rendered schedule image."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(
+            discord.ui.Container(
+                discord.ui.TextDisplay(TOURNAMENT_SCHEDULE_INTRO),
+                discord.ui.Separator(),
+                discord.ui.MediaGallery(
+                    discord.MediaGalleryItem(media=f"attachment://{TOURNAMENT_SCHEDULE_FILENAME}")
+                ),
+            )
+        )
+
+
+@bot.tree.command(
+    name="checktournament",
+    description="Show the tournament match schedule or bracket",
+)
+@app_commands.describe(option="What to show")
+@app_commands.choices(
+    option=[
+        app_commands.Choice(name="Schedule", value="schedule"),
+        app_commands.Choice(name="Bracket", value="bracket"),
+    ]
+)
+async def checktournament(interaction: discord.Interaction, option: app_commands.Choice[str]):
+    # Add `if not has_staff_role(interaction.user): ...` here if you want this staff-only.
+    if option.value == "bracket":
+        await interaction.response.send_message("The bracket isn't set up yet.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    try:
+        image_bytes = await asyncio.to_thread(_render_tournament_schedule_image, list(_tournament_schedule))
+    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+        print(f"Failed to render tournament schedule image: {e!r}")
+        await interaction.followup.send("Something went wrong generating the schedule image.", ephemeral=True)
+        return
+
+    file = discord.File(io.BytesIO(image_bytes), filename=TOURNAMENT_SCHEDULE_FILENAME)
+    await interaction.followup.send(view=TournamentScheduleView(), file=file)
+
+
 # ---------- Global slash-command error handler ----------
 # Without this, discord.py just logs a full traceback for every unhandled command error
 # (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
