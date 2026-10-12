@@ -8995,6 +8995,8 @@ TOURNAMENT_SCHEDULE_FILENAME = "tournament_schedule.png"
 TOURNAMENT_SCHEDULE_ROWS = 7
 TOURNAMENT_SCHEDULE_FOOTER = "discord.gg/acarenahub"
 TOURNAMENT_SCHEDULE_INTRO = "Here's the Match Schedule, this will be updated after every match."
+TOURNAMENT_BRACKET_INTRO = "Here's the Tournament Bracket, this will be updated after every match."
+TOURNAMENT_IMAGE_LOG_CHANNEL_ID = 1559244699435536484  # every /changetournamentstatus image is logged here (and read back from here by /checktournament)
 
 # One dict per match, in order. Leave empty for a blank 01-07 sheet like the template, or fill:
 #   {"teams": "Alpha vs Bravo", "date": "Oct 14 • 8:00 PM", "best_of": "3", "status": "Upcoming"}
@@ -9088,20 +9090,43 @@ def _render_tournament_schedule_image(matches: list[dict]) -> bytes:
     return out.getvalue()
 
 
-class TournamentScheduleView(discord.ui.LayoutView):
-    """Components V2 container: intro line, divider, then the rendered schedule image."""
+class TournamentImageView(discord.ui.LayoutView):
+    """Components V2 container: intro line, divider, then the schedule/bracket image."""
 
-    def __init__(self):
+    def __init__(self, intro: str, filename: str):
         super().__init__(timeout=None)
         self.add_item(
             discord.ui.Container(
-                discord.ui.TextDisplay(TOURNAMENT_SCHEDULE_INTRO),
+                discord.ui.TextDisplay(intro),
                 discord.ui.Separator(),
-                discord.ui.MediaGallery(
-                    discord.MediaGalleryItem(media=f"attachment://{TOURNAMENT_SCHEDULE_FILENAME}")
-                ),
+                discord.ui.MediaGallery(discord.MediaGalleryItem(media=f"attachment://{filename}")),
             )
         )
+
+
+TOURNAMENT_IMAGE_CHOICES = [
+    app_commands.Choice(name="Schedule", value="schedule"),
+    app_commands.Choice(name="Bracket", value="bracket"),
+]
+
+
+async def _fetch_latest_tournament_image(kind: str) -> tuple[bytes, str] | None:
+    """Returns (image_bytes, filename) of the most recent image logged for `kind`
+    ("schedule" or "bracket") in TOURNAMENT_IMAGE_LOG_CHANNEL_ID, or None if there isn't
+    one. Reading it back from the log channel (rather than a local file or a stored CDN
+    URL) means it survives restarts/redeploys and the URL never goes stale."""
+    try:
+        channel = bot.get_channel(TOURNAMENT_IMAGE_LOG_CHANNEL_ID) or await bot.fetch_channel(
+            TOURNAMENT_IMAGE_LOG_CHANNEL_ID
+        )
+        marker = f"tournament_image:{kind}"
+        async for msg in channel.history(limit=100):
+            if msg.author.id == bot.user.id and marker in msg.content and msg.attachments:
+                attachment = msg.attachments[0]
+                return await attachment.read(), attachment.filename
+    except discord.HTTPException as e:
+        print(f"Failed to load tournament {kind} image from log channel: {e!r}")
+    return None
 
 
 @bot.tree.command(
@@ -9109,28 +9134,76 @@ class TournamentScheduleView(discord.ui.LayoutView):
     description="Show the tournament match schedule or bracket",
 )
 @app_commands.describe(option="What to show")
-@app_commands.choices(
-    option=[
-        app_commands.Choice(name="Schedule", value="schedule"),
-        app_commands.Choice(name="Bracket", value="bracket"),
-    ]
-)
+@app_commands.choices(option=TOURNAMENT_IMAGE_CHOICES)
 async def checktournament(interaction: discord.Interaction, option: app_commands.Choice[str]):
-    # Add `if not has_staff_role(interaction.user): ...` here if you want this staff-only.
-    if option.value == "bracket":
-        await interaction.response.send_message("The bracket isn't set up yet.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    kind = option.value
+
+    logged = await _fetch_latest_tournament_image(kind)
+    if logged is not None:
+        image_bytes, source_name = logged
+        ext = os.path.splitext(source_name)[1].lower() or ".png"
+        filename = f"tournament_{kind}{ext}"
+    elif kind == "schedule":
+        # Nothing uploaded yet — show the blank 01-07 template (or the in-code matches).
+        try:
+            image_bytes = await asyncio.to_thread(_render_tournament_schedule_image, list(_tournament_schedule))
+        except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
+            print(f"Failed to render tournament schedule image: {e!r}")
+            await interaction.followup.send("Something went wrong generating the schedule image.", ephemeral=True)
+            return
+        filename = TOURNAMENT_SCHEDULE_FILENAME
+    else:
+        await interaction.followup.send("The bracket hasn't been set yet.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    intro = TOURNAMENT_SCHEDULE_INTRO if kind == "schedule" else TOURNAMENT_BRACKET_INTRO
+    file = discord.File(io.BytesIO(image_bytes), filename=filename)
+    await interaction.followup.send(view=TournamentImageView(intro, filename), file=file, ephemeral=True)
+
+
+@bot.tree.command(
+    name="changetournamentstatus",
+    description="Change the tournament schedule or bracket image",
+)
+@app_commands.describe(option="Which image to change", image="The new image")
+@app_commands.choices(option=TOURNAMENT_IMAGE_CHOICES)
+async def changetournamentstatus(
+    interaction: discord.Interaction, option: app_commands.Choice[str], image: discord.Attachment
+):
+    # Open to everyone by request — add a has_staff_role check here to restrict it.
+    if not (image.content_type or "").startswith("image/"):
+        await interaction.response.send_message("Please attach an image file (png, jpg, webp, gif).", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    kind = option.value
+
     try:
-        image_bytes = await asyncio.to_thread(_render_tournament_schedule_image, list(_tournament_schedule))
-    except Exception as e:  # noqa: BLE001 - don't let a bad render kill the command
-        print(f"Failed to render tournament schedule image: {e!r}")
-        await interaction.followup.send("Something went wrong generating the schedule image.", ephemeral=True)
+        data = await image.read()
+        log_channel = bot.get_channel(TOURNAMENT_IMAGE_LOG_CHANNEL_ID) or await bot.fetch_channel(
+            TOURNAMENT_IMAGE_LOG_CHANNEL_ID
+        )
+        await log_channel.send(
+            content=(
+                f"{'🗓️' if kind == 'schedule' else '🏆'} **Tournament {kind}** image changed by "
+                f"{interaction.user.mention} (`{interaction.user.id}`)\n-# tournament_image:{kind}"
+            ),
+            file=discord.File(io.BytesIO(data), filename=image.filename),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to log tournament {kind} image: {e!r}")
+        await interaction.followup.send(
+            "Couldn't save that image to the log channel, so nothing was changed. Please try again.",
+            ephemeral=True,
+        )
         return
 
-    file = discord.File(io.BytesIO(image_bytes), filename=TOURNAMENT_SCHEDULE_FILENAME)
-    await interaction.followup.send(view=TournamentScheduleView(), file=file)
+    await interaction.followup.send(
+        f"✅ The tournament **{kind}** has been updated. Use `/checktournament {kind}` to see it.",
+        ephemeral=True,
+    )
 
 
 # ---------- Global slash-command error handler ----------
