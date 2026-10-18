@@ -1953,7 +1953,7 @@ def build_tournament_signup_content(signups: list) -> str:
     )
 
 
-TOURNAMENT_TEAM_SELECT_PAGES = 2  # number of team-select dropdowns on the admin panel (25 teams each)
+TOURNAMENT_TEAM_SELECT_PAGES = 4  # team-select dropdowns on the admin panel (25 teams each). MAX is 4: Discord allows 5 rows per message and the Clear button needs one.
 
 
 def build_tournament_team_select_pages(teams: dict) -> list[list[discord.SelectOption]]:
@@ -2107,8 +2107,8 @@ async def ensure_tournament_stickies() -> None:
 
 class TournamentAdminPanelView(discord.ui.View):
     """Staff-only utility panel for the tournament:
-    - Two team-select dropdowns (each covering up to 25 teams, so 50+ teams are covered
-      between the two) that post/refresh the sticky "Join Tournament" sign-up message in
+    - Four team-select dropdowns (each covering up to 25 teams, so up to 100 teams are
+      covered between them) that post/refresh the sticky "Join Tournament" sign-up message in
       ONE chosen team's channel at a time — sign-ups are no longer auto-sent to every team.
     - A Clear button that strips TOURNAMENT_SUBMISSION_ROLE_ID from everyone holding it,
       resets every team's sign-up list in the DB, and purges
@@ -2263,7 +2263,18 @@ async def post_tournament_panel_if_missing() -> None:
 
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == TOURNAMENT_PANEL_TITLE:
-            return  # panel already posted — leave it alone
+            # Panel already posted — leave it alone, unless it was posted with fewer dropdowns
+            # than TOURNAMENT_TEAM_SELECT_PAGES now calls for; then edit it in place (no
+            # delete/resend) so the extra dropdowns appear without a manual repost.
+            existing_selects = sum(
+                1 for row in msg.components for c in getattr(row, "children", []) if c.type == discord.ComponentType.string_select
+            )
+            if existing_selects != TOURNAMENT_TEAM_SELECT_PAGES:
+                try:
+                    await msg.edit(embed=_build_tournament_panel_embed(), view=TournamentAdminPanelView(load_db()["teams"]))
+                except discord.HTTPException as e:
+                    print(f"[ERROR] Failed to upgrade tournament panel dropdowns: {e}")
+            return
 
     db = load_db()
     await channel.send(embed=_build_tournament_panel_embed(), view=TournamentAdminPanelView(db["teams"]))
@@ -6027,7 +6038,7 @@ async def activitychart(interaction: discord.Interaction):
             score_lines.append(f"⚪ **{name}** — *no data yet, excluded from score*")
 
     score_body = (
-        f"# {overall_emoji} {overall_score:.0f}/100 — {overall_label}\n"
+        f"### {overall_emoji} {overall_score:.0f}/100 — {overall_label}\n"
         f"This is a weighted blend of {len(usable)} metric(s) below — a quick read on server health, not the whole story.\n\n"
         + "\n".join(score_lines)
     )
