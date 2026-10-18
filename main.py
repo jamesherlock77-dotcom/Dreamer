@@ -5692,6 +5692,31 @@ class ActivityChartView(discord.ui.LayoutView):
         self.add_item(discord.ui.Container(*children))
 
 
+ACTIVITYCHART_MAX_TEXT = 3800  # Discord's limit is 4000 total text chars per message; leave headroom
+
+
+def _chunk_activitychart_sections(sections: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
+    """Groups (heading, body) sections into messages whose combined text stays under
+    ACTIVITYCHART_MAX_TEXT. A single section that's too long on its own is trimmed."""
+    groups: list[list[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    current_len = 0
+    for heading, body in sections:
+        overhead = len(heading) + 6  # "**heading**\n" plus separator slack
+        room = ACTIVITYCHART_MAX_TEXT - overhead
+        if len(body) > room:
+            body = body[: room - 1].rstrip() + "…"
+        size = overhead + len(body)
+        if current and current_len + size > ACTIVITYCHART_MAX_TEXT:
+            groups.append(current)
+            current, current_len = [], 0
+        current.append((heading, body))
+        current_len += size
+    if current:
+        groups.append(current)
+    return groups
+
+
 @bot.tree.command(name="activitychart", description="(Staff) Full server activity & engagement report")
 async def activitychart(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not has_staff_role(interaction.user):
@@ -6104,7 +6129,11 @@ async def activitychart(interaction: discord.Interaction):
         ("🛠️ What To Improve", recommendations_body),
     ]
 
-    await interaction.followup.send(view=ActivityChartView(sections))
+    # Discord caps the TOTAL displayable text in one Components V2 message at 4000 chars, and
+    # the full report is longer than that — so pack sections into as few messages as fit
+    # (each its own container), keeping every section whole and in order.
+    for group in _chunk_activitychart_sections(sections):
+        await interaction.followup.send(view=ActivityChartView(group))
 
 
 # ---------- Slash commands ----------
