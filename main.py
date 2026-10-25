@@ -103,6 +103,9 @@ QOTD_PING_ROLE_ID = 1535432839548506163     # pinged alongside each Question of 
 
 SCRIM_CATEGORY_ID = 1537952629131444244     # category /startscrim channels are created in
 SCRIM_LOG_CHANNEL_ID = 1537897056218386462  # scrims JSON "database" message lives here
+REWARDS_LOG_CHANNEL_ID = 1564026480420323478  # /sendrewardslist JSON "database" message lives here
+REWARDS_RECIPIENT_ID = 1429110753683832985    # user DM'd every ID submitted through a /sendrewardslist list
+REWARDS_STICKY_DEBOUNCE_SECONDS = 5           # min gap between re-sticking a rewards list, per channel
 SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
@@ -148,6 +151,7 @@ GIVEAWAYS_DB_FILE = "giveaways_data.json"
 TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
 SCRIMS_DB_FILE = "scrims_data.json"
+REWARDS_DB_FILE = "rewards_lists.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 # (DATA_OPTOUT_DB_FILE is declared above, next to the privacy-panel channel config it belongs with)
 
@@ -463,6 +467,7 @@ DB_CHANNEL_SPECS = {
     "TICKET_LOG_CHANNEL_ID": (TICKETS_DB_FILE, None),
     "INVITE_LOG_CHANNEL_ID": (INVITES_DB_FILE, None),
     "SCRIM_LOG_CHANNEL_ID": (SCRIMS_DB_FILE, None),
+    "REWARDS_LOG_CHANNEL_ID": (REWARDS_DB_FILE, None),
     "DATA_OPTOUT_LOG_CHANNEL_ID": (DATA_OPTOUT_DB_FILE, None),
     "MESSAGE_LEADERBOARD_LOG_CHANNEL_ID": (MESSAGE_LEADERBOARD_DB_FILE, "save_message_leaderboard_db"),
     "OVERALL_MESSAGE_LOG_CHANNEL_ID": (OVERALL_MESSAGE_DB_FILE, "save_overall_message_db"),
@@ -7767,6 +7772,7 @@ async def on_message(message: discord.Message):
 
     if message.guild is not None and not message.author.bot:
         await maybe_restick_tournament_message(message)
+        await maybe_restick_rewards_lists(message)
 
         # Shared 5s-per-user anti-spam gate for BOTH leaderboards: a message only counts if
         # this long has passed since that user's last counted message, anywhere in the guild.
@@ -9246,6 +9252,309 @@ async def changetournamentstatus(
     )
 
 
+# ============================================================
+# /sendrewardslist — posts a sticky "claim your reward" message in the channel it's run
+# in. Each click opens a form asking for a user ID, which is DM'd to REWARDS_RECIPIENT_ID.
+# The message re-sticks to the bottom as chat moves, shows submitted/max, and deletes
+# itself once as many IDs as the team has members have been submitted.
+# State lives in REWARDS_DB_FILE, backed up to REWARDS_LOG_CHANNEL_ID.
+# ============================================================
+REWARDS_BUTTON_ID = "rewards_list_submit"
+
+_rewards_lock = asyncio.Lock()          # serialises read-modify-write on the rewards DB (so the last slot can't be double-filled)
+_rewards_channel_ids: set = set()       # channels that currently have a list, so on_message can cheaply skip every other channel
+_rewards_last_repost: dict = {}         # channel_id -> monotonic time of the last re-stick
+
+
+def load_rewards_db() -> dict:
+    data = _load_json_file(REWARDS_DB_FILE)
+    if data is None:
+        return {"lists": {}}
+    data.setdefault("lists", {})
+    return data
+
+
+def save_rewards_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    _atomic_write_json(REWARDS_DB_FILE, data)
+
+
+async def backup_rewards_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(REWARDS_LOG_CHANNEL_ID, REWARDS_DB_FILE, REWARDS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up rewards db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill anything else
+        print(f"Unexpected error backing up rewards db: {e}")
+
+
+async def restore_rewards_db_from_log_channel():
+    if _load_json_file(REWARDS_DB_FILE) is not None:
+        await backup_rewards_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(REWARDS_LOG_CHANNEL_ID, REWARDS_DB_FILE, REWARDS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore rewards db from log channel: {e}")
+        found = False
+    print("Restored rewards db from log channel backup." if found else "No existing rewards db backup found — starting fresh.")
+
+
+def _refresh_rewards_channel_cache(data: dict) -> None:
+    _rewards_channel_ids.clear()
+    _rewards_channel_ids.update(int(e["channel_id"]) for e in data["lists"].values())
+
+
+def build_rewards_content(count: int, maximum: int) -> str:
+    return f"Hello, please click the button below to receive your reward!\n**{count}/{maximum}**"
+
+
+async def _delete_rewards_message(channel, message_id) -> None:
+    if not message_id or channel is None:
+        return
+    try:
+        await channel.get_partial_message(message_id).delete()
+    except discord.HTTPException:
+        pass  # already gone
+
+
+async def _post_rewards_sticky(channel, data: dict, key: str) -> None:
+    """Deletes the list's old message (if any), posts a fresh one at the bottom of the
+    channel and saves the new message ID. Caller must hold _rewards_lock."""
+    entry = data["lists"][key]
+    await _delete_rewards_message(channel, entry.get("message_id"))
+    msg = await channel.send(
+        content=build_rewards_content(len(entry["submissions"]), entry["max"]),
+        view=RewardsListView(),
+    )
+    entry["message_id"] = msg.id
+    save_rewards_db(data)  # local only — a backup on every re-stick would spam the log channel
+
+
+async def maybe_restick_rewards_lists(message: discord.Message) -> None:
+    """Called from on_message for every non-bot message: keeps any rewards list in that
+    channel stuck to the bottom (debounced, like the tournament sign-up sticky)."""
+    if message.channel.id not in _rewards_channel_ids:
+        return
+    now = time.monotonic()
+    if now - _rewards_last_repost.get(message.channel.id, 0) < REWARDS_STICKY_DEBOUNCE_SECONDS:
+        return
+    _rewards_last_repost[message.channel.id] = now
+    try:
+        async with _rewards_lock:
+            data = load_rewards_db()
+            for key, entry in list(data["lists"].items()):
+                if int(entry["channel_id"]) == message.channel.id:
+                    await _post_rewards_sticky(message.channel, data, key)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ERROR] Failed to re-stick rewards list in {message.channel.id}: {e}")
+
+
+async def ensure_rewards_stickies() -> None:
+    """Startup: the stored message IDs can be stale after a redeploy (the DB is restored
+    from the last backup, not the last re-stick), so clear any leftover rewards messages in
+    each list's channel and post one fresh sticky per list."""
+    async with _rewards_lock:
+        data = load_rewards_db()
+        _refresh_rewards_channel_cache(data)
+        by_channel: dict = {}
+        for key, entry in data["lists"].items():
+            by_channel.setdefault(int(entry["channel_id"]), []).append(key)
+        for channel_id, keys in by_channel.items():
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                continue
+            try:
+                async for msg in channel.history(limit=50):
+                    if msg.author.id == bot.user.id and any(
+                        getattr(c, "custom_id", None) == REWARDS_BUTTON_ID
+                        for row in msg.components
+                        for c in getattr(row, "children", [])
+                    ):
+                        await msg.delete()
+            except discord.HTTPException:
+                pass
+            for key in keys:
+                try:
+                    await _post_rewards_sticky(channel, data, key)
+                except discord.HTTPException as e:
+                    print(f"[ERROR] Failed to post rewards list {key}: {e}")
+
+
+class RewardIdModal(discord.ui.Modal, title="Claim Your Reward"):
+    reward_id = discord.ui.TextInput(
+        label="Discord User ID",
+        placeholder="e.g. 123456789012345678",
+        min_length=17,
+        max_length=20,
+        required=True,
+    )
+
+    def __init__(self, key: str):
+        super().__init__()
+        self.key = key
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        raw = self.reward_id.value.strip()
+        if not raw.isdigit() or not 17 <= len(raw) <= 20:
+            await interaction.followup.send("That doesn't look like a valid Discord user ID (numbers only).", ephemeral=True)
+            return
+
+        async with _rewards_lock:
+            data = load_rewards_db()
+            entry = data["lists"].get(self.key)
+            if entry is None:
+                await interaction.followup.send("This reward list is no longer active.", ephemeral=True)
+                return
+            subs = entry["submissions"]
+            if len(subs) >= entry["max"]:
+                await interaction.followup.send("This reward list is already full.", ephemeral=True)
+                return
+            if any(s["user_id"] == interaction.user.id for s in subs):
+                await interaction.followup.send("You've already submitted an ID.", ephemeral=True)
+                return
+            if any(s["reward_id"] == raw for s in subs):
+                await interaction.followup.send("That ID has already been submitted.", ephemeral=True)
+                return
+
+            # DM first: if it can't be delivered, don't record the submission (it would
+            # use up a slot and block a retry while the recipient never saw it).
+            try:
+                recipient = await bot.fetch_user(REWARDS_RECIPIENT_ID)
+                await recipient.send(
+                    f"User Submitted Id For Reward\n```\n{raw}\n```\n"
+                    f"-# Team: {entry['team']} • submitted by {interaction.user.mention} "
+                    f"(`{interaction.user.id}`) • {len(subs) + 1}/{entry['max']}",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.HTTPException as e:
+                print(f"[ERROR] Failed to DM rewards recipient: {e}")
+                await interaction.followup.send("Couldn't deliver your ID right now — please try again in a bit.", ephemeral=True)
+                return
+
+            subs.append({"user_id": interaction.user.id, "reward_id": raw, "at": discord.utils.utcnow().isoformat()})
+            channel = bot.get_channel(int(entry["channel_id"])) or interaction.channel
+            if len(subs) >= entry["max"]:
+                await _delete_rewards_message(channel, entry.get("message_id"))
+                del data["lists"][self.key]
+                save_rewards_db(data)
+            else:
+                save_rewards_db(data)
+                try:
+                    await _post_rewards_sticky(channel, data, self.key)  # refresh count + keep at bottom
+                except discord.HTTPException as e:
+                    print(f"[ERROR] Failed to refresh rewards list {self.key}: {e}")
+            _refresh_rewards_channel_cache(data)
+
+        await backup_rewards_db_to_log_channel()
+        await interaction.followup.send("✅ Your ID has been submitted!", ephemeral=True)
+
+
+class RewardsListView(discord.ui.View):
+    """Attached to the sticky rewards message. The list is found by the message it's on,
+    so one persistent button (one custom_id) serves every list."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim Reward", style=discord.ButtonStyle.success, custom_id=REWARDS_BUTTON_ID)
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = load_rewards_db()
+        message_id = interaction.message.id if interaction.message else None
+        key = next((k for k, e in data["lists"].items() if e.get("message_id") == message_id), None)
+        if key is None:
+            in_channel = [k for k, e in data["lists"].items() if int(e["channel_id"]) == interaction.channel_id]
+            key = in_channel[0] if len(in_channel) == 1 else None
+        if key is None:
+            await interaction.response.send_message("This reward list is no longer active.", ephemeral=True)
+            return
+        if any(s["user_id"] == interaction.user.id for s in data["lists"][key]["submissions"]):
+            await interaction.response.send_message("You've already submitted an ID.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RewardIdModal(key))
+
+
+@bot.tree.command(
+    name="sendrewardslist",
+    description="(Staff) Post a sticky list collecting reward IDs from a team",
+)
+@app_commands.describe(
+    team="The team to collect IDs for (max submissions = its member count)",
+    deletecurrentlist="True = delete this team's current list and stop it being sticky",
+)
+async def sendrewardslist(interaction: discord.Interaction, team: str, deletecurrentlist: bool = False):
+    if not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+        return
+
+    db = load_db()
+    team_key = next((k for k in db["teams"] if k.lower() == team.lower()), None)
+    if team_key is None:
+        await interaction.response.send_message(f"No team named **{team}** found.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if deletecurrentlist:
+        async with _rewards_lock:
+            data = load_rewards_db()
+            keys = [k for k, e in data["lists"].items() if e["team"] == team_key]
+            if not keys:
+                await interaction.followup.send(f"**{team_key}** has no active rewards list.", ephemeral=True)
+                return
+            for k in keys:
+                entry = data["lists"].pop(k)
+                await _delete_rewards_message(bot.get_channel(int(entry["channel_id"])), entry.get("message_id"))
+            save_rewards_db(data)
+            _refresh_rewards_channel_cache(data)
+        await backup_rewards_db_to_log_channel()
+        await interaction.followup.send(f"🗑️ Deleted **{team_key}**'s current rewards list.", ephemeral=True)
+        return
+
+    maximum = len(db["teams"][team_key].get("members", []))
+    if maximum < 1:
+        await interaction.followup.send(f"**{team_key}** has no members.", ephemeral=True)
+        return
+
+    key = f"{interaction.channel_id}:{team_key}"
+    async with _rewards_lock:
+        data = load_rewards_db()
+        if key in data["lists"]:
+            await interaction.followup.send(
+                f"**{team_key}** already has an active list in this channel. "
+                "Run this again with `deletecurrentlist: True` first to replace it.",
+                ephemeral=True,
+            )
+            return
+        data["lists"][key] = {
+            "team": team_key,
+            "channel_id": interaction.channel_id,
+            "message_id": None,
+            "max": maximum,
+            "submissions": [],
+            "created_by": interaction.user.id,
+            "created_at": discord.utils.utcnow().isoformat(),
+        }
+        try:
+            await _post_rewards_sticky(interaction.channel, data, key)
+        except discord.HTTPException as e:
+            del data["lists"][key]
+            print(f"[ERROR] Failed to post rewards list: {e}")
+            await interaction.followup.send("Couldn't post the list in this channel (missing permissions?).", ephemeral=True)
+            return
+        _refresh_rewards_channel_cache(data)
+    await backup_rewards_db_to_log_channel()
+    await interaction.followup.send(
+        f"✅ Rewards list posted for **{team_key}** (max **{maximum}** IDs). It will stay at the bottom of this channel "
+        "and delete itself once it's full.",
+        ephemeral=True,
+    )
+
+
+sendrewardslist.autocomplete("team")(team_name_autocomplete)
+
+
 # ---------- Global slash-command error handler ----------
 # Without this, discord.py just logs a full traceback for every unhandled command error
 # (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
@@ -9305,6 +9614,7 @@ async def on_ready():
     await restore_ticket_db_from_log_channel()
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
+    await restore_rewards_db_from_log_channel()
     await restore_message_leaderboard_from_log_channel()
     await restore_overall_message_from_log_channel()
     await restore_optout_db_from_log_channel()
@@ -9322,6 +9632,7 @@ async def on_ready():
     bot.add_view(TicketThreadView())
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
+    bot.add_view(RewardsListView())
     bot.add_view(GiveawayView())
     bot.add_view(PrivacyPanelView())
     bot.add_view(BugReportView())
@@ -9354,6 +9665,10 @@ async def on_ready():
         await ensure_tournament_stickies()
     except Exception as e:
         print(f"Failed to backfill tournament sticky messages: {e}")
+    try:
+        await ensure_rewards_stickies()
+    except Exception as e:
+        print(f"Failed to refresh rewards list stickies: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
     if not check_scrim_expiry.is_running():
