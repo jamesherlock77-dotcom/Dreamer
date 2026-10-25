@@ -9306,7 +9306,10 @@ def _refresh_rewards_channel_cache(data: dict) -> None:
 
 
 def build_rewards_content(count: int, maximum: int) -> str:
-    return f"Hello, please click the button below to receive your reward!\n**{count}/{maximum}**"
+    return (
+        "Hello, please click the button below to receive your reward! <:Ghostie:1528242571418275981>\n"
+        f"**{count}/{maximum}** <:CompanyCoins:1528218837030535394>"
+    )
 
 
 async def _delete_rewards_message(channel, message_id) -> None:
@@ -9477,59 +9480,59 @@ class RewardsListView(discord.ui.View):
 
 @bot.tree.command(
     name="sendrewardslist",
-    description="(Staff) Post a sticky list collecting reward IDs from a team",
+    description="(Staff) Post a sticky list collecting reward IDs in a team's channel",
 )
 @app_commands.describe(
-    team="The team to collect IDs for (max submissions = its member count)",
-    deletecurrentlist="True = delete this team's current list and stop it being sticky",
+    channel="The team channel to post the list in (max submissions = that team's member count)",
+    deletecurrentlist="True = delete the current list in that channel and stop it being sticky",
 )
-async def sendrewardslist(interaction: discord.Interaction, team: str, deletecurrentlist: bool = False):
+async def sendrewardslist(
+    interaction: discord.Interaction, channel: discord.TextChannel, deletecurrentlist: bool = False
+):
     if not has_staff_role(interaction.user):
         await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
         return
 
-    db = load_db()
-    team_key = next((k for k in db["teams"] if k.lower() == team.lower()), None)
-    if team_key is None:
-        await interaction.response.send_message(f"No team named **{team}** found.", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=True)
+    key = str(channel.id)  # one list per channel
 
     if deletecurrentlist:
         async with _rewards_lock:
             data = load_rewards_db()
-            keys = [k for k, e in data["lists"].items() if e["team"] == team_key]
-            if not keys:
-                await interaction.followup.send(f"**{team_key}** has no active rewards list.", ephemeral=True)
+            entry = data["lists"].pop(key, None)
+            if entry is None:
+                await interaction.followup.send(f"{channel.mention} has no active rewards list.", ephemeral=True)
                 return
-            for k in keys:
-                entry = data["lists"].pop(k)
-                await _delete_rewards_message(bot.get_channel(int(entry["channel_id"])), entry.get("message_id"))
+            await _delete_rewards_message(channel, entry.get("message_id"))
             save_rewards_db(data)
             _refresh_rewards_channel_cache(data)
         await backup_rewards_db_to_log_channel()
-        await interaction.followup.send(f"🗑️ Deleted **{team_key}**'s current rewards list.", ephemeral=True)
+        await interaction.followup.send(f"🗑️ Deleted the rewards list in {channel.mention}.", ephemeral=True)
         return
 
+    # Find which team this channel belongs to — its member count is the max submissions.
+    db = load_db()
+    team_key = find_team_by_channel(db["teams"], channel.id)
+    if not team_key:
+        await interaction.followup.send(f"{channel.mention} isn't linked to any team's channel.", ephemeral=True)
+        return
     maximum = len(db["teams"][team_key].get("members", []))
     if maximum < 1:
         await interaction.followup.send(f"**{team_key}** has no members.", ephemeral=True)
         return
 
-    key = f"{interaction.channel_id}:{team_key}"
     async with _rewards_lock:
         data = load_rewards_db()
         if key in data["lists"]:
             await interaction.followup.send(
-                f"**{team_key}** already has an active list in this channel. "
+                f"{channel.mention} already has an active list. "
                 "Run this again with `deletecurrentlist: True` first to replace it.",
                 ephemeral=True,
             )
             return
         data["lists"][key] = {
             "team": team_key,
-            "channel_id": interaction.channel_id,
+            "channel_id": channel.id,
             "message_id": None,
             "max": maximum,
             "submissions": [],
@@ -9537,22 +9540,19 @@ async def sendrewardslist(interaction: discord.Interaction, team: str, deletecur
             "created_at": discord.utils.utcnow().isoformat(),
         }
         try:
-            await _post_rewards_sticky(interaction.channel, data, key)
+            await _post_rewards_sticky(channel, data, key)
         except discord.HTTPException as e:
             del data["lists"][key]
             print(f"[ERROR] Failed to post rewards list: {e}")
-            await interaction.followup.send("Couldn't post the list in this channel (missing permissions?).", ephemeral=True)
+            await interaction.followup.send(f"Couldn't post in {channel.mention} (missing permissions?).", ephemeral=True)
             return
         _refresh_rewards_channel_cache(data)
     await backup_rewards_db_to_log_channel()
     await interaction.followup.send(
-        f"✅ Rewards list posted for **{team_key}** (max **{maximum}** IDs). It will stay at the bottom of this channel "
-        "and delete itself once it's full.",
+        f"✅ Rewards list posted in {channel.mention} for **{team_key}** (max **{maximum}** IDs). "
+        "It will stay at the bottom of that channel and delete itself once it's full.",
         ephemeral=True,
     )
-
-
-sendrewardslist.autocomplete("team")(team_name_autocomplete)
 
 
 # ---------- Global slash-command error handler ----------
