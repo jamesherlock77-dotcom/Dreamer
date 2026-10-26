@@ -106,6 +106,11 @@ SCRIM_LOG_CHANNEL_ID = 1537897056218386462  # scrims JSON "database" message liv
 REWARDS_LOG_CHANNEL_ID = 1564026480420323478  # /sendrewardslist JSON "database" message lives here
 REWARDS_RECIPIENT_ID = 1429110753683832985    # user DM'd every ID submitted through a /sendrewardslist list
 REWARDS_STICKY_DEBOUNCE_SECONDS = 5           # min gap between re-sticking a rewards list, per channel
+EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event panel is posted here
+EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
+EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
+EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
+EVENT_COOLDOWN_HOURS = 24                      # each host can start one event per this many hours
 SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
@@ -152,6 +157,7 @@ TICKETS_DB_FILE = "tickets_data.json"
 INVITES_DB_FILE = "invites_data.json"
 SCRIMS_DB_FILE = "scrims_data.json"
 REWARDS_DB_FILE = "rewards_lists.json"
+EVENTS_DB_FILE = "events_data.json"
 DB_FILE = "teams.json"  # legacy combined file — read only, for one-time migration
 # (DATA_OPTOUT_DB_FILE is declared above, next to the privacy-panel channel config it belongs with)
 
@@ -468,6 +474,7 @@ DB_CHANNEL_SPECS = {
     "INVITE_LOG_CHANNEL_ID": (INVITES_DB_FILE, None),
     "SCRIM_LOG_CHANNEL_ID": (SCRIMS_DB_FILE, None),
     "REWARDS_LOG_CHANNEL_ID": (REWARDS_DB_FILE, None),
+    "EVENT_LOG_CHANNEL_ID": (EVENTS_DB_FILE, None),
     "DATA_OPTOUT_LOG_CHANNEL_ID": (DATA_OPTOUT_DB_FILE, None),
     "MESSAGE_LEADERBOARD_LOG_CHANNEL_ID": (MESSAGE_LEADERBOARD_DB_FILE, "save_message_leaderboard_db"),
     "OVERALL_MESSAGE_LOG_CHANNEL_ID": (OVERALL_MESSAGE_DB_FILE, "save_overall_message_db"),
@@ -9555,6 +9562,176 @@ async def sendrewardslist(
     )
 
 
+# ============================================================
+# Tournament-staff event panel (EVENT_PANEL_CHANNEL_ID)
+#   Start Event — form (title / difficulty / info / code) -> posts the event embed in
+#                 EVENT_POST_CHANNEL_ID. One event per host per EVENT_COOLDOWN_HOURS.
+#   End Event   — deletes the caller's own active event message (only the host can).
+# State lives in EVENTS_DB_FILE, backed up to EVENT_LOG_CHANNEL_ID.
+# ============================================================
+EVENT_PANEL_TITLE = "🛠️ Tournament Event Panel"
+_events_lock = asyncio.Lock()
+
+
+def load_events_db() -> dict:
+    data = _load_json_file(EVENTS_DB_FILE) or {}
+    data.setdefault("hosts", {})    # user_id -> {"last_event_at": iso, "name": str}
+    data.setdefault("active", {})   # user_id -> {"message_id", "channel_id", "title", "started_at"}
+    return data
+
+
+def save_events_db(data: dict) -> None:
+    data["last_updated"] = discord.utils.utcnow().isoformat()
+    _atomic_write_json(EVENTS_DB_FILE, data)
+
+
+async def backup_events_db_to_log_channel():
+    try:
+        await _backup_file_to_channel(EVENT_LOG_CHANNEL_ID, EVENTS_DB_FILE, EVENTS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to back up events db to log channel: {e}")
+    except Exception as e:  # noqa: BLE001 - never let a bad backup attempt kill anything else
+        print(f"Unexpected error backing up events db: {e}")
+
+
+async def restore_events_db_from_log_channel():
+    if _load_json_file(EVENTS_DB_FILE) is not None:
+        await backup_events_db_to_log_channel()
+        return
+    try:
+        found = await _restore_file_from_channel(EVENT_LOG_CHANNEL_ID, EVENTS_DB_FILE, EVENTS_DB_FILE)
+    except discord.HTTPException as e:
+        print(f"Failed to restore events db from log channel: {e}")
+        found = False
+    print("Restored events db from log channel backup." if found else "No existing events db backup found — starting fresh.")
+
+
+def has_event_staff_role(member: discord.abc.User) -> bool:
+    return any(role.id == EVENT_STAFF_ROLE_ID for role in getattr(member, "roles", []))
+
+
+def _event_start_block_reason(data: dict, user_id: int) -> str | None:
+    """Why this host can't start an event right now, or None if they can."""
+    uid = str(user_id)
+    if uid in data["active"]:
+        return "You already have an active event — press **End Event** to end it before starting another."
+    last = data["hosts"].get(uid, {}).get("last_event_at")
+    if last:
+        next_time = datetime.fromisoformat(last) + timedelta(hours=EVENT_COOLDOWN_HOURS)
+        if discord.utils.utcnow() < next_time:
+            ts = int(next_time.timestamp())
+            return f"You can only host one event every {EVENT_COOLDOWN_HOURS} hours. You can host again <t:{ts}:R> (<t:{ts}:f>)."
+    return None
+
+
+class StartEventModal(discord.ui.Modal, title="Start Event"):
+    event_title = discord.ui.TextInput(label="Event Title", placeholder="e.g. Simon Says", max_length=100, required=True)
+    difficulty = discord.ui.TextInput(label="Difficulty", placeholder="e.g. Easy", max_length=50, required=True)
+    event_info = discord.ui.TextInput(
+        label="Event Info", style=discord.TextStyle.paragraph, max_length=3000, required=True
+    )
+    event_code = discord.ui.TextInput(label="Event Code", placeholder="e.g. spooky.event", max_length=100, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with _events_lock:
+            data = load_events_db()
+            reason = _event_start_block_reason(data, interaction.user.id)  # re-check: state may have changed while the form was open
+            if reason:
+                await interaction.followup.send(reason, ephemeral=True)
+                return
+
+            embed = discord.Embed(
+                title=self.event_title.value.strip(),
+                description=f"**Difficulty:** {self.difficulty.value.strip()}\n\n{self.event_info.value.strip()}",
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow(),  # Discord shows this next to the footer, e.g. "• 24/10/2026, 19:06"
+            )
+            embed.add_field(name="Event Code", value=f"`{self.event_code.value.replace('`', '').strip()}`", inline=False)
+            embed.set_footer(text=f"Hosted by {interaction.user.display_name}")
+
+            try:
+                channel = bot.get_channel(EVENT_POST_CHANNEL_ID) or await bot.fetch_channel(EVENT_POST_CHANNEL_ID)
+                msg = await channel.send(embed=embed)
+            except discord.HTTPException as e:
+                print(f"[ERROR] Failed to post event: {e}")
+                await interaction.followup.send("Couldn't post the event (missing permissions?). Nothing was saved.", ephemeral=True)
+                return
+
+            now = discord.utils.utcnow().isoformat()
+            uid = str(interaction.user.id)
+            data["active"][uid] = {
+                "message_id": msg.id,
+                "channel_id": msg.channel.id,
+                "title": self.event_title.value.strip(),
+                "started_at": now,
+            }
+            data["hosts"][uid] = {"last_event_at": now, "name": interaction.user.display_name}
+            save_events_db(data)
+
+        await backup_events_db_to_log_channel()
+        await interaction.followup.send(f"✅ Your event is live in <#{EVENT_POST_CHANNEL_ID}>.", ephemeral=True)
+
+
+class EventPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Start Event", emoji="▶️", style=discord.ButtonStyle.success, custom_id="event_panel_start")
+    async def start_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_event_staff_role(interaction.user):
+            await interaction.response.send_message("Tournament staff only.", ephemeral=True)
+            return
+        reason = _event_start_block_reason(load_events_db(), interaction.user.id)
+        if reason:
+            await interaction.response.send_message(reason, ephemeral=True)
+            return
+        await interaction.response.send_modal(StartEventModal())
+
+    @discord.ui.button(label="End Event", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="event_panel_end")
+    async def end_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_event_staff_role(interaction.user):
+            await interaction.response.send_message("Tournament staff only.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with _events_lock:
+            data = load_events_db()
+            # Looked up by the caller's own ID, so you can only ever end the event YOU host.
+            entry = data["active"].pop(str(interaction.user.id), None)
+            if entry is None:
+                await interaction.followup.send("You don't have an active event to end.", ephemeral=True)
+                return
+            try:
+                channel = bot.get_channel(int(entry["channel_id"])) or await bot.fetch_channel(int(entry["channel_id"]))
+                await channel.get_partial_message(int(entry["message_id"])).delete()
+            except discord.HTTPException:
+                pass  # message already deleted — still end the event
+            save_events_db(data)
+        await backup_events_db_to_log_channel()
+        await interaction.followup.send(f"✅ Ended **{entry['title']}** and deleted its message.", ephemeral=True)
+
+
+def _build_event_panel_embed() -> discord.Embed:
+    return discord.Embed(
+        title=EVENT_PANEL_TITLE,
+        description=(
+            "**Tournament Staff only.** Every button answers privately.\n\n"
+            "▶️ **Start Event** — fill the form and post your event "
+            f"(one event every {EVENT_COOLDOWN_HOURS}h per host)\n"
+            "⏹️ **End Event** — end and delete the event you're hosting (only the host can end it)"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+async def post_event_panel_if_missing() -> None:
+    channel = bot.get_channel(EVENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(EVENT_PANEL_CHANNEL_ID)
+    async for msg in channel.history(limit=50):
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == EVENT_PANEL_TITLE:
+            return  # already posted — leave it alone
+    await channel.send(embed=_build_event_panel_embed(), view=EventPanelView())
+
+
 # ---------- Global slash-command error handler ----------
 # Without this, discord.py just logs a full traceback for every unhandled command error
 # (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
@@ -9615,6 +9792,7 @@ async def on_ready():
     await restore_invite_db_from_log_channel()
     await restore_scrim_db_from_log_channel()
     await restore_rewards_db_from_log_channel()
+    await restore_events_db_from_log_channel()
     await restore_message_leaderboard_from_log_channel()
     await restore_overall_message_from_log_channel()
     await restore_optout_db_from_log_channel()
@@ -9633,6 +9811,7 @@ async def on_ready():
     bot.add_view(TournamentAdminPanelView())
     bot.add_view(TournamentSignupView())
     bot.add_view(RewardsListView())
+    bot.add_view(EventPanelView())
     bot.add_view(GiveawayView())
     bot.add_view(PrivacyPanelView())
     bot.add_view(BugReportView())
@@ -9669,6 +9848,10 @@ async def on_ready():
         await ensure_rewards_stickies()
     except Exception as e:
         print(f"Failed to refresh rewards list stickies: {e}")
+    try:
+        await post_event_panel_if_missing()
+    except Exception as e:
+        print(f"Failed to post event panel: {e}")
     if not check_giveaways.is_running():
         check_giveaways.start()
     if not check_scrim_expiry.is_running():
