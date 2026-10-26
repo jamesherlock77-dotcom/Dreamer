@@ -110,7 +110,7 @@ EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event pane
 EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
 EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
 EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
-EVENT_COOLDOWN_HOURS = 12                      # each host can start one event per this many hours
+EVENT_COOLDOWN_HOURS = 12                      # shared by ALL tournament staff: once anyone starts an event, nobody can start another for this many hours
 SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
@@ -9565,7 +9565,7 @@ async def sendrewardslist(
 # ============================================================
 # Tournament-staff event panel (EVENT_PANEL_CHANNEL_ID)
 #   Start Event — form (title / difficulty / info / code) -> posts the event embed in
-#                 EVENT_POST_CHANNEL_ID. One event per host per EVENT_COOLDOWN_HOURS.
+#                 EVENT_POST_CHANNEL_ID. One event per EVENT_COOLDOWN_HOURS across ALL staff.
 #   End Event   — deletes the caller's own active event message (only the host can).
 # State lives in EVENTS_DB_FILE, backed up to EVENT_LOG_CHANNEL_ID.
 # ============================================================
@@ -9612,17 +9612,32 @@ def has_event_staff_role(member: discord.abc.User) -> bool:
     return any(role.id == EVENT_STAFF_ROLE_ID for role in getattr(member, "roles", []))
 
 
+def _event_cooldown_end(data: dict) -> tuple[datetime | None, str | None]:
+    """(when the shared cooldown ends, who started the event that triggered it). The cooldown
+    runs from the most recent event started by ANY host, so it applies to every staff member."""
+    latest_uid, latest_iso = None, None
+    for uid, info in data["hosts"].items():
+        iso = info.get("last_event_at")
+        if iso and (latest_iso is None or datetime.fromisoformat(iso) > datetime.fromisoformat(latest_iso)):
+            latest_uid, latest_iso = uid, iso
+    if latest_iso is None:
+        return None, None
+    return datetime.fromisoformat(latest_iso) + timedelta(hours=EVENT_COOLDOWN_HOURS), latest_uid
+
+
 def _event_start_block_reason(data: dict, user_id: int) -> str | None:
     """Why this host can't start an event right now, or None if they can."""
     uid = str(user_id)
     if uid in data["active"]:
         return "You already have an active event — press **End Event** to end it before starting another."
-    last = data["hosts"].get(uid, {}).get("last_event_at")
-    if last:
-        next_time = datetime.fromisoformat(last) + timedelta(hours=EVENT_COOLDOWN_HOURS)
-        if discord.utils.utcnow() < next_time:
-            ts = int(next_time.timestamp())
-            return f"You can only host one event every {EVENT_COOLDOWN_HOURS} hours. You can host again <t:{ts}:R> (<t:{ts}:f>)."
+    next_time, last_uid = _event_cooldown_end(data)
+    if next_time and discord.utils.utcnow() < next_time:
+        ts = int(next_time.timestamp())
+        who = "you" if last_uid == uid else f"<@{last_uid}>"
+        return (
+            f"Only one event can be hosted every {EVENT_COOLDOWN_HOURS} hours across all tournament staff, "
+            f"and {who} started the last one. The next event can start <t:{ts}:R> (<t:{ts}:f>)."
+        )
     return None
 
 
@@ -9733,66 +9748,42 @@ class EventPanelView(discord.ui.View):
             await interaction.response.send_message("Tournament staff only.", ephemeral=True)
             return
         await interaction.response.send_message(
-            embed=_build_event_activity_embed(interaction.guild, load_events_db()), ephemeral=True
+            embed=_build_event_activity_embed(interaction.user, load_events_db()), ephemeral=True
         )
 
 
-def _build_event_activity_embed(guild: discord.Guild | None, data: dict) -> discord.Embed:
-    """Progress of every tournament staff member: events hosted, this week's count, last event,
-    whether one is live, and when they can host next. Ranked by events hosted."""
+def _build_event_activity_embed(user: discord.abc.User, data: dict) -> discord.Embed:
+    """The caller's OWN event stats: total hosted, this week's count, last event, whether one
+    is live, when they can host next, and their most recent events."""
     now = discord.utils.utcnow()
-    per_host: dict[str, list[dict]] = {}
-    for record in data["history"]:
-        per_host.setdefault(record["host_id"], []).append(record)
+    uid = str(user.id)
+    events = [e for e in data["history"] if e["host_id"] == uid]
+    week = sum(1 for e in events if now - datetime.fromisoformat(e["started_at"]) <= timedelta(days=7))
 
-    host_ids = set(per_host)
-    role = guild.get_role(EVENT_STAFF_ROLE_ID) if guild else None
-    if role:
-        host_ids.update(str(m.id) for m in role.members)  # staff who haven't hosted yet still show up
+    last_iso = data["hosts"].get(uid, {}).get("last_event_at")
+    last_txt = f"<t:{int(datetime.fromisoformat(last_iso).timestamp())}:R>" if last_iso else "No events yet"
+    next_dt, _ = _event_cooldown_end(data)  # shared across all staff, not just you
+    avail = "✅ You can host now" if next_dt is None or now >= next_dt else f"⏳ Next event can start <t:{int(next_dt.timestamp())}:R>"
 
-    rows = []
-    for uid in host_ids:
-        events = per_host.get(uid, [])
-        week = sum(1 for e in events if now - datetime.fromisoformat(e["started_at"]) <= timedelta(days=7))
-        last_iso = data["hosts"].get(uid, {}).get("last_event_at")
-        rows.append((len(events), last_iso or "", uid, events, week, last_iso))
-    rows.sort(key=lambda r: (r[0], r[1]), reverse=True)  # most events first, then most recent
+    active = data["active"].get(uid)
+    live = f"🟢 **{active['title']}**" if active else "⚪ None"
 
-    lines = []
-    for rank, (count, _, uid, events, week, last_iso) in enumerate(rows, start=1):
-        active = data["active"].get(uid)
-        if last_iso:
-            last_dt = datetime.fromisoformat(last_iso)
-            next_dt = last_dt + timedelta(hours=EVENT_COOLDOWN_HOURS)
-            last_txt = f"last <t:{int(last_dt.timestamp())}:R>"
-            avail = "✅ can host now" if now >= next_dt else f"⏳ next <t:{int(next_dt.timestamp())}:R>"
-        else:
-            last_txt, avail = "no events yet", "✅ can host now"
-        live = f"🟢 live: *{active['title']}*" if active else "⚪ no live event"
-        lines.append(
-            f"**{rank}.** <@{uid}> — **{count}** event{'s' if count != 1 else ''} ({week} this week)\n"
-            f"↳ {last_txt} • {live} • {avail}"
-        )
+    embed = discord.Embed(title="📊 Your Event Activity", color=discord.Color.blurple())
+    embed.add_field(name="Events hosted", value=str(len(events)), inline=True)
+    embed.add_field(name="Last 7 days", value=str(week), inline=True)
+    embed.add_field(name="Last event", value=last_txt, inline=True)
+    embed.add_field(name="Live event", value=live, inline=True)
+    embed.add_field(name="Next event", value=avail, inline=True)
 
-    description_lines, used = [], 0
-    for i, line in enumerate(lines):
-        if used + len(line) + 2 > 3700:
-            description_lines.append(f"…and {len(lines) - i} more")
-            break
-        description_lines.append(line)
-        used += len(line) + 2
+    recent = []
+    for e in reversed(events[-5:]):
+        started = int(datetime.fromisoformat(e["started_at"]).timestamp())
+        status = "🟢 live" if e.get("ended_at") is None and uid in data["active"] and data["active"][uid].get("message_id") == e.get("message_id") else "ended"
+        recent.append(f"• **{e['title']}** — {e.get('difficulty', '?')} • <t:{started}:R> • {status}")
+    if recent:
+        embed.add_field(name="Recent events", value="\n".join(recent), inline=False)
 
-    total_events = len(data["history"])
-    live_now = len(data["active"])
-    embed = discord.Embed(
-        title="📊 Tournament Event Activity",
-        description=(
-            f"**Total events:** {total_events} • **Live now:** {live_now} • **Hosts:** {len(rows)}\n\n"
-            + ("\n\n".join(description_lines) if description_lines else "No tournament staff found yet.")
-        ),
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text=f"One event per host every {EVENT_COOLDOWN_HOURS}h")
+    embed.set_footer(text=f"One event every {EVENT_COOLDOWN_HOURS}h across all tournament staff")
     return embed
 
 
@@ -9802,9 +9793,9 @@ def _build_event_panel_embed() -> discord.Embed:
         description=(
             "**Tournament Staff only.** Every button answers privately.\n\n"
             "▶️ **Start Event** — fill the form and post your event "
-            f"(one event every {EVENT_COOLDOWN_HOURS}h per host)\n"
+            f"(only one event every {EVENT_COOLDOWN_HOURS}h for all staff)\n"
             "⏹️ **End Event** — end and delete the event you're hosting (only the host can end it)\n"
-            "📊 **Activity** — every tournament staff member's events: hosted, last event and who's live"
+            "📊 **Activity** — your own event stats: hosted, last event and when the next event can start"
         ),
         color=discord.Color.blurple(),
     )
