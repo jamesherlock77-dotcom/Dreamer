@@ -110,7 +110,7 @@ EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event pane
 EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
 EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
 EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
-EVENT_COOLDOWN_HOURS = 24                      # each host can start one event per this many hours
+EVENT_COOLDOWN_HOURS = 12                      # each host can start one event per this many hours
 SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
@@ -9570,6 +9570,7 @@ async def sendrewardslist(
 # State lives in EVENTS_DB_FILE, backed up to EVENT_LOG_CHANNEL_ID.
 # ============================================================
 EVENT_PANEL_TITLE = "🛠️ Tournament Event Panel"
+EVENT_HISTORY_LIMIT = 1000
 _events_lock = asyncio.Lock()
 
 
@@ -9577,6 +9578,7 @@ def load_events_db() -> dict:
     data = _load_json_file(EVENTS_DB_FILE) or {}
     data.setdefault("hosts", {})    # user_id -> {"last_event_at": iso, "name": str}
     data.setdefault("active", {})   # user_id -> {"message_id", "channel_id", "title", "started_at"}
+    data.setdefault("history", [])  # every event ever started: {"host_id", "host_name", "title", "difficulty", "message_id", "started_at", "ended_at"}
     return data
 
 
@@ -9667,6 +9669,16 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
                 "started_at": now,
             }
             data["hosts"][uid] = {"last_event_at": now, "name": interaction.user.display_name}
+            data["history"].append({
+                "host_id": uid,
+                "host_name": interaction.user.display_name,
+                "title": self.event_title.value.strip(),
+                "difficulty": self.difficulty.value.strip(),
+                "message_id": msg.id,
+                "started_at": now,
+                "ended_at": None,
+            })
+            del data["history"][:-EVENT_HISTORY_LIMIT]  # keep the newest EVENT_HISTORY_LIMIT entries
             save_events_db(data)
 
         await backup_events_db_to_log_channel()
@@ -9706,9 +9718,82 @@ class EventPanelView(discord.ui.View):
                 await channel.get_partial_message(int(entry["message_id"])).delete()
             except discord.HTTPException:
                 pass  # message already deleted — still end the event
+            for record in reversed(data["history"]):
+                if record.get("message_id") == entry["message_id"]:
+                    record["ended_at"] = discord.utils.utcnow().isoformat()
+                    break
             save_events_db(data)
         await backup_events_db_to_log_channel()
         await interaction.followup.send(f"✅ Ended **{entry['title']}** and deleted its message.", ephemeral=True)
+
+
+    @discord.ui.button(label="Activity", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="event_panel_activity")
+    async def activity(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_event_staff_role(interaction.user):
+            await interaction.response.send_message("Tournament staff only.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=_build_event_activity_embed(interaction.guild, load_events_db()), ephemeral=True
+        )
+
+
+def _build_event_activity_embed(guild: discord.Guild | None, data: dict) -> discord.Embed:
+    """Progress of every tournament staff member: events hosted, this week's count, last event,
+    whether one is live, and when they can host next. Ranked by events hosted."""
+    now = discord.utils.utcnow()
+    per_host: dict[str, list[dict]] = {}
+    for record in data["history"]:
+        per_host.setdefault(record["host_id"], []).append(record)
+
+    host_ids = set(per_host)
+    role = guild.get_role(EVENT_STAFF_ROLE_ID) if guild else None
+    if role:
+        host_ids.update(str(m.id) for m in role.members)  # staff who haven't hosted yet still show up
+
+    rows = []
+    for uid in host_ids:
+        events = per_host.get(uid, [])
+        week = sum(1 for e in events if now - datetime.fromisoformat(e["started_at"]) <= timedelta(days=7))
+        last_iso = data["hosts"].get(uid, {}).get("last_event_at")
+        rows.append((len(events), last_iso or "", uid, events, week, last_iso))
+    rows.sort(key=lambda r: (r[0], r[1]), reverse=True)  # most events first, then most recent
+
+    lines = []
+    for rank, (count, _, uid, events, week, last_iso) in enumerate(rows, start=1):
+        active = data["active"].get(uid)
+        if last_iso:
+            last_dt = datetime.fromisoformat(last_iso)
+            next_dt = last_dt + timedelta(hours=EVENT_COOLDOWN_HOURS)
+            last_txt = f"last <t:{int(last_dt.timestamp())}:R>"
+            avail = "✅ can host now" if now >= next_dt else f"⏳ next <t:{int(next_dt.timestamp())}:R>"
+        else:
+            last_txt, avail = "no events yet", "✅ can host now"
+        live = f"🟢 live: *{active['title']}*" if active else "⚪ no live event"
+        lines.append(
+            f"**{rank}.** <@{uid}> — **{count}** event{'s' if count != 1 else ''} ({week} this week)\n"
+            f"↳ {last_txt} • {live} • {avail}"
+        )
+
+    description_lines, used = [], 0
+    for i, line in enumerate(lines):
+        if used + len(line) + 2 > 3700:
+            description_lines.append(f"…and {len(lines) - i} more")
+            break
+        description_lines.append(line)
+        used += len(line) + 2
+
+    total_events = len(data["history"])
+    live_now = len(data["active"])
+    embed = discord.Embed(
+        title="📊 Tournament Event Activity",
+        description=(
+            f"**Total events:** {total_events} • **Live now:** {live_now} • **Hosts:** {len(rows)}\n\n"
+            + ("\n\n".join(description_lines) if description_lines else "No tournament staff found yet.")
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"One event per host every {EVENT_COOLDOWN_HOURS}h")
+    return embed
 
 
 def _build_event_panel_embed() -> discord.Embed:
@@ -9718,7 +9803,8 @@ def _build_event_panel_embed() -> discord.Embed:
             "**Tournament Staff only.** Every button answers privately.\n\n"
             "▶️ **Start Event** — fill the form and post your event "
             f"(one event every {EVENT_COOLDOWN_HOURS}h per host)\n"
-            "⏹️ **End Event** — end and delete the event you're hosting (only the host can end it)"
+            "⏹️ **End Event** — end and delete the event you're hosting (only the host can end it)\n"
+            "📊 **Activity** — every tournament staff member's events: hosted, last event and who's live"
         ),
         color=discord.Color.blurple(),
     )
@@ -9728,7 +9814,11 @@ async def post_event_panel_if_missing() -> None:
     channel = bot.get_channel(EVENT_PANEL_CHANNEL_ID) or await bot.fetch_channel(EVENT_PANEL_CHANNEL_ID)
     async for msg in channel.history(limit=50):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == EVENT_PANEL_TITLE:
-            return  # already posted — leave it alone
+            try:  # edit in place (no delete/resend) so button/text changes show up after a redeploy
+                await msg.edit(embed=_build_event_panel_embed(), view=EventPanelView())
+            except discord.HTTPException as e:
+                print(f"[ERROR] Failed to refresh event panel: {e}")
+            return
     await channel.send(embed=_build_event_panel_embed(), view=EventPanelView())
 
 
