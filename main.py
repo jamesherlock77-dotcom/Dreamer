@@ -108,6 +108,7 @@ REWARDS_RECIPIENT_ID = 1429110753683832985    # user DM'd every ID submitted thr
 REWARDS_STICKY_DEBOUNCE_SECONDS = 5           # min gap between re-sticking a rewards list, per channel
 EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event panel is posted here
 EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
+EVENT_PING_ROLE_ID = 1544471293704019988       # pinged at the top of every event post
 EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
 EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
 EVENT_COOLDOWN_HOURS = 12                      # shared by ALL tournament staff: once anyone starts an event, nobody can start another for this many hours
@@ -9641,6 +9642,11 @@ def _event_start_block_reason(data: dict, user_id: int) -> str | None:
     return None
 
 
+def _strip_mass_pings(text: str) -> str:
+    """Neutralises @everyone / @here in anything staff type into the event form."""
+    return text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
 class StartEventModal(discord.ui.Modal, title="Start Event"):
     event_title = discord.ui.TextInput(label="Event Title", placeholder="e.g. Simon Says", max_length=100, required=True)
     difficulty = discord.ui.TextInput(label="Difficulty", placeholder="e.g. Easy", max_length=50, required=True)
@@ -9658,18 +9664,31 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
                 await interaction.followup.send(reason, ephemeral=True)
                 return
 
+            title = _strip_mass_pings(self.event_title.value.strip())
+            difficulty = _strip_mass_pings(self.difficulty.value.strip())
+            info = _strip_mass_pings(self.event_info.value.strip())
+            code = _strip_mass_pings(self.event_code.value.replace("`", "").strip())
+
             embed = discord.Embed(
-                title=self.event_title.value.strip(),
-                description=f"**Difficulty:** {self.difficulty.value.strip()}\n\n{self.event_info.value.strip()}",
+                title=title,
+                description=f"**Difficulty:** {difficulty}\n\n{info}",
                 color=discord.Color.green(),
                 timestamp=discord.utils.utcnow(),  # Discord shows this next to the footer, e.g. "• 24/10/2026, 19:06"
             )
-            embed.add_field(name="Event Code", value=f"`{self.event_code.value.replace('`', '').strip()}`", inline=False)
+            # Code, then the host right beside it: `code` — @host
+            embed.add_field(name="Event Code", value=f"`{code}` — {interaction.user.mention}", inline=False)
             embed.set_footer(text=f"Hosted by {interaction.user.display_name}")
 
             try:
                 channel = bot.get_channel(EVENT_POST_CHANNEL_ID) or await bot.fetch_channel(EVENT_POST_CHANNEL_ID)
-                msg = await channel.send(embed=embed)
+                msg = await channel.send(
+                    content=f"<@&{EVENT_PING_ROLE_ID}>",
+                    embed=embed,
+                    # Only the event role can ping — never @everyone/@here, other roles or users.
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, users=False, roles=[discord.Object(id=EVENT_PING_ROLE_ID)]
+                    ),
+                )
             except discord.HTTPException as e:
                 print(f"[ERROR] Failed to post event: {e}")
                 await interaction.followup.send("Couldn't post the event (missing permissions?). Nothing was saved.", ephemeral=True)
@@ -9680,15 +9699,15 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
             data["active"][uid] = {
                 "message_id": msg.id,
                 "channel_id": msg.channel.id,
-                "title": self.event_title.value.strip(),
+                "title": title,
                 "started_at": now,
             }
             data["hosts"][uid] = {"last_event_at": now, "name": interaction.user.display_name}
             data["history"].append({
                 "host_id": uid,
                 "host_name": interaction.user.display_name,
-                "title": self.event_title.value.strip(),
-                "difficulty": self.difficulty.value.strip(),
+                "title": title,
+                "difficulty": difficulty,
                 "message_id": msg.id,
                 "started_at": now,
                 "ended_at": None,
