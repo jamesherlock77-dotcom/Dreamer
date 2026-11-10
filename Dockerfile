@@ -11,8 +11,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright + browser + OS deps it needs (fonts, libs, etc.)
-RUN playwright install --with-deps chromium
 
 # Now copy the rest of your bot's code
 COPY . .
