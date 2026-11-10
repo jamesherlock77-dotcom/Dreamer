@@ -109,9 +109,10 @@ REWARDS_STICKY_DEBOUNCE_SECONDS = 5           # min gap between re-sticking a re
 EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event panel is posted here
 EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
 EVENT_PING_ROLE_ID = 1544471293704019988       # pinged at the top of every event post
+EVENT_REPORT_CHANNEL_ID = 1528502239197663262  # the weekly tournament-staff activity report is posted here at each weekly reset
 EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
 EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
-EVENT_COOLDOWN_HOURS = 12                      # shared by ALL tournament staff: once anyone starts an event, nobody can start another for this many hours
+EVENT_COOLDOWN_HOURS = 6                       # shared by ALL tournament staff: once anyone starts an event, nobody can start another for this many hours
 SCRIM_CHANNEL_NAME = "🎯┃scrim"              # name given to every scrim channel
 SCRIM_DURATION_DAYS = 3                     # scrim channels auto-delete this many days after creation
 SCRIM_CHECK_INTERVAL_MINUTES = 5            # how often the expiry loop checks for scrim channels to delete
@@ -9571,7 +9572,7 @@ async def sendrewardslist(
 # State lives in EVENTS_DB_FILE, backed up to EVENT_LOG_CHANNEL_ID.
 # ============================================================
 EVENT_PANEL_TITLE = "🛠️ Tournament Event Panel"
-EVENT_HISTORY_LIMIT = 1000
+EVENT_HISTORY_LIMIT = 5000
 _events_lock = asyncio.Lock()
 
 
@@ -9579,6 +9580,8 @@ def load_events_db() -> dict:
     data = _load_json_file(EVENTS_DB_FILE) or {}
     data.setdefault("hosts", {})    # user_id -> {"last_event_at": iso, "name": str}
     data.setdefault("active", {})   # user_id -> {"message_id", "channel_id", "title", "started_at"}
+    data.setdefault("missed", {})   # user_id -> weeks missed (no event that week). Cumulative — never resets.
+    data.setdefault("week_start", None)  # iso start of the week currently being counted (see event_weekly_rollover_loop)
     data.setdefault("history", [])  # every event ever started: {"host_id", "host_name", "title", "difficulty", "message_id", "started_at", "ended_at"}
     return data
 
@@ -9832,6 +9835,126 @@ async def post_event_panel_if_missing() -> None:
     await channel.send(embed=_build_event_panel_embed(), view=EventPanelView())
 
 
+# ============================================================
+# Tournament-staff weekly activity: each staff member should host at least ONE event per
+# week. The week boundary is the same one the weekly message leaderboard uses (Sunday
+# 23:59 UTC). At each boundary the bot counts every tournament-staff member's events that
+# week, adds a permanent "missed week" to anyone with zero, posts the report in
+# EVENT_REPORT_CHANNEL_ID, and the weekly counts start again from zero. Missed weeks never reset.
+# ============================================================
+def _count_events_between(history: list[dict], start: datetime, end: datetime) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in history:
+        started = datetime.fromisoformat(record["started_at"])
+        if start <= started < end:
+            counts[record["host_id"]] = counts.get(record["host_id"], 0) + 1
+    return counts
+
+
+def _build_staff_activity_messages(data: dict, staff_ids: list[str], weekly: dict[str, int], when: datetime) -> list[str]:
+    """The report text (like the message-activity report): totals, then every tournament
+    staff member ranked by this week's events with their cumulative missed weeks. Split into
+    <=1900-char messages to stay under Discord's 2000 limit."""
+    all_time = len(data["history"])
+    all_time_by_uid: dict[str, int] = {}
+    for record in data["history"]:
+        all_time_by_uid[record["host_id"]] = all_time_by_uid.get(record["host_id"], 0) + 1
+
+    ranked = sorted(staff_ids, key=lambda u: (-weekly.get(u, 0), -all_time_by_uid.get(u, 0), u))
+    header = (
+        f"**Total Events From Tournament Staff {when.strftime('%d-%m-%y')}:** {sum(weekly.get(u, 0) for u in staff_ids)}\n"
+        f"**Total Events All Time:** {all_time}\n\n"
+        "🌟 **Tournament Staff:**"
+    )
+    lines = []
+    for rank, uid in enumerate(ranked, start=1):
+        n = weekly.get(uid, 0)
+        lines.append(f"{rank}. <@{uid}>: **{n}** event{'s' if n != 1 else ''} | Missed: {data['missed'].get(uid, 0)}")
+
+    messages, current = [], header
+    for line in lines:
+        if len(current) + len(line) + 1 > 1900:
+            messages.append(current)
+            current = line
+        else:
+            current += "\n" + line
+    messages.append(current)
+    return messages
+
+
+@bot.tree.command(
+    name="tournamentstaffactivity",
+    description="Tournament staff event activity this week (min. 1 event/week) and missed weeks",
+)
+async def tournamentstaffactivity(interaction: discord.Interaction):
+    if not (has_event_staff_role(interaction.user) or has_staff_role(interaction.user)):
+        await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+        return
+    role = interaction.guild.get_role(EVENT_STAFF_ROLE_ID) if interaction.guild else None
+    if role is None:
+        await interaction.response.send_message("Couldn't find the tournament staff role.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    data = load_events_db()
+    now = discord.utils.utcnow()
+    weekly = _count_events_between(data["history"], _message_leaderboard_reset_boundary(now), now + timedelta(days=1))
+    staff_ids = [str(m.id) for m in role.members]
+    for message in _build_staff_activity_messages(data, staff_ids, weekly, now):
+        await interaction.followup.send(message, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tasks.loop(minutes=1)
+async def event_weekly_rollover_loop():
+    """Once a minute: if a weekly boundary has passed since the week we're counting, settle
+    that week (and any whole weeks missed while the bot was offline, one at a time)."""
+    now = discord.utils.utcnow()
+    boundary = _message_leaderboard_reset_boundary(now)
+
+    report_channel = bot.get_channel(EVENT_REPORT_CHANNEL_ID)
+    guild = (report_channel or bot.get_channel(EVENT_POST_CHANNEL_ID) or bot.get_channel(EVENT_PANEL_CHANNEL_ID))
+    guild = guild.guild if guild else None
+    role = guild.get_role(EVENT_STAFF_ROLE_ID) if guild else None
+    if role is None:
+        return  # not ready / misconfigured — try again next tick rather than skipping a week
+
+    messages: list[str] = []
+    async with _events_lock:
+        data = load_events_db()
+        if data["week_start"] is None:
+            data["week_start"] = boundary.isoformat()  # first run: start counting now, no missed weeks for the past
+            save_events_db(data)
+        else:
+            start = datetime.fromisoformat(data["week_start"])
+            if boundary <= start:
+                return
+            staff_ids = [str(m.id) for m in role.members]
+            weekly: dict[str, int] = {}
+            while start + timedelta(days=7) <= boundary:
+                end = start + timedelta(days=7)
+                weekly = _count_events_between(data["history"], start, end)
+                for uid in staff_ids:
+                    if weekly.get(uid, 0) < 1:  # the weekly minimum is one event
+                        data["missed"][uid] = data["missed"].get(uid, 0) + 1
+                start = end
+            data["week_start"] = boundary.isoformat()
+            save_events_db(data)
+            messages = _build_staff_activity_messages(data, staff_ids, weekly, now)
+
+    await backup_events_db_to_log_channel()
+    if report_channel is not None:
+        for message in messages:
+            try:
+                await report_channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as e:
+                print(f"[ERROR] Failed to post weekly tournament staff report: {e}")
+
+
+@event_weekly_rollover_loop.before_loop
+async def before_event_weekly_rollover_loop():
+    await bot.wait_until_ready()
+
+
 # ---------- Global slash-command error handler ----------
 # Without this, discord.py just logs a full traceback for every unhandled command error
 # (interaction/message expiring mid-command, a bad Member argument, etc.) and the user is
@@ -9960,6 +10083,8 @@ async def on_ready():
         message_leaderboard_save_loop.start()
     if not message_leaderboard_rollover_loop.is_running():
         message_leaderboard_rollover_loop.start()
+    if not event_weekly_rollover_loop.is_running():
+        event_weekly_rollover_loop.start()
     if not overall_message_save_loop.is_running():
         overall_message_save_loop.start()
     if not streak_check_loop.is_running():
