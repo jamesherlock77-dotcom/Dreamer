@@ -110,6 +110,10 @@ EVENT_PANEL_CHANNEL_ID = 1564274536344453160   # the tournament-staff event pane
 EVENT_STAFF_ROLE_ID = 1528155138337013921      # tournament staff — the only role that can use the event panel buttons
 EVENT_PING_ROLE_ID = 1544471293704019988       # pinged at the top of every event post
 EVENT_REPORT_CHANNEL_ID = 1528502239197663262  # the weekly tournament-staff activity report is posted here at each weekly reset
+EVENT_CC_CHANNEL_ID = 1572667931702067260      # Company Coins events: a notice when one starts, and the winner's username when it ends
+EVENT_CC_COOLDOWN_HOURS = 24                   # Company Coins events: one per this many hours across ALL tournament staff
+EVENT_CC_MIN, EVENT_CC_MAX = 100, 500          # allowed Company Coins reward range
+EVENT_CC_EMOJI = "<:CompanyCoins:1528218837030535394>"
 EVENT_POST_CHANNEL_ID = 1546145947736871012    # started events are posted here
 EVENT_LOG_CHANNEL_ID = 1564276625388998657     # event JSON "database" message lives here
 EVENT_COOLDOWN_HOURS = 6                       # shared by ALL tournament staff: once anyone starts an event, nobody can start another for this many hours
@@ -9579,10 +9583,22 @@ _events_lock = asyncio.Lock()
 def load_events_db() -> dict:
     data = _load_json_file(EVENTS_DB_FILE) or {}
     data.setdefault("hosts", {})    # user_id -> {"last_event_at": iso, "name": str}
-    data.setdefault("active", {})   # user_id -> {"message_id", "channel_id", "title", "started_at"}
+    data.setdefault("active", {})   # user_id -> {"message_id", "channel_id", "url", "title", "started_at", "cc_amount"}
     data.setdefault("missed", {})   # user_id -> weeks missed (no event that week). Cumulative — never resets.
     data.setdefault("week_start", None)  # iso start of the week currently being counted (see event_weekly_rollover_loop)
-    data.setdefault("history", [])  # every event ever started: {"host_id", "host_name", "title", "difficulty", "message_id", "started_at", "ended_at"}
+    data.setdefault("history", [])  # every event ever started: {"host_id", "host_name", "title", "difficulty", "message_id", "started_at", "ended_at", "cc_amount", "winner"}
+    # Shared cooldown timers (what /resetcooldown clears). Older saves only had per-host times, so seed from those once.
+    if "last_event_at" not in data:
+        latest_uid, latest_iso = None, None
+        for uid, info in data["hosts"].items():
+            iso = info.get("last_event_at")
+            if iso and (latest_iso is None or datetime.fromisoformat(iso) > datetime.fromisoformat(latest_iso)):
+                latest_uid, latest_iso = uid, iso
+        data["last_event_at"], data["last_event_by"] = latest_iso, latest_uid
+    data.setdefault("last_event_by", None)
+    data.setdefault("last_event_cc", False)      # was the most recent event a Company Coins one?
+    data.setdefault("last_cc_event_at", None)
+    data.setdefault("last_cc_event_by", None)
     return data
 
 
@@ -9617,37 +9633,64 @@ def has_event_staff_role(member: discord.abc.User) -> bool:
 
 
 def _event_cooldown_end(data: dict) -> tuple[datetime | None, str | None]:
-    """(when the shared cooldown ends, who started the event that triggered it). The cooldown
-    runs from the most recent event started by ANY host, so it applies to every staff member."""
-    latest_uid, latest_iso = None, None
-    for uid, info in data["hosts"].items():
-        iso = info.get("last_event_at")
-        if iso and (latest_iso is None or datetime.fromisoformat(iso) > datetime.fromisoformat(latest_iso)):
-            latest_uid, latest_iso = uid, iso
-    if latest_iso is None:
+    """(when the shared cooldown ends, who started the event that triggered it). It runs from
+    the most recent event of ANY kind started by ANY host, so it applies to every staff member."""
+    iso = data.get("last_event_at")
+    if not iso:
         return None, None
-    return datetime.fromisoformat(latest_iso) + timedelta(hours=EVENT_COOLDOWN_HOURS), latest_uid
+    return datetime.fromisoformat(iso) + timedelta(hours=EVENT_COOLDOWN_HOURS), data.get("last_event_by")
 
 
-def _event_start_block_reason(data: dict, user_id: int) -> str | None:
-    """Why this host can't start an event right now, or None if they can."""
+def _event_cc_cooldown_end(data: dict) -> tuple[datetime | None, str | None]:
+    """Same idea, but for Company Coins events only (EVENT_CC_COOLDOWN_HOURS, all staff)."""
+    iso = data.get("last_cc_event_at")
+    if not iso:
+        return None, None
+    return datetime.fromisoformat(iso) + timedelta(hours=EVENT_CC_COOLDOWN_HOURS), data.get("last_cc_event_by")
+
+
+def _event_start_block_reason(data: dict, user_id: int, cc: bool = False) -> str | None:
+    """Why this host can't start an event right now, or None if they can. `cc` = the event
+    would reward Company Coins, which has its own, longer cooldown on top of the normal one."""
     uid = str(user_id)
+    now = discord.utils.utcnow()
     if uid in data["active"]:
         return "You already have an active event — press **End Event** to end it before starting another."
     next_time, last_uid = _event_cooldown_end(data)
-    if next_time and discord.utils.utcnow() < next_time:
+    if next_time and now < next_time:
         ts = int(next_time.timestamp())
         who = "you" if last_uid == uid else f"<@{last_uid}>"
         return (
             f"Only one event can be hosted every {EVENT_COOLDOWN_HOURS} hours across all tournament staff, "
             f"and {who} started the last one. The next event can start <t:{ts}:R> (<t:{ts}:f>)."
         )
+    if cc:
+        cc_next, cc_uid = _event_cc_cooldown_end(data)
+        if cc_next and now < cc_next:
+            ts = int(cc_next.timestamp())
+            who = "you" if cc_uid == uid else f"<@{cc_uid}>"
+            return (
+                f"Only one Company Coins event can be hosted every {EVENT_CC_COOLDOWN_HOURS} hours across all tournament staff, "
+                f"and {who} started the last one. The next one can start <t:{ts}:R> (<t:{ts}:f>). "
+                "You can still host a normal event without Company Coins."
+            )
     return None
 
 
 def _strip_mass_pings(text: str) -> str:
     """Neutralises @everyone / @here in anything staff type into the event form."""
     return text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
+async def _send_cc_notice(text: str) -> bool:
+    """Posts to the Company Coins channel (no pings). False if it couldn't be sent."""
+    try:
+        channel = bot.get_channel(EVENT_CC_CHANNEL_ID) or await bot.fetch_channel(EVENT_CC_CHANNEL_ID)
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except discord.HTTPException as e:
+        print(f"[ERROR] Failed to post Company Coins notice: {e}")
+        return False
 
 
 class StartEventModal(discord.ui.Modal, title="Start Event"):
@@ -9657,12 +9700,32 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
         label="Event Info", style=discord.TextStyle.paragraph, max_length=3000, required=True
     )
     event_code = discord.ui.TextInput(label="Event Code", placeholder="e.g. spooky.event", max_length=100, required=True)
+    cc_reward = discord.ui.TextInput(
+        label=f"Reward Company Coins? ({EVENT_CC_MIN}-{EVENT_CC_MAX}, blank = no)",
+        placeholder="Leave blank for a normal code",
+        max_length=5,
+        required=False,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
+        # Company Coins amount: blank / "no" = normal code, otherwise a whole number in range.
+        cc_amount = 0
+        raw_cc = self.cc_reward.value.strip().lower()
+        if raw_cc and raw_cc not in ("no", "n", "none", "0"):
+            if not raw_cc.isdigit() or not EVENT_CC_MIN <= int(raw_cc) <= EVENT_CC_MAX:
+                await interaction.followup.send(
+                    f"Company Coins must be a number from {EVENT_CC_MIN} to {EVENT_CC_MAX} (or leave it blank for a normal code). "
+                    "Nothing was posted — press **Start Event** to try again.",
+                    ephemeral=True,
+                )
+                return
+            cc_amount = int(raw_cc)
+
         async with _events_lock:
             data = load_events_db()
-            reason = _event_start_block_reason(data, interaction.user.id)  # re-check: state may have changed while the form was open
+            reason = _event_start_block_reason(data, interaction.user.id, cc=bool(cc_amount))  # re-check: state may have changed while the form was open
             if reason:
                 await interaction.followup.send(reason, ephemeral=True)
                 return
@@ -9702,10 +9765,15 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
             data["active"][uid] = {
                 "message_id": msg.id,
                 "channel_id": msg.channel.id,
+                "url": msg.jump_url,
                 "title": title,
                 "started_at": now,
+                "cc_amount": cc_amount,
             }
             data["hosts"][uid] = {"last_event_at": now, "name": interaction.user.display_name}
+            data["last_event_at"], data["last_event_by"], data["last_event_cc"] = now, uid, bool(cc_amount)
+            if cc_amount:
+                data["last_cc_event_at"], data["last_cc_event_by"] = now, uid
             data["history"].append({
                 "host_id": uid,
                 "host_name": interaction.user.display_name,
@@ -9714,12 +9782,79 @@ class StartEventModal(discord.ui.Modal, title="Start Event"):
                 "message_id": msg.id,
                 "started_at": now,
                 "ended_at": None,
+                "cc_amount": cc_amount,
             })
             del data["history"][:-EVENT_HISTORY_LIMIT]  # keep the newest EVENT_HISTORY_LIMIT entries
             save_events_db(data)
 
         await backup_events_db_to_log_channel()
-        await interaction.followup.send(f"✅ Your event is live in <#{EVENT_POST_CHANNEL_ID}>.", ephemeral=True)
+
+        note = ""
+        if cc_amount:
+            sent = await _send_cc_notice(
+                f"{EVENT_CC_EMOJI} **Company Coins event started**\n"
+                f"**Host:** {interaction.user.mention}\n"
+                f"**Event:** {title}\n"
+                f"**Reward:** {cc_amount} Company Coins\n"
+                f"**Code:** `{code}`\n"
+                f"{msg.jump_url}"
+            )
+            if not sent:
+                note = "\n⚠️ I couldn't post the Company Coins notice — please tell staff about this event directly."
+        await interaction.followup.send(f"✅ Your event is live in <#{EVENT_POST_CHANNEL_ID}>.{note}", ephemeral=True)
+
+
+async def _end_event_for(interaction: discord.Interaction, winner: str | None) -> None:
+    """Ends the caller's own active event: deletes its message and marks it ended. For a
+    Company Coins event, `winner` (the username to pay) is sent to the Company Coins channel.
+    The interaction must already be deferred."""
+    async with _events_lock:
+        data = load_events_db()
+        # Looked up by the caller's own ID, so you can only ever end the event YOU host.
+        entry = data["active"].pop(str(interaction.user.id), None)
+        if entry is None:
+            await interaction.followup.send("You don't have an active event to end.", ephemeral=True)
+            return
+        try:
+            channel = bot.get_channel(int(entry["channel_id"])) or await bot.fetch_channel(int(entry["channel_id"]))
+            await channel.get_partial_message(int(entry["message_id"])).delete()
+        except discord.HTTPException:
+            pass  # message already deleted — still end the event
+        for record in reversed(data["history"]):
+            if record.get("message_id") == entry["message_id"]:
+                record["ended_at"] = discord.utils.utcnow().isoformat()
+                if winner:
+                    record["winner"] = winner
+                break
+        save_events_db(data)
+    await backup_events_db_to_log_channel()
+
+    note = ""
+    cc_amount = int(entry.get("cc_amount") or 0)
+    if cc_amount:
+        sent = await _send_cc_notice(
+            f"{EVENT_CC_EMOJI} **Company Coins event ended**\n"
+            f"**Host:** {interaction.user.mention}\n"
+            f"**Event:** {entry['title']}\n"
+            f"**Pay {cc_amount} Company Coins to:** `{winner or 'no winner given'}`\n"
+            f"{entry.get('url', '')}"
+        )
+        if not sent:
+            note = "\n⚠️ I couldn't post the winner in the Company Coins channel — please tell staff directly."
+    await interaction.followup.send(f"✅ Ended **{entry['title']}** and deleted its message.{note}", ephemeral=True)
+
+
+class EndEventModal(discord.ui.Modal, title="End Event"):
+    winner = discord.ui.TextInput(
+        label="Username of the winner",
+        placeholder="Who should receive the Company Coins?",
+        max_length=100,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await _end_event_for(interaction, _strip_mass_pings(self.winner.value.replace("`", "").strip()))
 
 
 class EventPanelView(discord.ui.View):
@@ -9731,6 +9866,8 @@ class EventPanelView(discord.ui.View):
         if not has_event_staff_role(interaction.user):
             await interaction.response.send_message("Tournament staff only.", ephemeral=True)
             return
+        # Quick pre-check (normal-event rules) so nobody fills in the form just to be told no.
+        # The Company Coins cooldown depends on the form, so it's checked again on submit.
         reason = _event_start_block_reason(load_events_db(), interaction.user.id)
         if reason:
             await interaction.response.send_message(reason, ephemeral=True)
@@ -9742,27 +9879,15 @@ class EventPanelView(discord.ui.View):
         if not has_event_staff_role(interaction.user):
             await interaction.response.send_message("Tournament staff only.", ephemeral=True)
             return
+        entry = load_events_db()["active"].get(str(interaction.user.id))
+        if entry is None:
+            await interaction.response.send_message("You don't have an active event to end.", ephemeral=True)
+            return
+        if entry.get("cc_amount"):
+            await interaction.response.send_modal(EndEventModal())  # Company Coins event: ask who won
+            return
         await interaction.response.defer(ephemeral=True)
-        async with _events_lock:
-            data = load_events_db()
-            # Looked up by the caller's own ID, so you can only ever end the event YOU host.
-            entry = data["active"].pop(str(interaction.user.id), None)
-            if entry is None:
-                await interaction.followup.send("You don't have an active event to end.", ephemeral=True)
-                return
-            try:
-                channel = bot.get_channel(int(entry["channel_id"])) or await bot.fetch_channel(int(entry["channel_id"]))
-                await channel.get_partial_message(int(entry["message_id"])).delete()
-            except discord.HTTPException:
-                pass  # message already deleted — still end the event
-            for record in reversed(data["history"]):
-                if record.get("message_id") == entry["message_id"]:
-                    record["ended_at"] = discord.utils.utcnow().isoformat()
-                    break
-            save_events_db(data)
-        await backup_events_db_to_log_channel()
-        await interaction.followup.send(f"✅ Ended **{entry['title']}** and deleted its message.", ephemeral=True)
-
+        await _end_event_for(interaction, None)
 
     @discord.ui.button(label="Activity", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="event_panel_activity")
     async def activity(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -9796,6 +9921,9 @@ def _build_event_activity_embed(user: discord.abc.User, data: dict) -> discord.E
     embed.add_field(name="Last event", value=last_txt, inline=True)
     embed.add_field(name="Live event", value=live, inline=True)
     embed.add_field(name="Next event", value=avail, inline=True)
+    cc_next, _ = _event_cc_cooldown_end(data)
+    cc_avail = "✅ Available" if cc_next is None or now >= cc_next else f"⏳ <t:{int(cc_next.timestamp())}:R>"
+    embed.add_field(name="Next CC event", value=cc_avail, inline=True)
 
     recent = []
     for e in reversed(events[-5:]):
@@ -9805,8 +9933,48 @@ def _build_event_activity_embed(user: discord.abc.User, data: dict) -> discord.E
     if recent:
         embed.add_field(name="Recent events", value="\n".join(recent), inline=False)
 
-    embed.set_footer(text=f"One event every {EVENT_COOLDOWN_HOURS}h across all tournament staff")
+    embed.set_footer(text=f"One event every {EVENT_COOLDOWN_HOURS}h (Company Coins: every {EVENT_CC_COOLDOWN_HOURS}h) across all tournament staff")
     return embed
+
+
+@bot.tree.command(
+    name="resetcooldown",
+    description="(Staff) Reset the tournament event cooldown so anyone can host an event again",
+)
+@app_commands.describe(option="Which cooldown to reset")
+@app_commands.choices(
+    option=[
+        app_commands.Choice(name="Company Coins (cc)", value="cc"),
+        app_commands.Choice(name="Normal", value="normal"),
+        app_commands.Choice(name="Both", value="both"),
+    ]
+)
+async def resetcooldown(interaction: discord.Interaction, option: app_commands.Choice[str]):
+    if not has_staff_role(interaction.user):
+        await interaction.response.send_message("You don't have permission to use this.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with _events_lock:
+        data = load_events_db()
+        if option.value in ("normal", "both"):
+            data["last_event_at"], data["last_event_by"] = None, None
+        if option.value in ("cc", "both"):
+            data["last_cc_event_at"], data["last_cc_event_by"] = None, None
+            if data.get("last_event_cc"):
+                # The most recent event WAS the Company Coins one, so it's also what started the
+                # normal wait — clear that too, otherwise a new CC event would still be blocked.
+                data["last_event_at"], data["last_event_by"] = None, None
+        save_events_db(data)
+    await backup_events_db_to_log_channel()
+
+    messages = {
+        "normal": f"✅ Reset the normal event cooldown ({EVENT_COOLDOWN_HOURS}h). Anyone can host a normal event again; "
+                  f"Company Coins events still follow their own {EVENT_CC_COOLDOWN_HOURS}h wait.",
+        "cc": f"✅ Reset the Company Coins cooldown ({EVENT_CC_COOLDOWN_HOURS}h). Anyone can host a Company Coins event again "
+              f"(if a normal event started in the last {EVENT_COOLDOWN_HOURS}h, that wait still applies — use **both** to clear everything).",
+        "both": "✅ Reset both cooldowns. Anyone can host any kind of event again.",
+    }
+    await interaction.followup.send(messages[option.value], ephemeral=True)
 
 
 def _build_event_panel_embed() -> discord.Embed:
@@ -9815,7 +9983,7 @@ def _build_event_panel_embed() -> discord.Embed:
         description=(
             "**Tournament Staff only.** Every button answers privately.\n\n"
             "▶️ **Start Event** — fill the form and post your event "
-            f"(only one event every {EVENT_COOLDOWN_HOURS}h for all staff)\n"
+            f"(one event every {EVENT_COOLDOWN_HOURS}h for all staff; Company Coins events every {EVENT_CC_COOLDOWN_HOURS}h)\n"
             "⏹️ **End Event** — end and delete the event you're hosting (only the host can end it)\n"
             "📊 **Activity** — your own event stats: hosted, last event and when the next event can start"
         ),
