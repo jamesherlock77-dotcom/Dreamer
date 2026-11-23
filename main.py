@@ -10134,7 +10134,7 @@ async def before_event_weekly_rollover_loop():
 # info — public IP addresses, phone numbers, emails, street addresses, SSNs and payment-card
 # numbers. A match is deleted straight away and an @here alert (with the sensitive parts
 # REDACTED, never re-posted) goes to DOX_ALERT_CHANNEL_ID. Explicit doxx/swat THREATS are
-# alerted too but not deleted, since they carry no personal data. Staff are exempt.
+# alerted too but not deleted, since they carry no personal data. Nobody is exempt.
 # Text only: it can't read images.
 # ============================================================
 DOX_PROTECTION_ENABLED = True
@@ -10266,14 +10266,14 @@ async def _send_dox_alert(message: discord.Message, hits: list[tuple[str, int, i
 
 async def check_doxxing(message: discord.Message) -> bool:
     """Scans a message. Returns True if it was removed (so the caller should stop processing it)."""
+    # No exemptions: staff, admins, other bots, webhooks and every channel (the alerts channel
+    # included) are all scanned. The only thing skipped is this bot's own output, which is
+    # already redacted and would otherwise loop on itself.
     if (
         not DOX_PROTECTION_ENABLED
         or message.guild is None
-        or message.author.bot
-        or message.webhook_id is not None
+        or message.author.id == bot.user.id
         or not message.content
-        or message.channel.id == DOX_ALERT_CHANNEL_ID
-        or has_staff_role(message.author)
     ):
         return False
 
