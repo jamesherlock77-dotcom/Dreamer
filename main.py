@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import io
 import re
+import ipaddress
 import json
 import logging
 import asyncio
@@ -7713,6 +7714,11 @@ def queue_message_log(message: discord.Message) -> None:
 
 @bot.event
 async def on_message(message: discord.Message):
+    # Doxxing protection runs first: a message removed for personal info must not be mirrored
+    # into the message logs below (that would just re-publish it).
+    if await check_doxxing(message):
+        return
+
     # Mirror every message in the logged categories. Placed first because several branches
     # below return early (contest channel, .membercount, @everyone filter).
     if (
@@ -10121,6 +10127,187 @@ async def event_weekly_rollover_loop():
 @event_weekly_rollover_loop.before_loop
 async def before_event_weekly_rollover_loop():
     await bot.wait_until_ready()
+
+
+# ============================================================
+# Doxxing protection. Every non-staff message (new or edited) is scanned for personal
+# info — public IP addresses, phone numbers, emails, street addresses, SSNs and payment-card
+# numbers. A match is deleted straight away and an @here alert (with the sensitive parts
+# REDACTED, never re-posted) goes to DOX_ALERT_CHANNEL_ID. Explicit doxx/swat THREATS are
+# alerted too but not deleted, since they carry no personal data. Staff are exempt.
+# Text only: it can't read images.
+# ============================================================
+DOX_PROTECTION_ENABLED = True
+DOX_ALERT_CHANNEL_ID = 1528007337699311743
+DOX_PING_COOLDOWN_SECONDS = 60  # @here at most once per this many seconds per user (extra alerts still post, silently)
+
+_DOX_IPV4 = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\w|\.\d)")
+_DOX_IPV6 = re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])")
+_DOX_EMAIL = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
+_DOX_PHONE = re.compile(
+    r"(?<![\w+])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\w)"
+    r"|(?<![\w+])\+\d{1,3}[\s.-]?\d{2,4}[\s.-]?\d{3,4}[\s.-]?\d{3,4}(?!\w)"
+)
+_DOX_SSN = re.compile(r"(?<![\d-])\d{3}-\d{2}-\d{4}(?![\d-])")
+_DOX_CARD = re.compile(r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])")
+_DOX_STREET = re.compile(
+    r"\b\d{1,5}\s+(?!(?:min|mins|minutes?|hours?|hrs?|secs?|seconds?|days?|weeks?|months?|years?|players?|people|more|times?|k|x|v|vs)\b)"
+    r"(?:[A-Za-z][A-Za-z'.-]*\s+){1,3}(?:street|st|avenue|ave|road|rd|boulevard|blvd|highway|hwy)\b\.?",
+    re.IGNORECASE,
+)
+_DOX_THREAT = re.compile(
+    r"\b(?:i(?:'|’)?ll|i\s+will|i(?:'|’)?m\s+(?:gonna|going\s+to)|gonna|going\s+to|about\s+to|we(?:'|’)?ll|we\s+will)\s+(?:dox+|swat)\w*"
+    r"|\bi\s+know\s+where\s+you\s+live\b"
+    r"|\bleak(?:ing)?\s+(?:your|his|her|their|ur)\s+(?:address|ip|info|number|location)\b"
+    r"|\b(?:get|got)\s+(?:you|him|her|them|u)\s+swatted\b",
+    re.IGNORECASE,
+)
+
+_dox_last_ping: dict[int, float] = {}
+
+
+def _luhn_ok(digits: str) -> bool:
+    total, flip = 0, False
+    for ch in reversed(digits):
+        d = int(ch)
+        if flip:
+            d = d * 2 - 9 if d * 2 > 9 else d * 2
+        total += d
+        flip = not flip
+    return total % 10 == 0
+
+
+def _detect_pii(text: str) -> list[tuple[str, int, int]]:
+    """[(label, start, end)] of personal info in `text`, non-overlapping, in text order."""
+    found: list[tuple[str, int, int]] = []
+
+    def add(label: str, m: re.Match) -> None:
+        if not any(m.start() < e and m.end() > st for _, st, e in found):  # skip overlaps with an earlier (higher-priority) hit
+            found.append((label, m.start(), m.end()))
+
+    for m in _DOX_CARD.finditer(text):
+        digits = re.sub(r"\D", "", m.group())
+        if 13 <= len(digits) <= 19 and digits[0] in "3456" and _luhn_ok(digits):  # prefix check keeps Discord IDs (start with 1) out
+            add("payment card", m)
+    for m in _DOX_SSN.finditer(text):
+        area, group, serial = m.group().split("-")
+        if area not in ("000", "666") and not area.startswith("9") and group != "00" and serial != "0000":
+            add("SSN", m)
+    for m in _DOX_EMAIL.finditer(text):
+        add("email address", m)
+    for m in _DOX_IPV4.finditer(text):
+        try:
+            if ipaddress.ip_address(m.group()).is_global:  # private/loopback ranges (192.168.x.x…) aren't a leak
+                add("IP address", m)
+        except ValueError:
+            pass
+    for m in _DOX_IPV6.finditer(text):
+        try:
+            if ipaddress.ip_address(m.group()).is_global:
+                add("IP address", m)
+        except ValueError:
+            pass
+    for m in _DOX_PHONE.finditer(text):
+        if 10 <= len(re.sub(r"\D", "", m.group())) <= 15:
+            add("phone number", m)
+    for m in _DOX_STREET.finditer(text):
+        add("street address", m)
+    return sorted(found, key=lambda h: h[1])
+
+
+def _redact(text: str, hits: list[tuple[str, int, int]]) -> str:
+    out, last = [], 0
+    for label, start, end in hits:
+        out.append(text[last:start])
+        out.append(f"[{label} removed]")
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+async def _send_dox_alert(message: discord.Message, hits: list[tuple[str, int, int]], threat: bool, deleted: bool) -> None:
+    labels = sorted({label for label, _, _ in hits})
+    if threat:
+        labels.append("doxxing / swatting threat")
+
+    safe_text = discord.utils.escape_mentions(discord.utils.escape_markdown(_redact(message.content, hits)))
+    if len(safe_text) > 700:
+        safe_text = safe_text[:700] + "…"
+
+    if hits:
+        status = "✅ Message deleted" if deleted else "⚠️ Couldn't delete it — I need **Manage Messages** in that channel"
+    else:
+        status = "👀 Threat only — message left in place"
+    embed = discord.Embed(
+        title="🚨 Possible doxxing detected",
+        description=f"**Message (sensitive parts redacted):**\n{safe_text}",
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)", inline=True)
+    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="Detected", value=", ".join(labels), inline=False)
+    embed.add_field(name="Action", value=status, inline=False)
+
+    now = time.monotonic()
+    ping = now - _dox_last_ping.get(message.author.id, -DOX_PING_COOLDOWN_SECONDS) >= DOX_PING_COOLDOWN_SECONDS
+    if ping:
+        _dox_last_ping[message.author.id] = now
+    try:
+        channel = bot.get_channel(DOX_ALERT_CHANNEL_ID) or await bot.fetch_channel(DOX_ALERT_CHANNEL_ID)
+        await channel.send(
+            content="@here" if ping else None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
+        )
+    except discord.HTTPException as e:
+        print(f"[ERROR] Failed to send doxxing alert: {e}")
+
+
+async def check_doxxing(message: discord.Message) -> bool:
+    """Scans a message. Returns True if it was removed (so the caller should stop processing it)."""
+    if (
+        not DOX_PROTECTION_ENABLED
+        or message.guild is None
+        or message.author.bot
+        or message.webhook_id is not None
+        or not message.content
+        or message.channel.id == DOX_ALERT_CHANNEL_ID
+        or has_staff_role(message.author)
+    ):
+        return False
+
+    hits = _detect_pii(message.content)
+    threat = _DOX_THREAT.search(message.content) is not None
+    if not hits and not threat:
+        return False
+
+    deleted = False
+    if hits:
+        try:
+            await message.delete()
+            deleted = True
+        except discord.HTTPException:
+            pass  # already gone, or no permission — the alert says which
+        if deleted:
+            try:
+                await message.channel.send(
+                    f"{message.author.mention} your message was removed because it looked like it contained "
+                    "personal information. Please don't share personal details — yours or anyone else's.",
+                    delete_after=10,
+                    allowed_mentions=discord.AllowedMentions(users=[message.author]),
+                )
+            except discord.HTTPException:
+                pass
+    await _send_dox_alert(message, hits, threat, deleted)
+    return deleted
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    # Someone can post something harmless and edit the personal info in afterwards.
+    if before.content != after.content:
+        await check_doxxing(after)
 
 
 # ---------- Global slash-command error handler ----------
